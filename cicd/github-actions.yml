@@ -1,0 +1,208 @@
+###############################################################################
+# CodeMigrateAI — GitHub Actions CI/CD Pipeline
+# MTech Final Year Project
+#
+# Pipeline stages:
+#   1. test        — lint backend, run unit tests, smoke-build frontend
+#   2. build-push  — build Docker images, push to GitHub Container Registry
+#   3. deploy      — SSH into server, pull new images, restart services
+#
+# Triggers:
+#   - push to main branch  → runs all 3 stages
+#   - pull request to main → runs only "test" stage (no deploy)
+###############################################################################
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY:   ghcr.io
+  IMAGE_API:  ${{ github.repository }}/backend
+  IMAGE_UI:   ${{ github.repository }}/frontend
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 1 — TEST
+# Runs on every push and every pull request.
+# Backend: Ruff lint + pytest unit tests
+# Frontend: npm install + vite build (proves the JS compiles)
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── Backend ──────────────────────────────────────────────────────────────
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install backend dependencies + test tools
+        run: |
+          pip install -r backend/requirements.txt
+          pip install ruff pytest pytest-asyncio
+
+      - name: Ruff lint (PEP8 + style)
+        run: ruff check backend/main.py --select E,W,F,I
+
+      - name: Run unit tests
+        run: pytest backend/tests.py -v --tb=short
+        # Tests mock the LLM — no Ollama needed in CI
+
+      # ── Frontend ─────────────────────────────────────────────────────────────
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package.json
+
+      - name: Install frontend dependencies
+        run: npm install
+        working-directory: frontend
+
+      - name: Build frontend (smoke test)
+        run: npm run build
+        working-directory: frontend
+        env:
+          VITE_API_URL: http://localhost:8000
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 2 — BUILD & PUSH DOCKER IMAGES
+# Only runs on push to main (not on pull requests).
+# Builds both images and pushes to GitHub Container Registry (GHCR) — free.
+# Tags: latest + sha-<commit-sha> for traceability.
+# ─────────────────────────────────────────────────────────────────────────────
+  build-push:
+    name: Build & Push Docker Images
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    permissions:
+      contents: read
+      packages: write      # required to push to GHCR
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Build + push backend ─────────────────────────────────────────────────
+      - name: Extract metadata for backend image
+        id: meta-backend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_API }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=sha-,format=short
+
+      - name: Build and push backend image
+        uses: docker/build-push-action@v5
+        with:
+          context:    ./backend
+          dockerfile: ./backend/Dockerfile
+          push:       true
+          tags:       ${{ steps.meta-backend.outputs.tags }}
+          labels:     ${{ steps.meta-backend.outputs.labels }}
+          cache-from: type=gha                   # GitHub Actions layer cache
+          cache-to:   type=gha,mode=max
+
+      # ── Build + push frontend ────────────────────────────────────────────────
+      - name: Extract metadata for frontend image
+        id: meta-frontend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_UI }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=sha-,format=short
+
+      - name: Build and push frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context:    ./frontend
+          dockerfile: ./frontend/Dockerfile
+          push:       true
+          tags:       ${{ steps.meta-frontend.outputs.tags }}
+          labels:     ${{ steps.meta-frontend.outputs.labels }}
+          build-args: |
+            VITE_API_URL=${{ secrets.PROD_API_URL }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 3 — DEPLOY
+# Only runs after images are pushed (main branch only).
+# SSHes into your server, pulls the new images, restarts containers.
+# ─────────────────────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: build-push
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production    # triggers manual approval gate if configured in GitHub
+
+    steps:
+      - name: Checkout code (for compose file)
+        uses: actions/checkout@v4
+
+      - name: Copy docker-compose to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host:     ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key:      ${{ secrets.DEPLOY_SSH_KEY }}
+          source:   cicd/docker-compose.yml
+          target:   ~/codemigrateai
+          strip_components: 1    # puts docker-compose.yml directly in ~/codemigrateai/
+
+      - name: Pull images and restart services
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:     ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key:      ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            set -e
+            cd ~/codemigrateai
+
+            # Authenticate with GHCR on the server
+            echo "${{ secrets.GITHUB_TOKEN }}" | \
+              docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+            # Override image names to use pre-built registry images
+            export BACKEND_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_API }}:latest"
+            export FRONTEND_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_UI }}:latest"
+
+            # Pull latest images (only downloads changed layers)
+            docker compose pull backend frontend
+
+            # Restart only app services — Ollama keeps running (model stays loaded)
+            docker compose up -d --no-build backend frontend
+
+            # Remove old dangling images to free disk space
+            docker image prune -f
+
+            echo "✅ Deployment complete"

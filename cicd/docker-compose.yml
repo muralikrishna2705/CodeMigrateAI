@@ -1,0 +1,60 @@
+# =============================================================================
+# CodeMigrateAI — Docker Compose
+# MTech Final Year Project
+#
+# ARCHITECTURE:
+#   Ollama  →  runs on Windows host (already installed, already running)
+#   Backend →  Docker container, talks to Ollama via host.docker.internal:11434
+#   Frontend → Docker container, served by Nginx on port 3000
+#
+# HOW TO RUN (first time or after any code change):
+#   docker compose -f cicd/docker-compose.yml down --remove-orphans
+#   docker compose -f cicd/docker-compose.yml up --build
+#
+# HOW TO RUN (subsequent runs, no code changes):
+#   docker compose -f cicd/docker-compose.yml up
+#
+# OPEN IN BROWSER:
+#   http://localhost:3000
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # BACKEND — FastAPI + AI Agent Pipeline
+  # Agents: AnalyzerAgent → PlannerAgent → MigratorAgent
+  # LLM: deepseek-coder:1.3b via Ollama on Windows host
+  # ---------------------------------------------------------------------------
+  backend:
+    build:
+      context:    ../backend
+      dockerfile: Dockerfile
+    container_name: codemigrateai-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+    extra_hosts:
+      # This resolves host.docker.internal → your Windows machine IP
+      # so the container can reach Ollama running on Windows
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # FRONTEND — React app built by Vite, served by Nginx
+  # Talks to backend at http://localhost:8000
+  # ---------------------------------------------------------------------------
+  frontend:
+    build:
+      context:    ../frontend
+      dockerfile: Dockerfile
+      args:
+        # Baked into the JS bundle at build time
+        # Must be reachable from the browser (not from inside Docker)
+        VITE_API_URL: "http://localhost:8000"
+    container_name: codemigrateai-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped

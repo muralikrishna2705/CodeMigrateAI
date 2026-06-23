@@ -1,0 +1,49 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Geist:wght@300;400;500;600;700&display=swap');
+
+/* ── CSS Variables ───────────────────────────────────────────────────── */
+:root {
+  --bg-root:    #060809;
+  --bg-base:    #0b0f14;
+  --bg-raised:  #111720;
+  --bg-overlay: #172030;
+  --bg-hover:   #1d2a3a;
+
+  --border:     #1a2434;
+  --border-mid: #243447;
+  --border-hi:  #2e4560;
+
+  --text-bright: #e2ecf8;
+  --text-normal: #a8becf;
+  --text-muted:  #506070;
+  --text-dim:    #2a3f55;
+
+  --accent:     #22d3a0;
+  --accent-dim: #178f6d;
+  --accent-glow: rgba(34, 211, 160, 0.18);
+
+  --blue:   #38bdf8;
+  --purple: #a78bfa;
+  --amber:  #fbbf24;
+  --red:    #f87171;
+  --green:  #4ade80;
+
+  --font-ui:   'Geist', sans-serif;
+  --font-code: 'JetBrains Mono', monospace;
+
+  --radius: 6px;
+  --sidebar: 272px;
+  --header:  52px;
+}
+
+/* ── Reset ───────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body, #root { height: 100%; overflow: hidden; }
+body { font-family: var(--font-ui); background: var(--bg-root); color: var(--text-bright); -webkit-font-smoothing: antialiased; }
+
+/* ── Scrollbar ───────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: var(--bg-base); }
+::-webkit-scrollbar-thumb { background: var(--bg-hover); border-radius: 3px; }
+
+/* ── Utility ─────────────────────────────────────────────────────────── */
+.sr-only { position: absolute; width: 1px; height: 1px; clip: rect(0,0,0,0); overflow: hidden; }
