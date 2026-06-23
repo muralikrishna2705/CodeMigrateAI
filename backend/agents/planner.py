@@ -123,7 +123,11 @@ class PlannerAgent(BaseAgent):
         if state.pipeline_mode.value == "fast" and recipe:
             plan = self._build_recipe_plan(recipe, state)
         else:
-            plan = await self._llm_plan(state, recipe)
+            try:
+                plan = await self._llm_plan(state, recipe)
+            except Exception as e:
+                log.warning("LLM plan failed, falling back to recipe: %s", e)
+                plan = self._build_recipe_plan(recipe, state)
 
         plan["migration_type"] = state.migration_type.value
         state.migration_plan = plan

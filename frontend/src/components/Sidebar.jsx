@@ -15,7 +15,8 @@ const LANGUAGES = [
 export default function Sidebar({
   srcLang, setSrcLang, srcVer, setSrcVer,
   tgtLang, setTgtLang, tgtVer, setTgtVer,
-  loading, ollamaStatus, apiError, result, onRun,
+  pipelineMode, setPipelineMode,
+  loading, ollamaStatus, apiError, result, agentProgress, onRun,
 }) {
   const srcDef = LANGUAGES.find(l => l.id === srcLang) || LANGUAGES[0];
   const tgtDef = LANGUAGES.find(l => l.id === tgtLang) || LANGUAGES[0];
@@ -75,6 +76,19 @@ export default function Sidebar({
         options={tgtDef.versions.map(v => ({ value: v, label: v }))}
       />
 
+      {/* ── Pipeline Mode ── */}
+      <SectionLabel text="Mode" />
+      <SelectRow
+        label="Pipeline"
+        value={pipelineMode}
+        onChange={setPipelineMode}
+        options={[
+          { value: "fast", label: "Fast (1 LLM call)" },
+          { value: "deep", label: "Deep (3 LLM calls)" },
+          { value: "validated", label: "Validated (+syntax)" },
+        ]}
+      />
+
       {/* ── Run button ── */}
       <button
         style={{ ...st.runBtn, ...(canRun ? {} : st.runBtnDisabled) }}
@@ -100,10 +114,26 @@ export default function Sidebar({
       )}
 
       {/* ── Agent pipeline log ── */}
-      {result && (
+      {(result || agentProgress.length > 0) && (
         <div style={st.logWrap}>
           <SectionLabel text="Agent Pipeline" />
-          <AgentLog reports={result.reports} />
+          {agentProgress.length > 0 && !result ? (
+            <div style={st.streamingProgress}>
+              {agentProgress.map((a, i) => (
+                <div key={i} style={st.agentProgressItem}>
+                  <span style={{
+                    ...st.agentStatusDot,
+                    background: a.status === "complete" ? "var(--green)" : "var(--accent)",
+                  }} />
+                  <span style={{ fontSize: 11, color: "var(--text-normal)" }}>
+                    {a.agent} {a.status === "complete" ? "✓" : "⟳"}
+                  </span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <AgentLog reports={result.reports} />
+          )}
         </div>
       )}
     </aside>
@@ -212,4 +242,7 @@ const st = {
     borderRadius: 3, fontFamily: "var(--font-code)", fontSize: 10,
   },
   logWrap: { display: "flex", flexDirection: "column", gap: 6, marginTop: 4 },
+  streamingProgress: { display: "flex", flexDirection: "column", gap: 4 },
+  agentProgressItem: { display: "flex", alignItems: "center", gap: 6, fontSize: 11 },
+  agentStatusDot: { width: 8, height: 8, borderRadius: "50%" },
 };

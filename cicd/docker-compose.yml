@@ -6,6 +6,7 @@
 #   Ollama  →  runs on Windows host (already installed, already running)
 #   Backend →  Docker container, talks to Ollama via host.docker.internal:11434
 #   Frontend → Docker container, served by Nginx on port 3000
+#   Redis   →  Cache layer for migration results
 #
 # HOW TO RUN (first time or after any code change):
 #   docker compose -f cicd/docker-compose.yml down --remove-orphans
@@ -21,6 +22,19 @@
 services:
 
   # ---------------------------------------------------------------------------
+  # REDIS — Cache layer for migration results
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: codemigrateai-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+
+  # ---------------------------------------------------------------------------
   # BACKEND — FastAPI + AI Agent Pipeline
   # Agents: AnalyzerAgent → PlannerAgent → MigratorAgent
   # LLM: deepseek-coder:1.3b via Ollama on Windows host
@@ -34,10 +48,13 @@ services:
       - "8000:8000"
     environment:
       - PYTHONUNBUFFERED=1
+      - REDIS_URL=redis://redis:6379/0
     extra_hosts:
       # This resolves host.docker.internal → your Windows machine IP
       # so the container can reach Ollama running on Windows
       - "host.docker.internal:host-gateway"
+    depends_on:
+      - redis
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
@@ -58,3 +75,6 @@ services:
     depends_on:
       - backend
     restart: unless-stopped
+
+volumes:
+  redis_data:

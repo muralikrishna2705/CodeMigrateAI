@@ -4,6 +4,7 @@ import Sidebar   from "./components/Sidebar.jsx";
 import Editor    from "./components/Editor.jsx";
 import Output    from "./components/Output.jsx";
 import AgentLog  from "./components/AgentLog.jsx";
+import { useMigrationStream } from "./hooks/useMigrationStream.js";
 
 const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
@@ -135,13 +136,22 @@ export default function App() {
   const [tgtLang, setTgtLang]         = useState("java");
   const [tgtVer,  setTgtVer]          = useState("17");
 
-  const [result,  setResult]          = useState(null);
-  const [loading, setLoading]         = useState(false);
-  const [apiError, setApiError]       = useState(null);
   const [ollamaStatus, setOllamaStatus] = useState("checking");  // checking | ok | down
   const [activePanel, setActivePanel] = useState("editor");      // editor | output
+  const [pipelineMode, setPipelineMode] = useState("fast");      // fast | deep | validated
 
   const healthTimer = useRef(null);
+
+  // ── Streaming migration hook ───────────────────────────────────────────────
+  const {
+    result,
+    streamBuffer,
+    agentProgress,
+    loading,
+    error,
+    runMigration,
+    cancel,
+  } = useMigrationStream(API_BASE);
 
   // ── Health polling ─────────────────────────────────────────────────────────
   const checkHealth = useCallback(async () => {
@@ -166,46 +176,25 @@ export default function App() {
     setSourceCode(ex.code);
     setSrcLang(ex.sl); setSrcVer(ex.sv);
     setTgtLang(ex.tl); setTgtVer(ex.tv);
-    setResult(null); setApiError(null);
     setActivePanel("editor");
   }, []);
 
-  // ── Run migration ──────────────────────────────────────────────────────────
-  const runMigration = useCallback(async () => {
+  // ── Run migration wrapper ──────────────────────────────────────────────────
+  const handleRunMigration = useCallback(() => {
     if (!sourceCode.trim()) {
-      setApiError("Paste your source code in the left panel first.");
+      // The hook will handle error state
       return;
     }
-    setLoading(true);
-    setApiError(null);
-    setResult(null);
     setActivePanel("output");
-
-    try {
-      const response = await fetch(`${API_BASE}/migrate`, {
-        method:  "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          source_code:     sourceCode,
-          source_language: srcLang,
-          source_version:  srcVer,
-          target_language: tgtLang,
-          target_version:  tgtVer,
-        }),
-      });
-
-      if (!response.ok) {
-        const err = await response.json();
-        throw new Error(err.detail || `HTTP ${response.status}`);
-      }
-      setResult(await response.json());
-    } catch (err) {
-      setApiError(err.message);
-      setActivePanel("editor");
-    } finally {
-      setLoading(false);
-    }
-  }, [sourceCode, srcLang, srcVer, tgtLang, tgtVer]);
+    runMigration({
+      source_code: sourceCode,
+      source_language: srcLang,
+      source_version: srcVer,
+      target_language: tgtLang,
+      target_version: tgtVer,
+      pipeline_mode: pipelineMode,
+    });
+  }, [sourceCode, srcLang, srcVer, tgtLang, tgtVer, pipelineMode, runMigration]);
 
   // ── Render ─────────────────────────────────────────────────────────────────
   return (
@@ -223,11 +212,13 @@ export default function App() {
           srcVer={srcVer}   setSrcVer={setSrcVer}
           tgtLang={tgtLang} setTgtLang={setTgtLang}
           tgtVer={tgtVer}   setTgtVer={setTgtVer}
+          pipelineMode={pipelineMode} setPipelineMode={setPipelineMode}
           loading={loading}
           ollamaStatus={ollamaStatus}
-          apiError={apiError}
+          apiError={error}
           result={result}
-          onRun={runMigration}
+          agentProgress={agentProgress}
+          onRun={handleRunMigration}
         />
 
         {/* ── MAIN PANELS ── */}
@@ -254,9 +245,9 @@ export default function App() {
             </button>
 
             {/* Agent log inline tab */}
-            {result && (
+            {(result || agentProgress.length > 0) && (
               <div style={styles.agentTabArea}>
-                <AgentLog reports={result.reports} compact />
+                <AgentLog reports={result?.reports || []} compact />
               </div>
             )}
           </div>
@@ -273,9 +264,11 @@ export default function App() {
             ) : (
               <Output
                 result={result}
+                streamBuffer={streamBuffer}
                 loading={loading}
                 language={tgtLang}
                 version={tgtVer}
+                agentProgress={agentProgress}
               />
             )}
           </div>

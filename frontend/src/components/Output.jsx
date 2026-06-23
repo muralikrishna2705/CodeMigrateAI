@@ -1,6 +1,6 @@
 import { useState } from "react";
 
-export default function Output({ result, loading, language, version }) {
+export default function Output({ result, streamBuffer, loading, language, version, agentProgress }) {
   const [copied, setCopied] = useState(false);
 
   const handleCopy = () => {
@@ -12,6 +12,39 @@ export default function Output({ result, loading, language, version }) {
 
   // ── Loading state ──────────────────────────────────────────────────────────
   if (loading) {
+    // If streaming, show progress with agent status and code buffer
+    if (agentProgress && agentProgress.length > 0) {
+      return (
+        <div style={st.panel}>
+          <div style={st.header}>
+            <span style={st.label}>Running Agent Pipeline…</span>
+          </div>
+          <div style={st.centered}>
+            <div style={st.agentProgress}>
+              {agentProgress.map((a, i) => (
+                <div key={i} style={st.agentProgressItem}>
+                  <span style={{
+                    ...st.agentStatusDot,
+                    background: a.status === "complete" ? "var(--green)" : "var(--accent)",
+                  }} />
+                  <span style={{ fontSize: 12, color: "var(--text-normal)" }}>
+                    {a.agent} {a.status === "complete" ? "✓" : "⟳"}
+                    {a.message && <span style={{ color: "var(--text-muted)", marginLeft: 8 }}>{a.message}</span>}
+                  </span>
+                </div>
+              ))}
+            </div>
+            {streamBuffer && (
+              <div style={st.streamingCode}>
+                <pre style={st.pre}>{streamBuffer}</pre>
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    // Non-streaming loading state
     return (
       <div style={st.panel}>
         <div style={st.header}>
@@ -40,7 +73,7 @@ export default function Output({ result, loading, language, version }) {
   }
 
   // ── Empty state ────────────────────────────────────────────────────────────
-  if (!result) {
+  if (!result && !streamBuffer) {
     return (
       <div style={st.panel}>
         <div style={st.header}>
@@ -55,33 +88,39 @@ export default function Output({ result, loading, language, version }) {
     );
   }
 
-  // ── Result ─────────────────────────────────────────────────────────────────
-  const lines = result.migrated_code.split("\n").length;
+  // ── Result (or streaming buffer) ─────────────────────────────────────────────
+  const displayCode = streamBuffer || (result?.migrated_code || "");
+  const lines = displayCode.split("\n").length;
+  const isStreaming = loading && streamBuffer;
+
   return (
     <div style={st.panel}>
       <div style={st.header}>
         <span style={st.label}>{language.toUpperCase()} {version} — Output</span>
         <div style={st.actions}>
-          <span style={{
-            ...st.tag,
-            color:       result.success ? "var(--green)"  : "var(--amber)",
-            borderColor: result.success ? "rgba(74,222,128,.3)" : "rgba(251,191,36,.3)",
-            background:  result.success ? "rgba(74,222,128,.08)" : "rgba(251,191,36,.08)",
-          }}>
-            {result.success ? "✓ Success" : "⚠ Partial"}
-          </span>
+          {result && (
+            <span style={{
+              ...st.tag,
+              color:       result.success ? "var(--green)"  : "var(--amber)",
+              borderColor: result.success ? "rgba(74,222,128,.3)" : "rgba(251,191,36,.3)",
+              background:  result.success ? "rgba(74,222,128,.08)" : "rgba(251,191,36,.08)",
+            }}>
+              {result.success ? "✓ Success" : "⚠ Partial"}
+            </span>
+          )}
           <span style={st.lineCount}>{lines} lines</span>
           <button
             style={st.btn}
             onClick={handleCopy}
             onMouseEnter={e => e.target.style.color = "var(--accent)"}
             onMouseLeave={e => e.target.style.color = "var(--text-muted)"}
+            disabled={!displayCode}
           >
             {copied ? "✓ Copied!" : "Copy"}
           </button>
         </div>
       </div>
-      <pre style={st.pre}>{result.migrated_code}</pre>
+      <pre style={st.pre}>{displayCode}</pre>
     </div>
   );
 }
@@ -133,4 +172,8 @@ const st = {
     display: "inline-block", animation: "spin 12s linear infinite",
   },
   emptyText: { fontSize: 13, color: "var(--text-dim)" },
+  agentProgress: { display: "flex", flexDirection: "column", gap: 6, marginBottom: 12 },
+  agentProgressItem: { display: "flex", alignItems: "center", gap: 8, fontSize: 12 },
+  agentStatusDot: { width: 8, height: 8, borderRadius: "50%" },
+  streamingCode: { width: "100%", maxHeight: 400, marginTop: 12 },
 };

@@ -4,6 +4,7 @@ from typing import Optional
 from cache.keys import generate_key
 from cache.manager import CacheManager
 from config import get_settings
+from llm.streaming import SSEStreamHandler
 from models.state import MigrationState
 from pipeline.registry import AgentRegistry
 
@@ -43,15 +44,47 @@ class Pipeline:
 
         agents = self.registry.get_order(state.pipeline_mode)
 
+        # Create streaming handler if enabled
+        stream_handler = None
+        if self.settings.enable_streaming and hasattr(state, "_stream_queue"):
+            stream_handler = SSEStreamHandler(state._stream_queue)
+
         for agent in agents:
-            if agent.name == "MigratorAgent" and self.settings.enable_streaming:
-                agent.stream_callback = getattr(state, "_stream_callback", None)
+            # Send agent start event
+            if stream_handler:
+                await stream_handler.send_agent_start(
+                    agent.name, f"Starting {agent.name}..."
+                )
+
+            # Set stream callback for MigratorAgent
+            if (
+                agent.name == "MigratorAgent"
+                and self.settings.enable_streaming
+                and stream_handler
+            ):
+                agent.stream_callback = stream_handler.send_token
 
             log.info("Running %s...", agent.name)
             state = await agent(state)
 
+            # Send agent complete event
+            if stream_handler:
+                # Get the last report for this agent
+                agent_report = next(
+                    (r for r in reversed(state.reports) if r.agent == agent.name),
+                    None,
+                )
+                if agent_report:
+                    await stream_handler.send_agent_complete(
+                        agent.name, agent_report.model_dump()
+                    )
+
             if state.errors and agent.name == "MigratorAgent":
                 log.error("MigratorAgent failed - stopping pipeline")
+                if stream_handler:
+                    await stream_handler.send_error(
+                        f"MigratorAgent failed: {state.errors[-1]}"
+                    )
                 break
 
         state.completed_at = __import__("datetime").datetime.utcnow()
@@ -64,6 +97,9 @@ class Pipeline:
         ):
             cache_key = generate_key(state)
             await self.cache.set(cache_key, state)
+
+        if stream_handler:
+            await stream_handler.send_complete(state)
 
         log.info(
             "Pipeline END. Agents done: %s | Errors: %d",
