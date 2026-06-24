@@ -21,10 +21,11 @@ class Settings(BaseSettings):
     llm_top_p: float = 0.9
 
     # Pipeline
-    default_pipeline_mode: str = "fast"
     max_code_chars: int = 50_000
+    enable_semantic_analysis: bool = False
 
     # Redis Cache
+    cache_enabled: bool = True
     redis_url: str = "redis://localhost:6379/0"
     redis_enabled: bool = True
     redis_ttl_seconds: int = 86400
@@ -34,6 +35,8 @@ class Settings(BaseSettings):
     local_cache_max_entries: int = 500
 
     # Validators
+    validator_url: str = "http://validator:8000"
+    enable_validation: bool = False
     validator_timeout_sec: int = 30
     enable_syntax_validation: bool = True
     enable_logic_validation: bool = False

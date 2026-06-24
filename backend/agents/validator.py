@@ -1,7 +1,8 @@
 import logging
 
-from agents.base import AgentResult, BaseAgent
 from models.state import MigrationState
+
+from agents.base import AgentResult, BaseAgent
 
 log = logging.getLogger("CodeMigrateAI.ValidatorAgent")
 
@@ -9,7 +10,6 @@ log = logging.getLogger("CodeMigrateAI.ValidatorAgent")
 class ValidatorAgent(BaseAgent):
     name = "ValidatorAgent"
     requires_llm = False
-    fast_mode_skip = True
 
     async def run(self, state: MigrationState) -> AgentResult:
         validation_result = {"syntax_valid": True, "logic_check": None}

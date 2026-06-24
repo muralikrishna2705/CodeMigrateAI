@@ -3,7 +3,6 @@ from collections import OrderedDict
 from typing import Optional
 
 import redis
-
 from config import get_settings
 from models.state import MigrationState
 
@@ -77,7 +76,7 @@ class CacheManager:
         r = self.redis
         if r:
             try:
-                data = await r.get(key)
+                data = r.get(key)
                 if data:
                     state = MigrationState.model_validate_json(data)
                     self.local.set(key, state)
@@ -93,7 +92,7 @@ class CacheManager:
         r = self.redis
         if r:
             try:
-                await r.setex(key, self._ttl, state.model_dump_json())
+                r.setex(key, self._ttl, state.model_dump_json())
                 log.debug(f"Cache set (redis): {key[:16]}...")
             except Exception as e:
                 log.warning(f"Redis set failed: {e}")

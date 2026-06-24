@@ -1,12 +1,11 @@
 """
-CodeMigrateAI — Backend
-MTech Final Year Project
+CodeMigrateAI backend.
 
-Three-agent pipeline:
-  AnalyzerAgent → PlannerAgent → MigratorAgent
+Two-agent LLM-first pipeline:
+  AnalyzerAgent -> MigratorAgent
 
-LLM: deepseek-coder:1.3b via Ollama (~800 MB, free, open-source)
-     Ollama runs on Windows host — Docker reaches it via host.docker.internal
+Ollama runs on the Windows host and is reached from Docker through
+host.docker.internal by default.
 """
 
 from __future__ import annotations
@@ -16,16 +15,16 @@ import logging
 import sys
 from contextlib import asynccontextmanager
 
+from cache.manager import CacheManager
+from config import get_settings
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-
-from cache.manager import CacheManager
-from config import get_settings
 from llm.client import LLMClient
+from llm.language_profiles import get_supported_profiles
 from llm.streaming import sse_event_generator
 from models.requests import MigrateRequest, MigrateResponse
-from models.state import MigrationState, PipelineMode
+from models.state import MigrationState
 from pipeline.orchestrator import Pipeline
 
 logging.basicConfig(
@@ -47,14 +46,14 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     log.info("OLLAMA_URL : %s", settings.ollama_url)
     log.info("LLM_MODEL  : %s", settings.llm_model)
-    log.info("PIPELINE_MODE: %s", settings.default_pipeline_mode)
+    log.info("PIPELINE   : AnalyzerAgent -> MigratorAgent")
 
     llm_client = LLMClient()
     alive = await llm_client.health_check()
     if alive:
         log.info("Ollama is reachable and ready")
     else:
-        log.warning("Ollama not reachable — check that Ollama is running on Windows")
+        log.warning("Ollama is not reachable; check that Ollama is running")
 
     cache_manager = CacheManager()
     pipeline = Pipeline(llm_client, cache_manager)
@@ -67,7 +66,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="CodeMigrateAI",
-    description="AI-driven code migration — MTech Final Year Project",
+    description="AI-driven code migration platform",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -83,34 +82,32 @@ app.add_middleware(
 
 @app.get("/health")
 async def health():
-    """Health check — used by the frontend status pill."""
     alive = await llm_client.health_check()
+    profiles = get_supported_profiles()
     return {
         "status": "ok",
         "model": get_settings().llm_model,
         "ollama": "connected" if alive else "unavailable",
+        "prompt_composer": "ready",
+        "language_profiles": sorted(profiles),
+        "language_profile_count": len(profiles),
     }
 
 
 @app.get("/languages")
 async def get_languages():
-    """All languages shown in the source / target dropdowns."""
     return {"languages": get_settings().supported_languages}
 
 
 @app.post("/migrate", response_model=MigrateResponse)
 async def migrate(request: MigrateRequest):
-    """
-    Core endpoint. Runs AnalyzerAgent → PlannerAgent → MigratorAgent
-    and returns the migrated code. Called by the frontend Run Migration button.
-    """
     if not await llm_client.health_check():
         raise HTTPException(
             status_code=503,
             detail=(
                 f"Ollama is not reachable at {get_settings().ollama_url}. "
-                f"Make sure Ollama is running on Windows "
-                f"and model '{get_settings().llm_model}' is pulled."
+                f"Make sure Ollama is running and model "
+                f"'{get_settings().llm_model}' is pulled."
             ),
         )
 
@@ -120,9 +117,6 @@ async def migrate(request: MigrateRequest):
         source_version=request.source_version,
         target_language=request.target_language,
         target_version=request.target_version,
-        pipeline_mode=PipelineMode(
-            request.pipeline_mode or get_settings().default_pipeline_mode
-        ),
     )
 
     try:
@@ -134,6 +128,7 @@ async def migrate(request: MigrateRequest):
     return MigrateResponse(
         success=bool(final_state.migrated_code) and not final_state.errors,
         migrated_code=final_state.migrated_code,
+        inline_plan=final_state.inline_plan,
         migration_type=final_state.migration_type.value,
         source_language=final_state.source_language,
         source_version=final_state.source_version,
@@ -148,21 +143,13 @@ async def migrate(request: MigrateRequest):
 
 @app.post("/migrate/stream")
 async def migrate_stream(request: MigrateRequest):
-    """
-    SSE streaming endpoint. Returns Server-Sent Events with:
-    - agent_start: when an agent begins
-    - agent_complete: when an agent finishes
-    - token: incremental code tokens from MigratorAgent
-    - complete: final result
-    - error: any error
-    """
     if not await llm_client.health_check():
         raise HTTPException(
             status_code=503,
             detail=(
                 f"Ollama is not reachable at {get_settings().ollama_url}. "
-                f"Make sure Ollama is running on Windows "
-                f"and model '{get_settings().llm_model}' is pulled."
+                f"Make sure Ollama is running and model "
+                f"'{get_settings().llm_model}' is pulled."
             ),
         )
 
@@ -172,12 +159,8 @@ async def migrate_stream(request: MigrateRequest):
         source_version=request.source_version,
         target_language=request.target_language,
         target_version=request.target_version,
-        pipeline_mode=PipelineMode(
-            request.pipeline_mode or get_settings().default_pipeline_mode
-        ),
     )
 
-    # Create queue for SSE events
     queue = asyncio.Queue()
     state._stream_queue = queue
 
@@ -185,13 +168,12 @@ async def migrate_stream(request: MigrateRequest):
         async for event in sse_event_generator(queue):
             yield event
 
-    # Run pipeline in background
     async def run_pipeline():
         try:
             await pipeline.run(state)
-        except Exception as e:
+        except Exception as exc:
             log.exception("Streaming pipeline error")
-            await queue.put({"type": "error", "message": str(e)})
+            await queue.put({"type": "error", "message": str(exc)})
 
     asyncio.create_task(run_pipeline())
 

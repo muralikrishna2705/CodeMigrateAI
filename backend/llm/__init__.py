@@ -1,11 +1,12 @@
 from .client import LLMClient
-from .prompts import ANALYZER_PROMPT, PLANNER_PROMPT
+from .prompt_composer import PromptComposer
+from .prompts import ANALYZER_PROMPT
 from .streaming import SSEStreamHandler, sse_event_generator
 
 __all__ = [
     "LLMClient",
+    "PromptComposer",
     "ANALYZER_PROMPT",
-    "PLANNER_PROMPT",
     "SSEStreamHandler",
     "sse_event_generator",
 ]

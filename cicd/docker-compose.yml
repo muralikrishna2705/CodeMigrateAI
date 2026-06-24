@@ -7,6 +7,7 @@
 #   Backend →  Docker container, talks to Ollama via host.docker.internal:11434
 #   Frontend → Docker container, served by Nginx on port 3000
 #   Redis   →  Cache layer for migration results
+#   Validator -> Optional syntax validation service
 #
 # HOW TO RUN (first time or after any code change):
 #   docker compose -f cicd/docker-compose.yml down --remove-orphans
@@ -36,7 +37,7 @@ services:
 
   # ---------------------------------------------------------------------------
   # BACKEND — FastAPI + AI Agent Pipeline
-  # Agents: AnalyzerAgent → PlannerAgent → MigratorAgent
+  # Agents: AnalyzerAgent -> MigratorAgent
   # LLM: deepseek-coder:1.3b via Ollama on Windows host
   # ---------------------------------------------------------------------------
   backend:
@@ -49,13 +50,35 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - REDIS_URL=redis://redis:6379/0
+      - VALIDATOR_URL=http://validator:8000
+      - ENABLE_VALIDATION=true
     extra_hosts:
       # This resolves host.docker.internal → your Windows machine IP
       # so the container can reach Ollama running on Windows
       - "host.docker.internal:host-gateway"
     depends_on:
       - redis
+      - validator
     restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # VALIDATOR - optional language syntax validation service
+  # ---------------------------------------------------------------------------
+  validator:
+    build:
+      context:    ../validator_service
+      dockerfile: Dockerfile
+    container_name: codemigrateai-validator
+    ports:
+      - "8001:8000"
+    environment:
+      - VALIDATOR_TIMEOUT=30
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   # ---------------------------------------------------------------------------
   # FRONTEND — React app built by Vite, served by Nginx

@@ -138,7 +138,6 @@ export default function App() {
 
   const [ollamaStatus, setOllamaStatus] = useState("checking");  // checking | ok | down
   const [activePanel, setActivePanel] = useState("editor");      // editor | output
-  const [pipelineMode, setPipelineMode] = useState("fast");      // fast | deep | validated
 
   const healthTimer = useRef(null);
 
@@ -192,9 +191,8 @@ export default function App() {
       source_version: srcVer,
       target_language: tgtLang,
       target_version: tgtVer,
-      pipeline_mode: pipelineMode,
     });
-  }, [sourceCode, srcLang, srcVer, tgtLang, tgtVer, pipelineMode, runMigration]);
+  }, [sourceCode, srcLang, srcVer, tgtLang, tgtVer, runMigration]);
 
   // ── Render ─────────────────────────────────────────────────────────────────
   return (
@@ -212,7 +210,6 @@ export default function App() {
           srcVer={srcVer}   setSrcVer={setSrcVer}
           tgtLang={tgtLang} setTgtLang={setTgtLang}
           tgtVer={tgtVer}   setTgtVer={setTgtVer}
-          pipelineMode={pipelineMode} setPipelineMode={setPipelineMode}
           loading={loading}
           ollamaStatus={ollamaStatus}
           apiError={error}

@@ -1,5 +1,6 @@
 async def validate_syntax(code: str, language: str):
-    from models.validation import SyntaxError, ValidationResult
+    from models.validation import SyntaxError as SyntaxDiagnostic
+    from models.validation import ValidationResult
 
     if language == "python":
         try:
@@ -10,7 +11,7 @@ async def validate_syntax(code: str, language: str):
             return ValidationResult(
                 valid=False,
                 errors=[
-                    SyntaxError(
+                    SyntaxDiagnostic(
                         line=e.lineno or 0, column=e.offset or 0, message=e.msg
                     )
                 ],
@@ -22,7 +23,7 @@ async def validate_syntax(code: str, language: str):
             valid=True,
             errors=[],
             warnings=[
-                SyntaxError(
+                SyntaxDiagnostic(
                     line=0,
                     column=0,
                     message="Java validation not implemented - requires javac",
@@ -34,7 +35,7 @@ async def validate_syntax(code: str, language: str):
         valid=True,
         errors=[],
         warnings=[
-            SyntaxError(
+            SyntaxDiagnostic(
                 line=0, column=0, message=f"No validator for {language}"
             )
         ],

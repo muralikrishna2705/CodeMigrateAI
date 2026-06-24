@@ -15,7 +15,6 @@ const LANGUAGES = [
 export default function Sidebar({
   srcLang, setSrcLang, srcVer, setSrcVer,
   tgtLang, setTgtLang, tgtVer, setTgtVer,
-  pipelineMode, setPipelineMode,
   loading, ollamaStatus, apiError, result, agentProgress, onRun,
 }) {
   const srcDef = LANGUAGES.find(l => l.id === srcLang) || LANGUAGES[0];
@@ -76,19 +75,6 @@ export default function Sidebar({
         options={tgtDef.versions.map(v => ({ value: v, label: v }))}
       />
 
-      {/* ── Pipeline Mode ── */}
-      <SectionLabel text="Mode" />
-      <SelectRow
-        label="Pipeline"
-        value={pipelineMode}
-        onChange={setPipelineMode}
-        options={[
-          { value: "fast", label: "Fast (1 LLM call)" },
-          { value: "deep", label: "Deep (3 LLM calls)" },
-          { value: "validated", label: "Validated (+syntax)" },
-        ]}
-      />
-
       {/* ── Run button ── */}
       <button
         style={{ ...st.runBtn, ...(canRun ? {} : st.runBtnDisabled) }}
@@ -97,7 +83,7 @@ export default function Sidebar({
       >
         {loading
           ? <><Spinner /> Migrating…</>
-          : <>"⟳  Run Migration"</>
+          : <>Run Migration</>
         }
       </button>
 

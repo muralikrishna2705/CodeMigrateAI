@@ -2,24 +2,24 @@ import logging
 import re
 from typing import Any
 
-from agents.base import AgentResult, BaseAgent
 from llm.prompts import ANALYZER_PROMPT
 from models.state import MigrationState
+
+from agents.base import AgentResult, BaseAgent
 
 log = logging.getLogger("CodeMigrateAI.AnalyzerAgent")
 
 
 class AnalyzerAgent(BaseAgent):
     name = "AnalyzerAgent"
-    requires_llm = True
-    fast_mode_skip = True
+    requires_llm = False
 
     async def run(self, state: MigrationState) -> AgentResult:
         code = state.source_code
 
         static_metrics = self._compute_static_metrics(code)
 
-        if state.pipeline_mode.value in ("deep", "validated"):
+        if self.config.get("enable_semantic_analysis"):
             try:
                 semantic = await self._llm_semantic_analysis(state, code)
                 metrics = {**static_metrics, **semantic}

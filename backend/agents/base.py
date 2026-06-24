@@ -19,7 +19,6 @@ class AgentResult:
 class BaseAgent(ABC):
     name: str = "BaseAgent"
     requires_llm: bool = True
-    fast_mode_skip: bool = False
 
     def __init__(self, llm_client, config: dict | None = None):
         self.llm = llm_client
@@ -34,7 +33,7 @@ class BaseAgent(ABC):
         log.info("[%s] Starting", self.name)
 
         if not self.should_run(state):
-            state.record_skip(self.name, f"Skipped in {state.pipeline_mode.value} mode")
+            state.record_skip(self.name, "Skipped by agent configuration")
             return state
 
         try:
@@ -64,14 +63,4 @@ class BaseAgent(ABC):
         return state
 
     def should_run(self, state: MigrationState) -> bool:
-        if state.pipeline_mode.value == "fast" and self.fast_mode_skip:
-            if self.name == "PlannerAgent" and self._has_recipe(state):
-                return False
         return True
-
-    def _has_recipe(self, state: MigrationState) -> bool:
-        from agents.planner import MIGRATION_RECIPES
-
-        src = state.source_language.lower()
-        tgt = state.target_language.lower()
-        return (src, tgt) in MIGRATION_RECIPES

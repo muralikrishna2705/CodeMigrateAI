@@ -10,12 +10,6 @@ class MigrationType(str, Enum):
     CONVERT_LANGUAGE = "convert_language"
 
 
-class PipelineMode(str, Enum):
-    FAST = "fast"
-    DEEP = "deep"
-    VALIDATED = "validated"
-
-
 class AgentReport(BaseModel):
     agent: str
     status: str
@@ -31,11 +25,10 @@ class MigrationState(BaseModel):
     source_version: str
     target_language: str
     target_version: str
-    pipeline_mode: PipelineMode = PipelineMode.FAST
 
     migration_type: MigrationType = MigrationType.UPGRADE_VERSION
     code_metrics: Optional[dict] = None
-    migration_plan: Optional[dict] = None
+    inline_plan: str = ""
     migrated_code: str = ""
     validation_result: Optional[dict] = None
 

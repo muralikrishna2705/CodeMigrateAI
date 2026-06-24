@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 LABEL maintainer="MTech Final Year Project — CodeMigrateAI"
-LABEL description="FastAPI backend with DeepSeek-Coder-V2 agent pipeline"
+LABEL description="FastAPI backend with two-agent LLM-first migration pipeline"
 
 WORKDIR /app
 
@@ -9,8 +9,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy source
-COPY main.py .
+# Copy backend source
+COPY . .
 
 # Non-root user for security
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app

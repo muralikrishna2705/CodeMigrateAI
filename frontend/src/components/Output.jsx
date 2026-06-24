@@ -58,8 +58,7 @@ export default function Output({ result, streamBuffer, loading, language, versio
           </div>
           <div style={st.steps}>
             <div style={st.step}>🔍 AnalyzerAgent — examining code structure…</div>
-            <div style={st.step}>📋 PlannerAgent — building migration strategy…</div>
-            <div style={st.step}>⚡ MigratorAgent — generating output with DeepSeek-Coder-V2…</div>
+            <div style={st.step}>⚡ MigratorAgent — composing prompt and generating output…</div>
           </div>
           <style>{`
             @keyframes bounce {
@@ -89,9 +88,10 @@ export default function Output({ result, streamBuffer, loading, language, versio
   }
 
   // ── Result (or streaming buffer) ─────────────────────────────────────────────
-  const displayCode = streamBuffer || (result?.migrated_code || "");
+  const displayCode = result?.migrated_code || streamBuffer || "";
+  const planSummary = result?.inline_plan || "";
+  const validationState = getValidationState(result?.validation_result);
   const lines = displayCode.split("\n").length;
-  const isStreaming = loading && streamBuffer;
 
   return (
     <div style={st.panel}>
@@ -108,6 +108,16 @@ export default function Output({ result, streamBuffer, loading, language, versio
               {result.success ? "✓ Success" : "⚠ Partial"}
             </span>
           )}
+          {validationState && (
+            <span style={{
+              ...st.tag,
+              color: validationState.color,
+              borderColor: validationState.border,
+              background: validationState.background,
+            }}>
+              {validationState.label}
+            </span>
+          )}
           <span style={st.lineCount}>{lines} lines</span>
           <button
             style={st.btn}
@@ -120,9 +130,70 @@ export default function Output({ result, streamBuffer, loading, language, versio
           </button>
         </div>
       </div>
+      {planSummary && (
+        <div style={st.plan}>
+          <span style={st.planLabel}>Plan</span>
+          <span style={st.planText}>{planSummary}</span>
+        </div>
+      )}
+      {validationState?.items.length > 0 && (
+        <details style={st.validation}>
+          <summary style={st.validationSummary}>Validation details</summary>
+          <div style={st.validationList}>
+            {validationState.items.map((item, index) => (
+              <div key={index} style={st.validationItem}>
+                {formatIssue(item)}
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
       <pre style={st.pre}>{displayCode}</pre>
     </div>
   );
+}
+
+function getValidationState(validation) {
+  if (!validation) return null;
+
+  const valid = Boolean(validation.valid ?? validation.syntax_valid);
+  const syntaxErrors = validation.syntax_errors || {};
+  const errors = validation.errors || syntaxErrors.errors || [];
+  const warnings = validation.warnings || syntaxErrors.warnings || [];
+  const items = [...errors, ...warnings];
+
+  if (!valid) {
+    return {
+      label: "Validation failed",
+      color: "var(--red)",
+      border: "rgba(248,113,113,.3)",
+      background: "rgba(248,113,113,.08)",
+      items,
+    };
+  }
+
+  if (warnings.length > 0) {
+    return {
+      label: "Validation warnings",
+      color: "var(--amber)",
+      border: "rgba(251,191,36,.3)",
+      background: "rgba(251,191,36,.08)",
+      items,
+    };
+  }
+
+  return {
+    label: "Validation OK",
+    color: "var(--green)",
+    border: "rgba(74,222,128,.3)",
+    background: "rgba(74,222,128,.08)",
+    items: [],
+  };
+}
+
+function formatIssue(issue) {
+  const location = issue.line ? `${issue.line}:${issue.column || 0} ` : "";
+  return `${location}${issue.message || String(issue)}`;
 }
 
 const st = {
@@ -140,6 +211,31 @@ const st = {
   tag: {
     padding: "2px 8px", borderRadius: 4, fontSize: 10,
     fontWeight: 700, border: "1px solid",
+  },
+  plan: {
+    display: "flex", gap: 10, alignItems: "flex-start",
+    padding: "9px 16px", background: "var(--bg-base)",
+    borderBottom: "1px solid var(--border)", flexShrink: 0,
+  },
+  planLabel: {
+    fontSize: 10, fontWeight: 700, textTransform: "uppercase",
+    color: "var(--accent)", fontFamily: "var(--font-code)",
+  },
+  planText: { fontSize: 12, color: "var(--text-normal)", lineHeight: 1.45 },
+  validation: {
+    padding: "8px 16px", background: "var(--bg-base)",
+    borderBottom: "1px solid var(--border)", flexShrink: 0,
+  },
+  validationSummary: {
+    color: "var(--text-muted)", cursor: "pointer", fontSize: 11,
+    fontFamily: "var(--font-ui)",
+  },
+  validationList: {
+    display: "flex", flexDirection: "column", gap: 5, marginTop: 8,
+  },
+  validationItem: {
+    color: "var(--text-normal)", fontSize: 11,
+    fontFamily: "var(--font-code)", lineHeight: 1.5,
   },
   lineCount: { fontSize: 10, color: "var(--text-dim)", fontFamily: "var(--font-code)" },
   btn: {

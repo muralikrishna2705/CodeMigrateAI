@@ -6,6 +6,7 @@ from cache.manager import CacheManager
 from config import get_settings
 from llm.streaming import SSEStreamHandler
 from models.state import MigrationState
+
 from pipeline.registry import AgentRegistry
 
 log = logging.getLogger("CodeMigrateAI.Pipeline")
@@ -20,7 +21,7 @@ class Pipeline:
     ):
         self.settings = settings or get_settings()
         self.cache = cache_manager
-        self.registry = AgentRegistry(llm_client)
+        self.registry = AgentRegistry(llm_client, self.settings)
 
     async def run(self, state: MigrationState) -> MigrationState:
         if self.cache and self.settings.cache_enabled:
@@ -28,21 +29,21 @@ class Pipeline:
             cached = await self.cache.get(cache_key)
             if cached:
                 log.info("Cache hit for %s...", cache_key[:16])
+                await self._run_optional_validation(cached)
                 return cached
 
         log.info("=" * 60)
         log.info(
-            "Pipeline START: %s %s to %s %s (mode=%s)",
+            "Pipeline START: %s %s to %s %s",
             state.source_language,
             state.source_version,
             state.target_language,
             state.target_version,
-            state.pipeline_mode.value,
         )
         log.info("Source size: %d chars", len(state.source_code))
         log.info("=" * 60)
 
-        agents = self.registry.get_order(state.pipeline_mode)
+        agents = self.registry.get_order()
 
         # Create streaming handler if enabled
         stream_handler = None
@@ -87,6 +88,8 @@ class Pipeline:
                     )
                 break
 
+        await self._run_optional_validation(state)
+
         state.completed_at = __import__("datetime").datetime.utcnow()
 
         if (
@@ -108,13 +111,52 @@ class Pipeline:
         )
         return state
 
+    async def _run_optional_validation(self, state: MigrationState):
+        if (
+            not self.settings.enable_validation
+            or not state.migrated_code
+            or state.errors
+            or state.validation_result
+        ):
+            return
+
+        from clients.validator_client import ValidatorClient
+
+        validator = ValidatorClient(
+            base_url=self.settings.validator_url,
+            timeout_sec=self.settings.validator_timeout_sec,
+        )
+        try:
+            state.validation_result = await validator.validate(
+                code=state.migrated_code,
+                language=state.target_language,
+                version=state.target_version,
+            )
+        except Exception as exc:
+            log.warning("Validator service unavailable: %s", exc)
+            state.validation_result = {
+                "valid": False,
+                "errors": [],
+                "warnings": [
+                    {
+                        "line": 0,
+                        "column": 0,
+                        "message": f"Validator service unavailable: {exc}",
+                        "severity": "warning",
+                    }
+                ],
+                "service_error": str(exc),
+            }
+        finally:
+            await validator.close()
+
 
 async def run_migration_pipeline(state: MigrationState) -> MigrationState:
     from cache.manager import CacheManager
     from llm.client import LLMClient
 
     llm = LLMClient()
-    cache = CacheManager() if state.pipeline_mode.value != "fast" else None
+    cache = CacheManager()
     pipeline = Pipeline(llm, cache)
 
     try:

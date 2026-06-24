@@ -1,8 +1,13 @@
+import json
 import logging
 import re
+from typing import Any
+
+from llm.language_profiles import ProfileRegistry, get_profile
+from llm.prompt_composer import PromptComposer
+from models.state import MigrationState, MigrationType
 
 from agents.base import AgentResult, BaseAgent
-from models.state import MigrationState, MigrationType
 
 log = logging.getLogger("CodeMigrateAI.MigratorAgent")
 
@@ -10,132 +15,171 @@ log = logging.getLogger("CodeMigrateAI.MigratorAgent")
 class MigratorAgent(BaseAgent):
     name = "MigratorAgent"
     requires_llm = True
-    fast_mode_skip = False
 
     def __init__(self, llm_client, config: dict | None = None):
         super().__init__(llm_client, config)
         self.stream_callback = config.get("stream_callback") if config else None
+        self.prompt_composer = PromptComposer()
 
     async def run(self, state: MigrationState) -> AgentResult:
-        plan = state.migration_plan or {}
-        metrics = state.code_metrics or {}
-        is_upgrade = state.migration_type == MigrationType.UPGRADE_VERSION
+        source_profile = get_profile(state.source_language)
+        target_profile = get_profile(state.target_language)
+        state.migration_type = self._detect_migration_type(state)
 
-        system_prompt = self._build_system_prompt(state, is_upgrade)
-        context = self._build_context(plan, metrics)
-        code_for_prompt = state.source_code[:4000]
-        user_prompt = self._build_user_prompt(
-            state, context, code_for_prompt, is_upgrade
+        prompt = self.prompt_composer.compose(
+            source_profile=source_profile,
+            target_profile=target_profile,
+            source_version=state.source_version,
+            target_version=state.target_version,
+            source_code=state.source_code[:4000],
+            analyzer_context=state.code_metrics or {},
+            migration_type=state.migration_type.value,
         )
+        system_prompt = self._build_system_prompt(state)
 
-        if self.stream_callback:
-            raw_output = ""
-            async for token in self.llm.stream_llm(user_prompt, system_prompt):
-                raw_output += token
-                await self.stream_callback(token)
-        else:
-            raw_output = await self.llm.call_llm(user_prompt, system_prompt)
+        raw_output = await self._call_llm(prompt, system_prompt)
+        try:
+            parsed = self._parse_llm_output(raw_output)
+        except ValueError as first_error:
+            log.warning("LLM JSON parse failed: %s", first_error)
+            retry_prompt = self._build_retry_prompt(raw_output)
+            try:
+                retry_output = await self.llm.call_llm(retry_prompt, system_prompt)
+                parsed = self._parse_llm_output(retry_output)
+            except Exception as retry_error:
+                log.warning("LLM JSON retry failed: %s", retry_error)
+                parsed = self._fallback_from_raw(raw_output)
 
-        cleaned_code = self._strip_fences(raw_output)
+        state.inline_plan = parsed["plan_summary"].strip()
+        state.migrated_code = parsed["migrated_code"].strip()
 
-        if not cleaned_code.strip():
-            raise ValueError("LLM returned empty code output")
+        if not state.migrated_code:
+            raise ValueError("LLM returned empty migrated_code")
 
-        state.migrated_code = cleaned_code
-
+        output_lines = len(state.migrated_code.splitlines())
         return AgentResult(
             success=True,
             summary=(
-                f"Generated {len(cleaned_code.splitlines())} lines of "
+                f"Generated {output_lines} lines of "
                 f"{state.target_language} {state.target_version}"
             ),
             details={
-                "input_lines": metrics.get("total_lines"),
-                "output_lines": len(cleaned_code.splitlines()),
+                "input_lines": (state.code_metrics or {}).get("total_lines"),
+                "output_lines": output_lines,
                 "migration_type": state.migration_type.value,
+                "plan_summary": state.inline_plan,
             },
         )
 
-    def _build_system_prompt(self, state: MigrationState, is_upgrade: bool) -> str:
-        if is_upgrade:
+    async def _call_llm(self, prompt: str, system_prompt: str) -> str:
+        if not self.stream_callback:
+            return await self.llm.call_llm(prompt, system_prompt)
+
+        raw_output = ""
+        async for token in self.llm.stream_llm(prompt, system_prompt):
+            raw_output += token
+            await self.stream_callback(token)
+        return raw_output
+
+    def _detect_migration_type(self, state: MigrationState) -> MigrationType:
+        source = ProfileRegistry.normalize(state.source_language)
+        target = ProfileRegistry.normalize(state.target_language)
+        if source == target:
+            return MigrationType.UPGRADE_VERSION
+        return MigrationType.CONVERT_LANGUAGE
+
+    def _build_system_prompt(self, state: MigrationState) -> str:
+        if state.migration_type == MigrationType.UPGRADE_VERSION:
             return (
-                "You are an expert "
-                f"{state.source_language} developer who specialises in "
-                "version migration. Your task is to upgrade "
-                f"{state.source_language} code from version "
-                f"{state.source_version} to {state.target_version}.\n"
-            "Rules:\n"
-            "  1. Output ONLY the migrated code — no explanations, "
-            "no markdown fences\n"
-            "  2. Preserve ALL original logic and business "
-            "functionality exactly\n"
-            "  3. Apply every transformation from the migration "
-            "plan below\n"
-            "  4. Add a short comment only where a migration "
-            "change is non-obvious\n"
-            "  5. Keep the same class/method structure unless "
-            "restructuring is required"
-        )
+                f"You are a senior {state.target_language} modernization engineer. "
+                "Preserve behavior exactly, apply safe target-version idioms, "
+                "and return only the requested JSON object."
+            )
         return (
-            "You are an expert polyglot software engineer. "
-            "Your task is to convert "
-            f"{state.source_language} code to idiomatic "
-            f"{state.target_language} {state.target_version}.\n"
-            "Rules:\n"
-            "  1. Output ONLY the converted code — no explanations, "
-            "no markdown fences\n"
-            "  2. Preserve ALL original logic and business "
-            "functionality exactly\n"
-            "  3. Use idiomatic "
-            f"{state.target_language} — do NOT do a "
-            "word-for-word translation\n"
-            "  4. Apply every transformation from the migration "
-            "plan below\n"
-            "  5. Use "
-            f"{state.target_language} standard library equivalents "
-            "throughout"
+            "You are a senior polyglot migration engineer. Preserve behavior "
+            f"while converting {state.source_language} to idiomatic "
+            f"{state.target_language}. Return only the requested JSON object."
         )
 
-    def _build_context(self, plan: dict, metrics: dict) -> str:
-        context_lines = []
-        if plan.get("strategy"):
-            context_lines.append(f"Migration strategy: {plan['strategy']}")
-        if plan.get("syntax_changes"):
-            context_lines.append("Syntax transformations to apply:")
-            context_lines.extend(f"  - {c}" for c in plan["syntax_changes"][:10])
-        if plan.get("api_changes"):
-            context_lines.append("API mappings to apply:")
-            context_lines.extend(f"  - {a}" for a in plan["api_changes"][:10])
-        if metrics.get("deprecated_patterns"):
-            context_lines.append("Deprecated patterns to fix:")
-            context_lines.extend(f"  - {d}" for d in metrics["deprecated_patterns"][:5])
-        if plan.get("risk_areas"):
-            context_lines.append("Handle these carefully:")
-            context_lines.extend(f"  ⚠ {r}" for r in plan["risk_areas"][:5])
-        return "\n".join(context_lines)
+    def _parse_llm_output(self, raw: str) -> dict[str, str]:
+        data = self._extract_json(raw)
+        plan_summary = str(data.get("plan_summary", "")).strip()
+        migrated_code = str(
+            data.get("migrated_code")
+            or data.get("code")
+            or data.get("output")
+            or ""
+        ).strip()
+        if not migrated_code:
+            raise ValueError("JSON response did not contain migrated_code")
+        if not plan_summary:
+            plan_summary = "Migration plan generated by the LLM."
+        return {"plan_summary": plan_summary, "migrated_code": migrated_code}
 
-    def _build_user_prompt(
-        self, state: MigrationState, context: str, code: str, is_upgrade: bool
-    ) -> str:
-        action = (
-            f"Upgrade from {state.source_version} to {state.target_version}"
-            if is_upgrade
-            else f"Convert to {state.target_language} {state.target_version}"
-        )
+    def _extract_json(self, raw: str) -> dict[str, Any]:
+        text = raw.strip()
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            pass
+
+        if hasattr(self.llm, "extract_json"):
+            try:
+                data = self.llm.extract_json(raw)
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                pass
+
+        for block in re.findall(r"```(?:json)?\s*([\s\S]*?)```", raw):
+            try:
+                data = json.loads(block.strip())
+                if isinstance(data, dict):
+                    return data
+            except json.JSONDecodeError:
+                continue
+
+        for candidate in sorted(
+            re.findall(r"\{[\s\S]*\}", raw),
+            key=len,
+            reverse=True,
+        ):
+            try:
+                data = json.loads(candidate)
+                if isinstance(data, dict):
+                    return data
+            except json.JSONDecodeError:
+                continue
+
+        raise ValueError("No valid JSON object in LLM response")
+
+    def _build_retry_prompt(self, raw_output: str) -> str:
         return (
-            f"{action}\n\n"
-            f"{context}\n\n"
-            f"SOURCE CODE ({state.source_language} {state.source_version}):\n"
-            f"{code}\n\n"
-            f"OUTPUT ({state.target_language} {state.target_version}) — "
-            "only the code, nothing else:"
+            "Your previous response was not valid JSON for CodeMigrateAI.\n"
+            "Rewrite it as a single valid JSON object with exactly these keys:\n"
+            '  "plan_summary": string\n'
+            '  "migrated_code": string\n'
+            "Do not add markdown, comments outside JSON, or extra keys.\n\n"
+            f"Previous response:\n{raw_output[:5000]}"
         )
+
+    def _fallback_from_raw(self, raw: str) -> dict[str, str]:
+        code = self._strip_fences(raw)
+        return {
+            "plan_summary": (
+                "The LLM returned unstructured output; CodeMigrateAI extracted "
+                "the migrated code directly."
+            ),
+            "migrated_code": code,
+        }
 
     def _strip_fences(self, raw: str) -> str:
-        fenced = re.match(r"^```[\w]*\n([\s\S]*?)```\s*$", raw.strip())
+        fenced = re.match(r"^```[\w+-]*\n([\s\S]*?)```\s*$", raw.strip())
         if fenced:
             return fenced.group(1).strip()
-        cleaned = re.sub(r"^```[\w]*\n?", "", raw.strip())
+        cleaned = re.sub(r"^```[\w+-]*\n?", "", raw.strip())
         cleaned = re.sub(r"\n?```$", "", cleaned.strip())
         cleaned = re.sub(
             r"(?i)^(here(?:'s| is) the (?:migrated|converted|upgraded) code[:\s]*\n)",

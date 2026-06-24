@@ -1,6 +1,6 @@
 export default function Header({ ollamaStatus, examples, onLoadExample }) {
   const statusColors = {
-    ok:       { color: "#22d3a0", dot: "#22d3a0", label: "DeepSeek-Coder-V2 Ready" },
+    ok:       { color: "#22d3a0", dot: "#22d3a0", label: "LLM-Powered Migration Ready" },
     down:     { color: "#f87171", dot: "#f87171", label: "Ollama Offline"          },
     checking: { color: "#506070", dot: "#506070", label: "Checking…"               },
   };
@@ -15,7 +15,7 @@ export default function Header({ ollamaStatus, examples, onLoadExample }) {
           <span style={st.logoText}>
             Code<span style={{ color: "var(--accent)", fontWeight: 800 }}>Migrate</span>AI
           </span>
-          <span style={st.logoSub}>AI-Driven Code Migration Platform</span>
+          <span style={st.logoSub}>LLM-Powered Code Migration Platform</span>
         </div>
       </div>
 

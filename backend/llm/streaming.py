@@ -24,7 +24,21 @@ class SSEStreamHandler:
         )
 
     async def send_complete(self, state: Any):
-        await self.queue.put({"type": "complete", "result": state.model_dump()})
+        result = {
+            "success": bool(state.migrated_code) and not state.errors,
+            "migrated_code": state.migrated_code,
+            "inline_plan": state.inline_plan,
+            "migration_type": state.migration_type.value,
+            "source_language": state.source_language,
+            "source_version": state.source_version,
+            "target_language": state.target_language,
+            "target_version": state.target_version,
+            "reports": [report.model_dump() for report in state.reports],
+            "errors": state.errors,
+            "agents_completed": state.agents_done,
+            "validation_result": state.validation_result,
+        }
+        await self.queue.put({"type": "complete", "result": result})
 
     async def send_error(self, message: str):
         await self.queue.put({"type": "error", "message": message})
