@@ -240,12 +240,19 @@ class PromptComposer:
 
     def _build_output_format(self) -> str:
         return (
-            "OUTPUT FORMAT\n"
-            "Return ONLY valid JSON. Do not use markdown fences. Do not add prose.\n"
-            "The JSON object must match this schema exactly:\n"
+            "OUTPUT FORMAT — CRITICAL: OUTPUT ONLY VALID JSON\n"
+            "No markdown fences, no code blocks, no explanations, no prose.\n"
+            "Your entire response must be a single JSON object matching this schema:\n"
             "{\n"
-            '  "plan_summary": "One concise sentence summarizing the migration '
-            'plan.",\n'
+            '  "plan_summary": "One concise sentence summarizing the migration plan.",\n'
             '  "migrated_code": "The complete migrated source code as a string."\n'
-            "}"
+            "}\n\n"
+            "VALID EXAMPLE:\n"
+            "{\"plan_summary\": \"Upgrade Java 7 to 17: use diamond inference, var, java.time\", \"migrated_code\": \"public class Foo {\\n  private List<String> list = new ArrayList<>();\\n}\"}\n\n"
+            "INVALID (will cause parse failure):\n"
+            "- Any text before or after the JSON\n"
+            "- Markdown fences (```json ... ```)\n"
+            "- Comments inside JSON\n"
+            "- Missing or extra keys\n"
+            "- Unescaped newlines in migrated_code (use \\n)"
         )

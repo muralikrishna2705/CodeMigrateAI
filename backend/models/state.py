@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class MigrationType(str, Enum):
@@ -11,6 +11,8 @@ class MigrationType(str, Enum):
 
 
 class AgentReport(BaseModel):
+    model_config = ConfigDict(json_encoders={datetime: lambda v: v.isoformat()})
+
     agent: str
     status: str
     summary: str
@@ -20,6 +22,8 @@ class AgentReport(BaseModel):
 
 
 class MigrationState(BaseModel):
+    model_config = ConfigDict(json_encoders={datetime: lambda v: v.isoformat()})
+
     source_code: str
     source_language: str
     source_version: str
