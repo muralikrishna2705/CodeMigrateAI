@@ -1,4 +1,4 @@
-async def validate_syntax(code: str, language: str):
+async def validate_syntax(code: str, language: str, version: str = ""):
     from models.validation import SyntaxError as SyntaxDiagnostic
     from models.validation import ValidationResult
 
@@ -31,7 +31,7 @@ async def validate_syntax(code: str, language: str):
         timeout_sec=settings.validator_timeout_sec,
     )
     try:
-        result = await validator.validate(code=code, language=language, version="")
+        result = await validator.validate(code=code, language=language, version=version)
         return ValidationResult(
             valid=result.get("valid", False),
             errors=[
@@ -54,14 +54,14 @@ async def validate_syntax(code: str, language: str):
     except Exception as exc:
         return ValidationResult(
             valid=False,
-            errors=[],
-            warnings=[
+            errors=[
                 SyntaxDiagnostic(
                     line=0,
                     column=0,
                     message=f"Validator service unavailable: {exc}",
                 )
             ],
+            warnings=[],
         )
     finally:
         await validator.close()

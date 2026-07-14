@@ -68,21 +68,18 @@ def set_stream_callback(callback) -> None:
 
 
 def _normalize_validation(vr: dict | None) -> dict | None:
-    """Give validation results a consistent shape for conditions/FixerAgent.
+    """Ensure validation results carry the keys conditions/FixerAgent read.
 
-    ``ValidatorAgent`` emits ``{syntax_valid, syntax_errors: {...}}`` while the
-    external validator service emits ``{valid, errors, warnings}``. Downstream
-    routing (:func:`conditions.validate_condition`) and the ``FixerAgent`` read
-    ``valid`` / ``errors`` / ``warnings``, so surface those keys either way.
+    Both the ``ValidatorAgent`` and the external validator service now emit the
+    unified ``{valid, errors, warnings}`` shape, so this is just a defensive
+    pass-through that fills in defaults for any missing key.
     """
     if not vr:
         return vr
     normalized = dict(vr)
-    syntax_errors = vr.get("syntax_errors")
-    nested = syntax_errors if isinstance(syntax_errors, dict) else {}
-    normalized.setdefault("valid", vr.get("syntax_valid", True))
-    normalized.setdefault("errors", nested.get("errors", []))
-    normalized.setdefault("warnings", nested.get("warnings", []))
+    normalized.setdefault("valid", True)
+    normalized.setdefault("errors", [])
+    normalized.setdefault("warnings", [])
     return normalized
 
 

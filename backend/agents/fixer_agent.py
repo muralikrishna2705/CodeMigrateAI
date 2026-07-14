@@ -20,6 +20,18 @@ class FixerAgent(BaseAgent):
         warnings = validation.get("warnings", [])
 
         if not errors:
+            if validation.get("valid") is False:
+                log.warning(
+                    "Validation failed with zero errors; likely a service issue"
+                )
+                return AgentResult(
+                    success=True,
+                    summary=(
+                        "Validation service returned no actionable errors; "
+                        "skipping fix"
+                    ),
+                    details={"validation_result": validation},
+                )
             return AgentResult(success=True, summary="No errors to fix")
 
         error_text = "\n".join(

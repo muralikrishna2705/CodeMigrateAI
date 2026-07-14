@@ -6,7 +6,7 @@ from validators import get_validator, supported_languages
 class ValidateRequest(BaseModel):
     code: str = Field(..., min_length=1)
     language: str = Field(..., min_length=1)
-    version: str = Field(..., min_length=1)
+    version: str = Field(default="", min_length=0)
 
 
 app = FastAPI(

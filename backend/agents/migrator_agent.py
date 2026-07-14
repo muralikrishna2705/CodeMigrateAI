@@ -118,6 +118,8 @@ class MigratorAgent(BaseAgent):
             data.get("migrated_code")
             or data.get("code")
             or data.get("output")
+            or data.get("result")
+            or data.get("source_code")
             or ""
         ).strip()
         if not migrated_code:
@@ -134,6 +136,22 @@ class MigratorAgent(BaseAgent):
                 return data
         except json.JSONDecodeError:
             pass
+
+        # Try stripping a conversational preamble and reparsing.
+        preamble_stripped = re.sub(
+            r"(?i)^(?:here(?:'s| is) (?:the |my |your )?"
+            r"(?:migrated|converted|upgraded) code[:\s]*|output[:\s]*|"
+            r"result[:\s]*|sure[^.]*\.)",
+            "",
+            text,
+        ).strip()
+        if preamble_stripped != text:
+            try:
+                data = json.loads(preamble_stripped)
+                if isinstance(data, dict):
+                    return data
+            except json.JSONDecodeError:
+                pass
 
         if hasattr(self.llm, "extract_json"):
             try:
