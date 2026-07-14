@@ -64,12 +64,16 @@ async def lifespan(app: FastAPI):
     cache_manager = CacheManager()
     pipeline = Pipeline(llm_client, cache_manager)
 
-    # RAG pipeline (Phase 2): embed reference docs into ChromaDB at startup and
-    # expose retrieval to the RetrieverAgent. Wrapped so that an unreachable
-    # Ollama embedding model or vector store cannot break app startup.
-    ingestion: IngestionPipeline | None = None
+    # RAG pipeline (Phase 2): embed reference docs into the vector store and
+    # expose retrieval to the RetrieverAgent. This runs as a BACKGROUND task so
+    # that embedding ingestion (which can take minutes) never blocks app
+    # startup — the API serves /health and /migrate immediately, and the
+    # RetrieverAgent simply skips RAG until it becomes ready. Wrapped so that an
+    # unreachable embedding model or vector store can never break the app.
     app.state.rag_pipeline = None
-    if settings.enable_rag:
+    rag_state = {"ingestion": None}
+
+    async def _init_rag() -> None:
         try:
             # The embedding model is separate from the chat model and is often
             # not pulled on a fresh Ollama install — without it every embed call
@@ -84,19 +88,33 @@ async def lifespan(app: FastAPI):
             rag_vector_store = VectorStore(rag_embeddings)
             rag_vector_store.initialize()
             ingestion = IngestionPipeline(rag_vector_store, rag_embeddings)
+            rag_state["ingestion"] = ingestion
             await ingestion.run(
                 [lang["id"] for lang in settings.supported_languages]
             )
             app.state.rag_pipeline = RAGPipeline(rag_vector_store, rag_embeddings)
             pipeline.registry.attach_rag_pipeline(app.state.rag_pipeline)
             log.info("RAG pipeline ready")
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             log.warning("RAG initialization failed; continuing without RAG: %s", exc)
+
+    rag_task: asyncio.Task | None = None
+    if settings.enable_rag:
+        rag_task = asyncio.create_task(_init_rag())
     else:
         log.info("RAG disabled via settings")
 
     yield
 
+    if rag_task is not None and not rag_task.done():
+        rag_task.cancel()
+        try:
+            await rag_task
+        except asyncio.CancelledError:
+            pass
+    ingestion = rag_state.get("ingestion")
     if ingestion is not None:
         await ingestion.close()
     await llm_client.close()

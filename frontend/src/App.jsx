@@ -137,6 +137,7 @@ export default function App() {
   const [tgtVer,  setTgtVer]          = useState("17");
 
   const [ollamaStatus, setOllamaStatus] = useState("checking");  // checking | ok | down
+  const [ollamaModel,  setOllamaModel]  = useState("");          // configured LLM model
   const [activePanel, setActivePanel] = useState("editor");      // editor | output
 
   const healthTimer = useRef(null);
@@ -157,6 +158,7 @@ export default function App() {
     try {
       const r = await fetch(`${API_BASE}/health`);
       const d = await r.json();
+      if (d.model) setOllamaModel(d.model);
       setOllamaStatus(d.ollama === "connected" ? "ok" : "down");
     } catch {
       setOllamaStatus("down");
@@ -212,6 +214,7 @@ export default function App() {
           tgtVer={tgtVer}   setTgtVer={setTgtVer}
           loading={loading}
           ollamaStatus={ollamaStatus}
+          ollamaModel={ollamaModel}
           apiError={error}
           result={result}
           agentProgress={agentProgress}

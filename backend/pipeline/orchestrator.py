@@ -50,6 +50,11 @@ class Pipeline:
             if cached:
                 log.info("Cache hit for %s...", cache_key[:16])
                 await self._run_optional_validation(cached)
+                # A streaming client is blocked on the SSE queue waiting for a
+                # terminal event. Without this, a cache hit returns here and the
+                # stream never emits `complete`, so the browser hangs forever.
+                if self.settings.enable_streaming and hasattr(state, "_stream_queue"):
+                    await SSEStreamHandler(state._stream_queue).send_complete(cached)
                 return cached
 
         log.info("=" * 60)

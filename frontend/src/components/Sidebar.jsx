@@ -15,7 +15,7 @@ const LANGUAGES = [
 export default function Sidebar({
   srcLang, setSrcLang, srcVer, setSrcVer,
   tgtLang, setTgtLang, tgtVer, setTgtVer,
-  loading, ollamaStatus, apiError, result, agentProgress, onRun,
+  loading, ollamaStatus, ollamaModel, apiError, result, agentProgress, onRun,
 }) {
   const srcDef = LANGUAGES.find(l => l.id === srcLang) || LANGUAGES[0];
   const tgtDef = LANGUAGES.find(l => l.id === tgtLang) || LANGUAGES[0];
@@ -94,9 +94,10 @@ export default function Sidebar({
       {/* ── Warnings / Errors ── */}
       {ollamaStatus === "down" && !loading && (
         <div style={st.warnBox}>
-          ⚠ Ollama offline. Run:<br />
+          ⚠ Backend or Ollama unreachable. Make sure Ollama is running:<br />
           <code style={st.code}>ollama serve</code><br />
-          <code style={st.code}>ollama pull deepseek-coder-v2</code>
+          Model <code style={st.code}>{ollamaModel || "the configured LLM"}</code>{" "}
+          is pulled automatically when the backend starts.
         </div>
       )}
       {apiError && (

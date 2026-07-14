@@ -48,7 +48,11 @@ async def sse_event_generator(queue: asyncio.Queue):
     try:
         while True:
             event = await queue.get()
-            yield f"data: {json.dumps(event)}\n\n"
+            # default=str keeps the stream robust against non-JSON-native values
+            # that agent results/reports can carry (datetime, Decimal, enums …),
+            # which would otherwise raise "Object of type datetime is not JSON
+            # serializable" and abort the whole migration mid-stream.
+            yield f"data: {json.dumps(event, default=str)}\n\n"
             if event.get("type") in ("complete", "error"):
                 break
     except asyncio.CancelledError:
@@ -56,4 +60,4 @@ async def sse_event_generator(queue: asyncio.Queue):
         raise
     except Exception as e:
         log.exception("SSE generator error")
-        yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+        yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, default=str)}\n\n"
