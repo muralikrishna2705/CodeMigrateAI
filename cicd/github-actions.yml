@@ -1,7 +1,5 @@
 ###############################################################################
 # CodeMigrateAI — GitHub Actions CI/CD Pipeline
-# MTech Final Year Project
-#
 # Pipeline stages:
 #   1. test        — lint backend, run unit tests, smoke-build frontend
 #   2. build-push  — build Docker images, push to GitHub Container Registry

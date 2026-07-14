@@ -26,6 +26,7 @@ from llm.streaming import sse_event_generator
 from models.requests import MigrateRequest, MigrateResponse
 from models.state import MigrationState
 from pipeline.orchestrator import Pipeline
+from rag import CachedEmbeddings, IngestionPipeline, RAGPipeline, VectorStore
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,8 +59,35 @@ async def lifespan(app: FastAPI):
     cache_manager = CacheManager()
     pipeline = Pipeline(llm_client, cache_manager)
 
+    # RAG pipeline (Phase 2): embed reference docs into ChromaDB at startup and
+    # expose retrieval to the RetrieverAgent. Wrapped so that an unreachable
+    # Ollama embedding model or vector store cannot break app startup.
+    ingestion: IngestionPipeline | None = None
+    app.state.rag_pipeline = None
+    if settings.enable_rag:
+        try:
+            rag_embeddings = CachedEmbeddings(
+                base_url=settings.ollama_url,
+                max_cache=settings.local_cache_max_entries,
+            )
+            rag_vector_store = VectorStore(rag_embeddings)
+            rag_vector_store.initialize()
+            ingestion = IngestionPipeline(rag_vector_store, rag_embeddings)
+            await ingestion.run(
+                [lang["id"] for lang in settings.supported_languages]
+            )
+            app.state.rag_pipeline = RAGPipeline(rag_vector_store, rag_embeddings)
+            pipeline.registry.attach_rag_pipeline(app.state.rag_pipeline)
+            log.info("RAG pipeline ready")
+        except Exception as exc:
+            log.warning("RAG initialization failed; continuing without RAG: %s", exc)
+    else:
+        log.info("RAG disabled via settings")
+
     yield
 
+    if ingestion is not None:
+        await ingestion.close()
     await llm_client.close()
     log.info("Shutdown complete")
 
@@ -89,6 +117,7 @@ async def health():
         "model": get_settings().llm_model,
         "ollama": "connected" if alive else "unavailable",
         "prompt_composer": "ready",
+        "rag": "ready" if getattr(app.state, "rag_pipeline", None) else "unavailable",
         "language_profiles": sorted(profiles),
         "language_profile_count": len(profiles),
     }

@@ -3,6 +3,7 @@ import json
 from collections import OrderedDict
 from typing import Any
 
+from config import get_settings
 from llm.language_profiles import LanguageProfile
 
 
@@ -45,7 +46,7 @@ class PromptComposer:
         migration_type: str,
     ) -> str:
         analyzer_context = analyzer_context or {}
-        source_code = source_code[:4000]
+        source_code = source_code[:get_settings().max_llm_code_chars]
         cache_key = self._cache_key(
             source_profile,
             target_profile,

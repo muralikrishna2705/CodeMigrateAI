@@ -33,6 +33,7 @@ class MigrationState(BaseModel):
     migration_type: MigrationType = MigrationType.UPGRADE_VERSION
     code_metrics: Optional[dict] = None
     inline_plan: str = ""
+    rag_context: str = ""
     migrated_code: str = ""
     validation_result: Optional[dict] = None
 

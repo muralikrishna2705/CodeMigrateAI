@@ -88,6 +88,12 @@ frontend/pnpm-debug.log*
 dump.rdb
 redis_data/
 
+# RAG (Phase 2) — generated artifacts, keep committed built-in examples only
+backend/rag/chroma_db/
+cicd/chroma_data/
+backend/rag/reference/*/_fetched/
+backend/rag/reference/*/user/
+
 # CI/CD
 .github/workflows/*.yml.bak
 

@@ -3,6 +3,7 @@ import logging
 import re
 from typing import Any
 
+from config import get_settings
 from llm.language_profiles import ProfileRegistry, get_profile
 from llm.prompt_composer import PromptComposer
 from models.state import MigrationState, MigrationType
@@ -31,11 +32,20 @@ class MigratorAgent(BaseAgent):
             target_profile=target_profile,
             source_version=state.source_version,
             target_version=state.target_version,
-            source_code=state.source_code[:4000],
+            source_code=state.source_code[:get_settings().max_llm_code_chars],
             analyzer_context=state.code_metrics or {},
             migration_type=state.migration_type.value,
         )
         system_prompt = self._build_system_prompt(state)
+
+        # Inject planner context if available (PlannerAgent runs upstream)
+        if state.inline_plan:
+            prompt = f"MIGRATION PLAN:\n{state.inline_plan}\n\n---\n\n{prompt}"
+
+        # Inject RAG reference context if the RetrieverAgent found any (Phase 2).
+        # rag_context already carries its own trailing separator.
+        if state.rag_context:
+            prompt = f"{state.rag_context}{prompt}"
 
         raw_output = await self._call_llm(prompt, system_prompt)
         try:

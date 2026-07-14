@@ -33,6 +33,10 @@ export default function Sidebar({
   const isConversion  = srcLang !== tgtLang;
   const canRun        = ollamaStatus === "ok" && !loading;
 
+  const srcVerIndex = srcDef.versions.indexOf(srcVer);
+  const tgtVerIndex = tgtDef.versions.indexOf(tgtVer);
+  const isDowngrade = !isConversion && srcVerIndex >= 0 && tgtVerIndex >= 0 && tgtVerIndex < srcVerIndex;
+
   return (
     <aside style={st.aside}>
 
@@ -97,6 +101,12 @@ export default function Sidebar({
       )}
       {apiError && (
         <div style={st.errBox}>⚠ {apiError}</div>
+      )}
+      {isDowngrade && (
+        <div style={st.downgradeBox}>
+          ⚠ Downgrading from {srcLang} {srcVer} to {tgtLang} {tgtVer} may introduce
+          breaking changes. Ensure backward compatibility.
+        </div>
       )}
 
       {/* ── Agent pipeline log ── */}
@@ -221,6 +231,11 @@ const st = {
     padding: "10px 12px", background: "rgba(248,113,113,.07)",
     border: "1px solid rgba(248,113,113,.25)", borderRadius: "var(--radius)",
     fontSize: 11, color: "var(--red)", lineHeight: 1.5,
+  },
+  downgradeBox: {
+    padding: "10px 12px", background: "rgba(251,191,36,.07)",
+    border: "1px solid rgba(251,191,36,.25)", borderRadius: "var(--radius)",
+    fontSize: 11, color: "var(--amber)", lineHeight: 1.5,
   },
   code: {
     display: "inline-block", marginTop: 3,

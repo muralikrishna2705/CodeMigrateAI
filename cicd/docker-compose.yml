@@ -59,6 +59,27 @@ services:
     depends_on:
       - redis
       - validator
+      - chromadb
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # CHROMADB — Vector database for the RAG reference index (Phase 2)
+  # ---------------------------------------------------------------------------
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: codemigrateai-chromadb
+    ports:
+      - "8002:8000"
+    volumes:
+      - ./chroma_data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - ANONYMIZED_TELEMETRY=FALSE
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------

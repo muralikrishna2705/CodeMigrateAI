@@ -2,6 +2,7 @@ import logging
 import re
 from typing import Any
 
+from config import get_settings
 from llm.prompts import ANALYZER_PROMPT
 from models.state import MigrationState
 
@@ -95,7 +96,7 @@ class AnalyzerAgent(BaseAgent):
             source_version=state.source_version,
             target_language=state.target_language,
             target_version=state.target_version,
-            code=code[:3500],
+            code=code[:get_settings().max_llm_code_chars],
         )
 
         raw = await self.llm.call_llm(

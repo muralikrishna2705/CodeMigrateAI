@@ -20,9 +20,12 @@ class Settings(BaseSettings):
     llm_num_threads: int = 8
     llm_top_p: float = 0.9
 
+    # Shared truncation limit for LLM input
+    max_llm_code_chars: int = 4000
+
     # Pipeline
     max_code_chars: int = 50_000
-    enable_semantic_analysis: bool = False
+    enable_semantic_analysis: bool = True
 
     # Redis Cache
     cache_enabled: bool = True
@@ -36,7 +39,7 @@ class Settings(BaseSettings):
 
     # Validators
     validator_url: str = "http://validator:8000"
-    enable_validation: bool = False
+    enable_validation: bool = True
     validator_timeout_sec: int = 30
     enable_syntax_validation: bool = True
     enable_logic_validation: bool = False
@@ -44,6 +47,16 @@ class Settings(BaseSettings):
     # Streaming
     enable_streaming: bool = True
     stream_chunk_size: int = 1
+
+    # RAG Pipeline (Phase 2)
+    enable_rag: bool = True
+    rag_top_k: int = 4
+    rag_min_score: float = 0.7
+    chroma_url: str = "http://chromadb:8002"
+
+    # Web Document Fetching (Phase 2)
+    enable_web_docs: bool = True
+    web_docs_refresh_days: int = 7
 
     # Supported Languages (drives frontend dropdowns)
     supported_languages: list[dict] = [

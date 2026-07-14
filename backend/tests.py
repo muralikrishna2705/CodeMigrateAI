@@ -12,8 +12,8 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from agents.analyzer import AnalyzerAgent
-from agents.migrator import MigratorAgent
+from agents.analyzer_agent import AnalyzerAgent
+from agents.migrator_agent import MigratorAgent
 from llm.client import LLMClient
 from llm.language_profiles import get_profile, get_supported_profiles
 from llm.prompt_composer import PromptComposer
@@ -248,9 +248,18 @@ async def test_migrator_retries_invalid_json():
     assert llm.call_llm.await_count == 2
 
 
-def test_registry_order_is_two_agents():
+def test_registry_discovers_runtime_and_domain_agents():
     registry = AgentRegistry(MockLLM())
     assert [agent.name for agent in registry.get_order()] == [
+        "ProviderAgent",
+        "RuntimeAgent",
+        "DispatcherAgent",
+        "ObserverAgent",
+        "RecoveryAgent",
+        "RuntimeValidatorAgent",
         "AnalyzerAgent",
+        "RetrieverAgent",
+        "PlannerAgent",
         "MigratorAgent",
+        "ValidatorAgent",
     ]

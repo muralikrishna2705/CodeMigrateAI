@@ -1,4 +1,4 @@
 from .orchestrator import Pipeline, run_migration_pipeline
-from .registry import PIPELINE_ORDER, AgentRegistry
+from .registry import AgentRegistry
 
-__all__ = ["Pipeline", "run_migration_pipeline", "AgentRegistry", "PIPELINE_ORDER"]
+__all__ = ["Pipeline", "run_migration_pipeline", "AgentRegistry"]

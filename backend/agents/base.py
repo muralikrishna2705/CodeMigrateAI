@@ -1,6 +1,6 @@
 import logging
 import time
-from abc import ABC, abstractmethod
+from abc import ABC, ABCMeta, abstractmethod
 from dataclasses import dataclass
 
 from models.state import MigrationState
@@ -16,7 +16,27 @@ class AgentResult:
     error: str | None = None
 
 
-class BaseAgent(ABC):
+class AgentMeta(ABCMeta):
+    """Metaclass that auto-registers all BaseAgent subclasses.
+
+    Extends ABCMeta (not plain ``type``) so it stays compatible with ABC,
+    which BaseAgent inherits — otherwise Python raises a metaclass conflict.
+    """
+
+    def __init__(cls, name, bases, namespace):
+        super().__init__(name, bases, namespace)
+        if not hasattr(cls, "_registry"):
+            cls._registry = {}
+        if name != "BaseAgent" and ABC not in bases:
+            cls._registry[name] = cls
+
+    def get_registry(cls) -> dict[str, type]:
+        return dict(cls._registry)
+
+
+class BaseAgent(ABC, metaclass=AgentMeta):
+    _registry: dict[str, type] = {}
+
     name: str = "BaseAgent"
     requires_llm: bool = True
 
