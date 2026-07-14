@@ -85,10 +85,10 @@ def test_graph_compiles_with_all_nodes():
         assert expected in node_names
 
 
-def test_cicd_skeleton_graph_compiles():
+def test_cicd_graph_compiles():
     app = build_cicd_graph()
     node_names = set(getattr(app, "nodes", {}) or {})
-    for expected in {"checkout", "migrate", "test", "open_pr"}:
+    for expected in {"check_pr", "create_pr", "wait_ci", "auto_merge"}:
         assert expected in node_names
 
 
@@ -191,7 +191,7 @@ async def test_retry_loop_exhausts_and_keeps_best_effort():
 
 async def _main() -> None:
     test_graph_compiles_with_all_nodes()
-    test_cicd_skeleton_graph_compiles()
+    test_cicd_graph_compiles()
     test_complexity_condition_routes_both_branches()
     test_migrate_condition_routes_empty_code_to_end()
     test_validate_condition_routes_pass_fix_and_exhausted()

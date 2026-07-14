@@ -23,6 +23,8 @@ __all__ = [
     "BaseAgent",
     "AgentResult",
     "AnalyzerAgent",
+    "DeepAnalyzerAgent",
+    "FixerAgent",
     "MigratorAgent",
     "PlannerAgent",
     "RetrieverAgent",

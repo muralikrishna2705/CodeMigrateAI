@@ -204,3 +204,23 @@ jobs:
             docker image prune -f
 
             echo "✅ Deployment complete"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 4 — AI CODE MIGRATION (pull requests only)
+# Delegates to the reusable CodeMigrate pipeline: scans the PR diff for
+# migration candidates and opens migration PRs for each. Independent of the
+# test/build/deploy stages above.
+#
+# NOTE: .github/workflows/codemigrate-pipeline.yml ALSO self-triggers on
+# `pull_request`, so with both in place the pipeline runs twice per PR. Keep
+# only one entrypoint: either drop this job, or remove the `pull_request`
+# trigger from codemigrate-pipeline.yml (leaving just `workflow_call`).
+# ─────────────────────────────────────────────────────────────────────────────
+  codemigrate:
+    name: AI Code Migration
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: write
+      pull-requests: write
+    uses: ./.github/workflows/codemigrate-pipeline.yml
+    secrets: inherit

@@ -1,0 +1,77 @@
+name: 'CodeMigrate AI'
+description: 'AI-driven code migration — upgrade version or convert languages'
+author: 'CodeMigrateAI'
+
+inputs:
+  source-language:
+    description: 'Source language ID (java, python, javascript, etc.)'
+    required: true
+  source-version:
+    description: 'Source version (e.g., 7, 2.7, ES5)'
+    required: true
+  target-language:
+    description: 'Target language ID'
+    required: true
+  target-version:
+    description: 'Target version'
+    required: true
+  source-path:
+    description: 'Path of the file being migrated (committed onto the migration branch)'
+    required: false
+    default: ''
+  ollama-url:
+    description: 'Ollama server URL'
+    required: false
+    default: 'http://localhost:11434'
+  github-token:
+    description: 'GitHub token for creating PRs'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        pip install -r backend/requirements.txt
+        pip install PyGithub
+
+    - name: Start ChromaDB
+      shell: bash
+      run: |
+        docker run -d --name chromadb -p 8002:8000 chromadb/chroma:latest
+
+    - name: Run migration
+      shell: bash
+      # backend/ holds top-level packages (agents, models, llm) that graph.nodes
+      # imports absolutely, so backend/ must be on PYTHONPATH. Runs from the repo
+      # root so migration_result.json lands where upload-artifact and
+      # cicd/create_pr.py expect it.
+      env:
+        PYTHONPATH: backend
+        OLLAMA_URL: ${{ inputs.ollama-url }}
+        SOURCE_LANG: ${{ inputs.source-language }}
+        SOURCE_VER: ${{ inputs.source-version }}
+        TARGET_LANG: ${{ inputs.target-language }}
+        TARGET_VER: ${{ inputs.target-version }}
+        SOURCE_PATH: ${{ inputs.source-path }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        python -m backend.graph.cicd_graph
+
+    - name: Upload migration artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: migration-result
+        path: migration_result.json
+        if-no-files-found: warn

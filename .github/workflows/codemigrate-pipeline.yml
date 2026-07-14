@@ -1,0 +1,62 @@
+name: CodeMigrate Pipeline
+
+# Runs standalone on every PR, and is also callable as a reusable workflow
+# (e.g. from cicd/github-actions.yml) via `workflow_call`.
+on:
+  pull_request:
+    types: [opened, synchronize]
+  workflow_call:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    outputs:
+      candidates: ${{ steps.scan.outputs.candidates }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - id: scan
+        shell: bash
+        run: |
+          python cicd/scan_candidates.py
+          # scan_candidates.py writes a compact, single-line candidates.json.
+          echo "candidates=$(cat candidates.json)" >> "$GITHUB_OUTPUT"
+
+  migrate:
+    needs: scan
+    if: ${{ needs.scan.outputs.candidates != '[]' && needs.scan.outputs.candidates != '' }}
+    permissions:
+      contents: write
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        candidate: ${{ fromJson(needs.scan.outputs.candidates) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run CodeMigrate
+        uses: ./.github/actions/codemigrate
+        with:
+          source-language: ${{ matrix.candidate.source_language }}
+          source-version: ${{ matrix.candidate.source_version }}
+          target-language: ${{ matrix.candidate.target_language }}
+          target-version: ${{ matrix.candidate.target_version }}
+          source-path: ${{ matrix.candidate.path }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create migration PR
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python cicd/create_pr.py \
+            --file "${{ matrix.candidate.path }}" \
+            --result migration_result.json
