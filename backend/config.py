@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     enable_streaming: bool = True
     stream_chunk_size: int = 1
 
+    # LangGraph (Phase 3)
+    max_retries: int = 2
+
     # RAG Pipeline (Phase 2)
     enable_rag: bool = True
     rag_top_k: int = 4

@@ -258,8 +258,10 @@ def test_registry_discovers_runtime_and_domain_agents():
         "RecoveryAgent",
         "RuntimeValidatorAgent",
         "AnalyzerAgent",
+        "DeepAnalyzerAgent",
         "RetrieverAgent",
         "PlannerAgent",
         "MigratorAgent",
         "ValidatorAgent",
+        "FixerAgent",
     ]

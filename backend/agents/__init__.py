@@ -1,5 +1,7 @@
 from .base import AgentResult, BaseAgent
 from .analyzer_agent import AnalyzerAgent
+from .deep_analyzer_agent import DeepAnalyzerAgent
+from .fixer_agent import FixerAgent
 from .migrator_agent import MigratorAgent
 from .planner_agent import PlannerAgent
 from .retriever_agent import RetrieverAgent

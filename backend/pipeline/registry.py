@@ -18,6 +18,8 @@ class AgentRegistry:
     def _discover_agents(self):
         # Import all agent modules to trigger AgentMeta registration
         import agents.analyzer_agent  # noqa: F401
+        import agents.deep_analyzer_agent  # noqa: F401
+        import agents.fixer_agent  # noqa: F401
         import agents.migrator_agent  # noqa: F401
         import agents.planner_agent  # noqa: F401
         import agents.retriever_agent  # noqa: F401
@@ -63,10 +65,12 @@ class AgentRegistry:
         ]
         domain_order = [
             "AnalyzerAgent",
+            "DeepAnalyzerAgent",
             "RetrieverAgent",
             "PlannerAgent",
             "MigratorAgent",
             "ValidatorAgent",
+            "FixerAgent",
         ]
         order = []
         for name in runtime_order + domain_order:
