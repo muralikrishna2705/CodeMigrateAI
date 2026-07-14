@@ -28,8 +28,11 @@ services:
   redis:
     image: redis:7-alpine
     container_name: codemigrateai-redis
-    ports:
-      - "6379:6379"
+    # No host port mapping: only the backend talks to Redis, and it does so over
+    # the internal Docker network (redis://redis:6379/0). Not exposing 6379 to
+    # the host avoids the cross-protocol probes Redis was logging as attacks.
+    expose:
+      - "6379"
     volumes:
       - redis_data:/data
     restart: unless-stopped

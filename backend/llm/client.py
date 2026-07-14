@@ -27,12 +27,15 @@ class LLMClient:
             )
         return self._client
 
-    async def call_llm(self, prompt: str, system_prompt: str = "") -> str:
-        payload = self._build_payload(prompt, system_prompt, stream=False)
+    async def call_llm(
+        self, prompt: str, system_prompt: str = "", fmt: str | None = None
+    ) -> str:
+        payload = self._build_payload(prompt, system_prompt, stream=False, fmt=fmt)
         log.info(
-            "Ollama call: model=%s, prompt=%d chars",
+            "Ollama call: model=%s, prompt=%d chars%s",
             self.settings.llm_model,
             len(prompt),
+            f", format={fmt}" if fmt else "",
         )
 
         response = await self.client.post(
@@ -43,9 +46,9 @@ class LLMClient:
         return response.json().get("response", "").strip()
 
     async def stream_llm(
-        self, prompt: str, system_prompt: str = ""
+        self, prompt: str, system_prompt: str = "", fmt: str | None = None
     ) -> AsyncIterator[str]:
-        payload = self._build_payload(prompt, system_prompt, stream=True)
+        payload = self._build_payload(prompt, system_prompt, stream=True, fmt=fmt)
 
         async with self.client.stream(
             "POST",
@@ -67,7 +70,11 @@ class LLMClient:
                     break
 
     def _build_payload(
-        self, prompt: str, system_prompt: str, stream: bool
+        self,
+        prompt: str,
+        system_prompt: str,
+        stream: bool,
+        fmt: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.settings.llm_model,
@@ -83,6 +90,12 @@ class LLMClient:
         }
         if system_prompt:
             payload["system"] = system_prompt
+        # Ollama's grammar-constrained decoding: when fmt="json" the model is
+        # forced to emit a single syntactically valid JSON object (with proper
+        # string escaping), which small models like deepseek-coder:1.3b cannot
+        # reliably do on their own. The prompt must still ask for JSON.
+        if fmt:
+            payload["format"] = fmt
         return payload
 
     def extract_json(self, raw_text: str) -> dict:
@@ -150,6 +163,55 @@ class LLMClient:
                 r = await client.get(f"{self.settings.ollama_url}/api/tags")
                 return r.status_code == 200
         except Exception:
+            return False
+
+    async def ensure_model(self, model: str) -> bool:
+        """Ensure an Ollama model is available locally, pulling it if missing.
+
+        Returns True if the model is present (or was successfully pulled),
+        False otherwise. Never raises — callers treat False as "unavailable"
+        and degrade gracefully.
+        """
+        try:
+            resp = await self.client.get(f"{self.settings.ollama_url}/api/tags")
+            resp.raise_for_status()
+            installed = {m.get("name", "") for m in resp.json().get("models", [])}
+        except Exception as exc:
+            log.warning("Could not query Ollama models for '%s': %s", model, exc)
+            return False
+
+        # Ollama reports names as "name:tag" (e.g. "nomic-embed-text:latest").
+        # Match whether the caller passed a bare name or an explicit tag.
+        if model in installed or any(
+            name.split(":")[0] == model.split(":")[0] for name in installed
+        ):
+            return True
+
+        log.info("Model '%s' not found locally; pulling from Ollama registry…", model)
+        try:
+            async with self.client.stream(
+                "POST",
+                f"{self.settings.ollama_url}/api/pull",
+                json={"name": model, "stream": True},
+            ) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if data.get("error"):
+                        log.error("Pull failed for '%s': %s", model, data["error"])
+                        return False
+                    if data.get("status") == "success":
+                        log.info("Model '%s' pulled successfully", model)
+                        return True
+            # Stream ended without an explicit "success" — assume complete.
+            return True
+        except Exception as exc:
+            log.warning("Failed to pull model '%s': %s", model, exc)
             return False
 
     async def close(self):

@@ -13,9 +13,14 @@ class Settings(BaseSettings):
     # Ollama
     ollama_url: str = "http://host.docker.internal:11434"
     llm_model: str = "deepseek-coder:1.3b"
+    embedding_model: str = "nomic-embed-text"
+    ollama_auto_pull: bool = True  # pull missing models on startup
     llm_timeout_sec: float = 120.0
-    llm_num_predict: int = 512
-    llm_num_ctx: int = 2048
+    # num_ctx must comfortably exceed the composed prompt (~1500+ tokens with
+    # RAG/planner context) plus num_predict, otherwise Ollama silently truncates
+    # the prompt/response and JSON output comes back malformed.
+    llm_num_predict: int = 2048
+    llm_num_ctx: int = 8192
     llm_temperature: float = 0.0
     llm_num_threads: int = 8
     llm_top_p: float = 0.9

@@ -242,18 +242,21 @@ class PromptComposer:
     def _build_output_format(self) -> str:
         return (
             "OUTPUT FORMAT — CRITICAL: OUTPUT ONLY VALID JSON\n"
-            "No markdown fences, no code blocks, no explanations, no prose.\n"
-            "Your entire response must be a single JSON object matching this schema:\n"
-            "{\n"
-            '  "plan_summary": "One concise sentence summarizing the migration plan.",\n'
-            '  "migrated_code": "The complete migrated source code as a string."\n'
-            "}\n\n"
-            "VALID EXAMPLE:\n"
-            "{\"plan_summary\": \"Upgrade Java 7 to 17: use diamond inference, var, java.time\", \"migrated_code\": \"public class Foo {\\n  private List<String> list = new ArrayList<>();\\n}\"}\n\n"
-            "INVALID (will cause parse failure):\n"
-            "- Any text before or after the JSON\n"
-            "- Markdown fences (```json ... ```)\n"
-            "- Comments inside JSON\n"
-            "- Missing or extra keys\n"
-            "- Unescaped newlines in migrated_code (use \\n)"
+            "Return a single JSON object with exactly these two keys and nothing "
+            "else:\n"
+            '  "plan_summary": one concise sentence describing the changes you made.\n'
+            '  "migrated_code": the COMPLETE migrated version of the SOURCE CODE '
+            "shown above, as a single string.\n\n"
+            "RULES:\n"
+            "- Migrate the ACTUAL source code provided above. Do NOT invent new "
+            "classes and do NOT output placeholder or example code such as "
+            "'class Foo'.\n"
+            "- Keep every class, method, field, and behavior from the source; only "
+            "modernize syntax and idioms for the target version.\n"
+            "- Escape newlines inside string values as \\n and inner double quotes "
+            'as \\".\n'
+            "- No markdown fences, no prose, no comments outside the JSON.\n\n"
+            "Respond using this shape (a schema to follow, NOT a value to copy):\n"
+            '{"plan_summary": "<one sentence>", "migrated_code": "<full migrated '
+            'source code here>"}'
         )

@@ -53,6 +53,11 @@ async def lifespan(app: FastAPI):
     alive = await llm_client.health_check()
     if alive:
         log.info("Ollama is reachable and ready")
+        # Pull the chat model if it isn't present yet, so switching LLM_MODEL
+        # (e.g. to a stronger coder model) works on the next startup without a
+        # manual `ollama pull`.
+        if settings.ollama_auto_pull:
+            await llm_client.ensure_model(settings.llm_model)
     else:
         log.warning("Ollama is not reachable; check that Ollama is running")
 
@@ -66,7 +71,13 @@ async def lifespan(app: FastAPI):
     app.state.rag_pipeline = None
     if settings.enable_rag:
         try:
+            # The embedding model is separate from the chat model and is often
+            # not pulled on a fresh Ollama install — without it every embed call
+            # 404s and RAG silently disables itself. Pull it once on startup.
+            if settings.ollama_auto_pull:
+                await llm_client.ensure_model(settings.embedding_model)
             rag_embeddings = CachedEmbeddings(
+                model=settings.embedding_model,
                 base_url=settings.ollama_url,
                 max_cache=settings.local_cache_max_entries,
             )

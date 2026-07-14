@@ -46,6 +46,7 @@ class DeepAnalyzerAgent(BaseAgent):
                 "You are a senior compiler engineer specializing in "
                 "cross-language analysis. Output only valid JSON."
             ),
+            fmt="json",
         )
 
         parsed = {}

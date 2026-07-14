@@ -47,14 +47,16 @@ class MigratorAgent(BaseAgent):
         if state.rag_context:
             prompt = f"{state.rag_context}{prompt}"
 
-        raw_output = await self._call_llm(prompt, system_prompt)
+        raw_output = await self._call_llm(prompt, system_prompt, fmt="json")
         try:
             parsed = self._parse_llm_output(raw_output)
         except ValueError as first_error:
             log.warning("LLM JSON parse failed: %s", first_error)
             retry_prompt = self._build_retry_prompt(raw_output)
             try:
-                retry_output = await self.llm.call_llm(retry_prompt, system_prompt)
+                retry_output = await self.llm.call_llm(
+                    retry_prompt, system_prompt, fmt="json"
+                )
                 parsed = self._parse_llm_output(retry_output)
             except Exception as retry_error:
                 log.warning("LLM JSON retry failed: %s", retry_error)
@@ -81,12 +83,14 @@ class MigratorAgent(BaseAgent):
             },
         )
 
-    async def _call_llm(self, prompt: str, system_prompt: str) -> str:
+    async def _call_llm(
+        self, prompt: str, system_prompt: str, fmt: str | None = None
+    ) -> str:
         if not self.stream_callback:
-            return await self.llm.call_llm(prompt, system_prompt)
+            return await self.llm.call_llm(prompt, system_prompt, fmt=fmt)
 
         raw_output = ""
-        async for token in self.llm.stream_llm(prompt, system_prompt):
+        async for token in self.llm.stream_llm(prompt, system_prompt, fmt=fmt):
             raw_output += token
             await self.stream_callback(token)
         return raw_output

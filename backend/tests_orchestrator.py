@@ -27,7 +27,9 @@ class StubLLM:
     def __init__(self):
         self.calls: list[str] = []
 
-    async def call_llm(self, prompt: str, system_prompt: str = "") -> str:
+    async def call_llm(
+        self, prompt: str, system_prompt: str = "", fmt: str | None = None
+    ) -> str:
         self.calls.append(prompt)
         if "MIGRATION PLANNING TASK" in prompt:
             return json.dumps(
@@ -37,10 +39,12 @@ class StubLLM:
             return VALID_PY
         return json.dumps({"plan_summary": "Migrated.", "migrated_code": VALID_PY})
 
-    async def stream_llm(self, prompt: str, system_prompt: str = ""):
+    async def stream_llm(
+        self, prompt: str, system_prompt: str = "", fmt: str | None = None
+    ):
         # MigratorAgent switches to token streaming when a stream_callback is
         # wired (see graph/nodes.py:set_stream_callback), same as LLMClient.
-        yield await self.call_llm(prompt, system_prompt)
+        yield await self.call_llm(prompt, system_prompt, fmt=fmt)
 
     def extract_json(self, raw_text: str) -> dict:
         return json.loads(raw_text)

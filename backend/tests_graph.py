@@ -40,7 +40,9 @@ class StubLLM:
         self.migrator_calls = 0
         self.calls: list[str] = []
 
-    async def call_llm(self, prompt: str, system_prompt: str = "") -> str:
+    async def call_llm(
+        self, prompt: str, system_prompt: str = "", fmt: str | None = None
+    ) -> str:
         self.calls.append(prompt)
 
         if "MIGRATION PLANNING TASK" in prompt:
@@ -152,7 +154,9 @@ async def test_migrator_failure_ends_without_validate_or_fix():
     """MigratorAgent raising (LLM unreachable) ends the graph, skipping validate/fix."""
 
     class FailingLLM:
-        async def call_llm(self, prompt: str, system_prompt: str = "") -> str:
+        async def call_llm(
+            self, prompt: str, system_prompt: str = "", fmt: str | None = None
+        ) -> str:
             if "MIGRATION PLANNING TASK" in prompt:
                 return json.dumps({"plan_summary": "plan", "steps": [], "risk_areas": []})
             raise ConnectionError("LLM unreachable")
