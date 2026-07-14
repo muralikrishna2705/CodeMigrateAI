@@ -1,4 +1,5 @@
 import logging
+import time
 
 from models.state import MigrationState
 
@@ -12,12 +13,23 @@ class RuntimeAgent(BaseAgent):
     requires_llm = False
 
     async def run(self, state: MigrationState) -> AgentResult:
-        # The RuntimeAgent wraps the entire pipeline execution.
-        # It coordinates startup, teardown, and error boundaries.
-        # Actual agent dispatch is handled by DispatcherAgent.
-        log.info("RuntimeAgent: pipeline lifecycle started")
+        start = time.perf_counter()
+        agent_count = len(state.agents_done)
+        error_count = len(state.errors)
+        duration = time.perf_counter() - start
+
+        log.info(
+            "RuntimeAgent: %d agents completed, %d errors in %.2fs",
+            agent_count,
+            error_count,
+            duration,
+        )
         return AgentResult(
             success=True,
-            summary="Runtime pipeline completed",
-            details={"agents_completed": list(state.agents_done)},
+            summary=f"Pipeline: {agent_count} agents, {error_count} errors",
+            details={
+                "agents_completed": list(state.agents_done),
+                "error_count": error_count,
+                "duration_seconds": round(duration, 3),
+            },
         )

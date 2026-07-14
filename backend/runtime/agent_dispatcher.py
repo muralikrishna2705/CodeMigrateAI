@@ -12,14 +12,33 @@ class DispatcherAgent(BaseAgent):
     requires_llm = False
 
     async def run(self, state: MigrationState) -> AgentResult:
-        # Determines which agents to run based on migration complexity and type.
-        # For low complexity: AnalyzerAgent -> PlannerAgent -> MigratorAgent
-        # For high complexity: adds DeepAnalyzerAgent (Phase 3)
+        complexity = (state.code_metrics or {}).get("complexity", "low")
+        migration_type = state.migration_type.value
+
+        routing = {
+            "low": ["AnalyzerAgent", "PlannerAgent", "MigratorAgent"],
+            "medium": ["AnalyzerAgent", "PlannerAgent", "MigratorAgent"],
+            "high": [
+                "AnalyzerAgent",
+                "DeepAnalyzerAgent",
+                "PlannerAgent",
+                "MigratorAgent",
+            ],
+        }
+
+        pipeline = routing.get(complexity, routing["low"])
         log.info(
-            "DispatcherAgent: routing determined for complexity=%s",
-            (state.code_metrics or {}).get("complexity", "unknown"),
+            "DispatcherAgent: complexity=%s migration_type=%s pipeline=%s",
+            complexity,
+            migration_type,
+            pipeline,
         )
         return AgentResult(
             success=True,
-            summary="Dispatch routing complete",
+            summary=f"Routing: {complexity} complexity → {len(pipeline)} agents",
+            details={
+                "complexity": complexity,
+                "migration_type": migration_type,
+                "pipeline": pipeline,
+            },
         )

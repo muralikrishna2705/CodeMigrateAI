@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import logging
 from collections import OrderedDict
@@ -31,8 +32,11 @@ class RAGPipeline:
         cached = self._query_cache.get(cache_key)
         if cached is None:
             try:
-                results = self._vector_store.similarity_search(
-                    query, k=settings.rag_top_k, score_threshold=settings.rag_min_score
+                results = await asyncio.to_thread(
+                    self._vector_store.similarity_search,
+                    query,
+                    k=settings.rag_top_k,
+                    score_threshold=settings.rag_min_score,
                 )
                 cached = results
                 self._query_cache[cache_key] = results

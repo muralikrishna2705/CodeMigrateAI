@@ -64,8 +64,10 @@ class CachedEmbeddings:
         return [r for r in results if r is not None]
 
     def _fallback_embed(self, text: str) -> list[float]:
-        h = hashlib.md5(text.encode()).digest()
-        return [b / 255.0 for b in h]
+        # Return a zero vector matching nomic-embed-text's dimension (768).
+        # A zero vector is at cosine-distance 1.0 from everything, so it will
+        # never pass the 0.7 similarity threshold and effectively be ignored.
+        return [0.0] * 768
 
     def clear_cache(self):
         self._cache.clear()

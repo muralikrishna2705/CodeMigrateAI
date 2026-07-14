@@ -29,8 +29,8 @@ class WebDocFetcher:
         for url in urls:
             cache_path = cache_dir / f"{self._url_to_filename(url)}.md"
             if cache_path.exists():
-                age_hours = (os.path.getmtime(cache_path) - time.time()) / 3600
-                if abs(age_hours) < self.settings.web_docs_refresh_days * 24:
+                age_hours = (time.time() - os.path.getmtime(cache_path)) / 3600
+                if age_hours < self.settings.web_docs_refresh_days * 24:
                     saved_files.append(cache_path)
                     continue
 

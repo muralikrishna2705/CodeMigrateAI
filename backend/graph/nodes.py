@@ -103,7 +103,7 @@ def hydrate_state(state: dict) -> MigrationState:
         mig_state.inline_plan = state["inline_plan"]
     if state.get("migrated_code"):
         mig_state.migrated_code = state["migrated_code"]
-    if state.get("rag_context"):
+    if "rag_context" in state:
         mig_state.rag_context = state["rag_context"]
     if state.get("validation_result"):
         mig_state.validation_result = state["validation_result"]

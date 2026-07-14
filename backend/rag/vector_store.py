@@ -28,7 +28,7 @@ class VectorStore:
                 "hnsw:search_ef": 50,
             },
         )
-        count = self._store._collection.count()
+        count = len(self._store.get()["ids"]) if self._store else 0
         log.info("Vector store initialized with %d existing docs", count)
 
     def add_documents(self, documents: list[Document]):
@@ -58,4 +58,4 @@ class VectorStore:
     def count(self) -> int:
         if not self._store:
             return 0
-        return self._store._collection.count()
+        return len(self._store.get()["ids"])

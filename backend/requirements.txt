@@ -14,3 +14,7 @@ markdownify>=0.12.0
 langgraph>=0.1.0
 typing-extensions>=4.9.0
 PyGithub>=2.0.0
+
+# Testing
+pytest>=8.0.0
+pytest-asyncio>=0.23.0

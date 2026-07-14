@@ -53,7 +53,7 @@ class DocLoader:
             str(target),
             glob=_SOURCE_GLOBS,
             loader_cls=TextLoader,
-            loader_kwargs={"encoding": "utf-8"},
+            loader_kwargs={"encoding": "utf-8", "errors": "replace"},
         )
         docs = await loop.run_in_executor(None, loader.load)
         for doc in docs:
