@@ -26,7 +26,11 @@ class IngestionPipeline:
             log.info("RAG disabled, skipping ingestion")
             return
 
-        from rag.url_index import OFFICIAL_DOC_URLS
+        from rag.url_index import (
+            OFFICIAL_DOC_URLS,
+            VERSIONED_DOC_TYPE,
+            VERSIONED_DOC_URLS,
+        )
 
         for lang in languages:
             log.info("Ingesting %s...", lang)
@@ -34,6 +38,14 @@ class IngestionPipeline:
             # Step 1: Fetch web docs (Source 3)
             if settings.enable_web_docs and lang in OFFICIAL_DOC_URLS:
                 await self.web_fetcher.fetch_for_language(lang, OFFICIAL_DOC_URLS[lang])
+
+            # Step 1b: Fetch per-version official docs (What's New / migration
+            # guides) into _fetched/<version>/<doc_type>/. This is what supplies
+            # the version-aware retrieval ladder with real versioned content.
+            if settings.enable_web_docs and lang in VERSIONED_DOC_URLS:
+                await self.web_fetcher.fetch_versioned(
+                    lang, VERSIONED_DOC_URLS[lang], VERSIONED_DOC_TYPE
+                )
 
             # Step 2: Load, split, embed all 3 sources
             chunks = await self.doc_pipeline.process_language(lang, SOURCE_TYPES)

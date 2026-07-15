@@ -338,6 +338,20 @@ class TestDocClassification:
         assert meta["version"] == "ES2020"
         assert meta["doc_type"] == "user"
 
+    def test_versioned_fetched_path_is_official_and_migration_typed(self):
+        # The layout the versioned fetcher writes: _fetched/<version>/<doc_type>/.
+        # It must yield a real version, an authoritative doc_type, and official
+        # authority — the three signals that drive the version-aware ladder.
+        from config import get_settings
+        from rag.loaders import derive_doc_metadata
+        from rag.url_index import VERSIONED_DOC_TYPE
+
+        meta = derive_doc_metadata(["3.12", VERSIONED_DOC_TYPE], "_fetched")
+        assert meta["version"] == "3.12"
+        assert meta["doc_type"] == VERSIONED_DOC_TYPE
+        assert meta["is_official"] is True
+        assert meta["doc_type"] in get_settings().rag_migration_doc_types
+
 
 class TestVersionAwareRetrieval:
     def test_version_phase_runs_first(self, monkeypatch):
@@ -433,3 +447,93 @@ class TestVersionAwareRetrieval:
         assert "relevance: 0.80" in out
         # And version/doc_type surface in the reference label for the model.
         assert "21" in out and "migration-guide" in out
+
+
+class TestVersionedDocRegistry:
+    """The per-version official-doc registry that feeds the retrieval ladder."""
+
+    def test_version_keys_match_selectable_target_versions(self):
+        # If a registry version key is not a version the UI can send as
+        # target_version, the version-filtered leg can NEVER match its docs —
+        # the whole ladder would silently collapse back to language-only.
+        from config import get_settings
+        from rag.url_index import VERSIONED_DOC_URLS
+
+        supported = {
+            lang["id"]: set(lang["versions"])
+            for lang in get_settings().supported_languages
+        }
+        for lang, versions in VERSIONED_DOC_URLS.items():
+            assert lang in supported, f"{lang} is not a supported language"
+            for version in versions:
+                assert version in supported[lang], (
+                    f"{lang} {version} is not a selectable target version"
+                )
+
+    def test_doc_type_earns_the_migration_ranking_boost(self):
+        from config import get_settings
+        from rag.url_index import VERSIONED_DOC_TYPE
+
+        assert VERSIONED_DOC_TYPE in get_settings().rag_migration_doc_types
+
+    def test_every_entry_has_official_https_urls(self):
+        from rag.url_index import VERSIONED_DOC_URLS
+
+        for lang, versions in VERSIONED_DOC_URLS.items():
+            for version, urls in versions.items():
+                assert urls, f"{lang} {version} has no URLs"
+                for url in urls:
+                    assert url.startswith("https://"), f"{lang} {version}: {url}"
+
+
+class TestVersionedDocFetch:
+    """End-to-end (offline) proof that fetching activates version metadata."""
+
+    def test_fetch_lands_in_version_dir_and_loader_tags_it(
+        self, tmp_path, monkeypatch
+    ):
+        from rag import web_doc_fetcher
+        from rag.loaders import DocLoader
+        from rag.url_index import VERSIONED_DOC_TYPE
+
+        # Redirect the corpus root and stub out network + rate-limit sleeps.
+        monkeypatch.setattr(web_doc_fetcher, "REFERENCE_DIR", tmp_path)
+
+        async def _no_sleep(*_a, **_k):
+            return None
+
+        monkeypatch.setattr(web_doc_fetcher.asyncio, "sleep", _no_sleep)
+
+        async def _run_fetch():
+            fetcher = web_doc_fetcher.WebDocFetcher()
+
+            async def _fake_convert(url):
+                return f"# What's New\nContent for {url}\n"
+
+            fetcher._fetch_and_convert = _fake_convert
+            versioned = {"3.12": ["https://docs.python.org/3/whatsnew/3.12.html"]}
+            saved = await fetcher.fetch_versioned(
+                "python", versioned, VERSIONED_DOC_TYPE
+            )
+            await fetcher.close()
+            return saved
+
+        saved = asyncio.run(_run_fetch())
+
+        # 1. The doc landed under _fetched/<version>/<doc_type>/.
+        expected_dir = tmp_path / "python" / "_fetched" / "3.12" / VERSIONED_DOC_TYPE
+        md_files = list(expected_dir.glob("*.md"))
+        assert len(md_files) == 1
+        assert saved == md_files
+
+        # 2. Loading that corpus stamps the real version + authoritative doc_type
+        #    that the retrieval ladder and ranking boosts key on.
+        loader = DocLoader()
+        loader._built_in_dir = tmp_path
+        docs = asyncio.run(loader.load_source("fetched", "python"))
+        assert len(docs) == 1
+        meta = docs[0].metadata
+        assert meta["language"] == "python"
+        assert meta["version"] == "3.12"
+        assert meta["doc_type"] == VERSIONED_DOC_TYPE
+        assert meta["is_official"] is True
