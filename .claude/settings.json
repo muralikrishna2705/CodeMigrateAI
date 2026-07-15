@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(/c/Python314/python -m pytest tests/test_rag.py -q)",
-      "Bash(/c/Python314/python -m pytest tests/ tests_units.py -q -p no:cacheprovider)"
+      "Bash(/c/Python314/python -m pytest tests/ tests_units.py -q -p no:cacheprovider)",
+      "Bash(/c/Python314/python -m pytest backend/tests/test_code_stream.py backend/tests_units.py -q)",
+      "Bash(/c/Python314/python -m pytest backend/ -q)"
     ]
   }
 }

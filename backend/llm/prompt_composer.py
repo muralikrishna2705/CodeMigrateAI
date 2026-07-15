@@ -70,6 +70,9 @@ class PromptComposer:
                     target_version,
                     migration_type,
                 ),
+                self._build_version_constraints(
+                    target_profile, target_version, migration_type
+                ),
                 self._build_analyzer_section(analyzer_context),
                 self._build_few_shots(source_profile, target_profile, migration_type),
                 self._build_source_section(source_profile, source_version, source_code),
@@ -190,6 +193,38 @@ class PromptComposer:
         if target_profile.style_guide:
             lines.append(f"Style guide: {target_profile.style_guide}")
 
+        return "\n".join(lines)
+
+    def _build_version_constraints(
+        self,
+        target_profile: LanguageProfile,
+        target_version: str,
+        migration_type: str,
+    ) -> str:
+        """Hard grounding on the *exact* target version.
+
+        The language-guidance section lists version features to reach for; this
+        section adds the negative constraint that actually prevents version
+        hallucination — do not emit syntax or APIs newer than ``target_version``,
+        even when a newer idiom would be cleaner. RAG evidence and few-shots
+        supply what *is* available; this fences off what is not.
+        """
+        name = target_profile.display_name
+        lines = [
+            "VERSION CONSTRAINTS — HARD REQUIREMENT",
+            f"The output must compile and run on {name} {target_version}.",
+            f"- Use ONLY syntax, language features, and standard-library APIs "
+            f"available in {name} {target_version} or earlier.",
+            f"- Do NOT use anything introduced AFTER {name} {target_version}, "
+            "even if it is more modern, shorter, or more idiomatic.",
+            "- When unsure whether an API exists in this version, choose the "
+            "well-established equivalent that you are certain does.",
+        ]
+        if migration_type == "upgrade_version":
+            lines.append(
+                f"- Replace constructs deprecated or removed by {name} "
+                f"{target_version} with their supported replacements."
+            )
         return "\n".join(lines)
 
     def _build_analyzer_section(self, analyzer_context: dict[str, Any]) -> str:

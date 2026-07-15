@@ -4,6 +4,7 @@ import re
 from typing import Any
 
 from config import get_settings
+from llm.code_stream import MigratedCodeStreamer
 from llm.language_profiles import ProfileRegistry, get_profile
 from llm.prompt_composer import PromptComposer
 from models.state import MigrationState, MigrationType
@@ -113,10 +114,19 @@ class MigratorAgent(BaseAgent):
         if not self.stream_callback:
             return await self.llm.call_llm(prompt, system_prompt, fmt=fmt)
 
+        # The full JSON is accumulated internally for parsing, but the client
+        # only ever sees the unwrapped migrated_code — the JSON stays internal.
+        # For a non-JSON call we have no wrapper to strip, so stream verbatim.
         raw_output = ""
+        streamer = MigratedCodeStreamer() if fmt == "json" else None
         async for token in self.llm.stream_llm(prompt, system_prompt, fmt=fmt):
             raw_output += token
-            await self.stream_callback(token)
+            if streamer is None:
+                await self.stream_callback(token)
+            else:
+                code_delta = streamer.feed(token)
+                if code_delta:
+                    await self.stream_callback(code_delta)
         return raw_output
 
     def _detect_migration_type(self, state: MigrationState) -> MigrationType:

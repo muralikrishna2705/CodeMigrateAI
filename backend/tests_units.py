@@ -43,6 +43,24 @@ class MockLLM:
         return json.loads(raw_text)
 
 
+class StreamingMockLLM:
+    """LLM stub that streams a canned response token-by-token.
+
+    Used to verify the migrator forwards *unwrapped* code (not raw JSON) to the
+    SSE callback. ``chunk`` deliberately splits the payload into tiny pieces so
+    the incremental unwrap is exercised across escape/quote boundaries.
+    """
+
+    def __init__(self, response: str, chunk: int = 3):
+        self._response = response
+        self._chunk = chunk
+        self.call_llm = AsyncMock(return_value=response)
+
+    async def stream_llm(self, prompt, system_prompt, fmt=None):
+        for i in range(0, len(self._response), self._chunk):
+            yield self._response[i : i + self._chunk]
+
+
 def _settings_with(**overrides) -> Settings:
     # Force fast_llm_model empty by default so the fallback test is not affected
     # by any FAST_LLM_MODEL in the environment/.env.
@@ -375,3 +393,59 @@ def test_fast_model_kwargs_empty_for_stub_llm():
 def test_fast_model_kwargs_present_for_real_client():
     agent = MigratorAgent(LLMClient(_settings_with(fast_llm_model="fast:1b")))
     assert agent._fast_model_kwargs() == {"model": "fast:1b"}
+
+
+# --- Version grounding + streamed-code unwrap -------------------------------
+
+
+def test_prompt_composer_grounds_target_version():
+    composer = PromptComposer()
+    python = get_profile("python")
+    prompt = composer.compose(
+        source_profile=python,
+        target_profile=python,
+        source_version="3.8",
+        target_version="3.12",
+        source_code="print('hi')",
+        analyzer_context={"total_lines": 1},
+        migration_type="upgrade_version",
+    )
+    assert "VERSION CONSTRAINTS — HARD REQUIREMENT" in prompt
+    # The negative constraint (no features newer than the target) is the part
+    # that actually prevents version hallucination.
+    assert "introduced AFTER" in prompt
+    assert "3.12" in prompt
+
+
+@pytest.mark.asyncio
+async def test_migrator_streams_unwrapped_code_not_json():
+    code = "def greet(name):\n    print(f'hi {name}')\n"
+    response = json.dumps({"plan_summary": "Converted.", "migrated_code": code})
+
+    streamed: list[str] = []
+
+    async def capture(token: str):
+        streamed.append(token)
+
+    agent = MigratorAgent(StreamingMockLLM(response), {"stream_callback": capture})
+    state = make_state(
+        source_language="python",
+        source_version="3.8",
+        target_language="python",
+        target_version="3.12",
+        source_code="print('hi')",
+        code_metrics={"total_lines": 1},
+    )
+
+    result = await agent(state)
+
+    streamed_text = "".join(streamed)
+    # The client sees the decoded code, never the JSON envelope or plan text.
+    # (The code itself contains f-string braces, so we check for the JSON
+    # envelope specifically rather than any brace.)
+    assert streamed_text == code
+    assert "plan_summary" not in streamed_text
+    assert '"migrated_code"' not in streamed_text
+    assert not streamed_text.lstrip().startswith("{")
+    # The authoritative parsed result still matches.
+    assert result.migrated_code == code.strip()
