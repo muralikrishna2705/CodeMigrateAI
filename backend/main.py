@@ -58,6 +58,13 @@ async def lifespan(app: FastAPI):
         # manual `ollama pull`.
         if settings.ollama_auto_pull:
             await llm_client.ensure_model(settings.llm_model)
+            # Pull the optional fast analysis/planning model too, but only when
+            # it's a distinct model — otherwise routing reuses llm_model.
+            if (
+                settings.fast_llm_model
+                and settings.fast_llm_model != settings.llm_model
+            ):
+                await llm_client.ensure_model(settings.fast_llm_model)
     else:
         log.warning("Ollama is not reachable; check that Ollama is running")
 
@@ -141,9 +148,11 @@ app.add_middleware(
 async def health():
     alive = await llm_client.health_check()
     profiles = get_supported_profiles()
+    settings = get_settings()
     return {
         "status": "ok",
-        "model": get_settings().llm_model,
+        "model": settings.llm_model,
+        "fast_model": settings.fast_llm_model or settings.llm_model,
         "ollama": "connected" if alive else "unavailable",
         "prompt_composer": "ready",
         "rag": "ready" if getattr(app.state, "rag_pipeline", None) else "unavailable",

@@ -85,14 +85,14 @@ class RAGPipeline:
         return signals[:max_symbols]
 
     def _build_query(
-        self, source_language: str, target_language: str, source_code: str
+        self,
+        source_language: str,
+        target_language: str,
+        source_code: str,
+        symbols: list[str],
     ) -> str:
         """Compose a code-aware retrieval query from the source code + languages."""
         settings = get_settings()
-        symbols = self._extract_code_signals(
-            source_code, settings.rag_query_max_symbols
-        )
-
         parts = [f"{source_language} to {target_language} migration"]
         if symbols:
             parts.append("involving " + ", ".join(symbols))
@@ -113,6 +113,62 @@ class RAGPipeline:
             where=where,
         )
 
+    async def _keyword_search(self, symbols: list[str], where: dict | None):
+        """Exact-symbol keyword leg; empty if the store has no keyword support."""
+        if not symbols or not hasattr(self._vector_store, "keyword_search"):
+            return []
+        settings = get_settings()
+        try:
+            return await asyncio.to_thread(
+                self._vector_store.keyword_search,
+                symbols,
+                settings.rag_top_k,
+                where,
+            )
+        except Exception as e:
+            log.warning("Keyword retrieval failed: %s", e)
+            return []
+
+    @staticmethod
+    def _rrf_merge(vector_hits, keyword_hits, k: int, rrf_k: int):
+        """Reciprocal-rank-fusion merge of the vector and keyword legs.
+
+        RRF ranks by 1/(rrf_k + rank) summed across legs, so a doc that ranks
+        well in either leg surfaces. The display score keeps each doc's own leg
+        signal — calibrated cosine when it came from the vector leg, else the
+        keyword match ratio — rather than the raw (tiny) RRF value.
+        """
+        fused: dict[str, float] = {}
+        best: dict[str, tuple] = {}
+
+        def _key(doc):
+            return hashlib.sha256(doc.page_content.encode()).hexdigest()
+
+        for rank, (doc, score) in enumerate(vector_hits):
+            key = _key(doc)
+            fused[key] = fused.get(key, 0.0) + 1.0 / (rrf_k + rank + 1)
+            best[key] = (doc, score)
+        for rank, (doc, ratio) in enumerate(keyword_hits):
+            key = _key(doc)
+            fused[key] = fused.get(key, 0.0) + 1.0 / (rrf_k + rank + 1)
+            best.setdefault(key, (doc, ratio))  # keep vector score if already seen
+
+        ordered = sorted(fused, key=lambda key: fused[key], reverse=True)[:k]
+        return [best[key] for key in ordered]
+
+    async def _retrieve(self, query: str, symbols: list[str], where: dict | None):
+        """One retrieval pass: vector leg, optionally fused with the keyword leg."""
+        settings = get_settings()
+        vector_hits = await self._search(query, where)
+        if not settings.rag_hybrid_enabled:
+            return vector_hits
+        keyword_hits = await self._keyword_search(symbols, where)
+        if not keyword_hits:
+            return vector_hits
+        return self._rrf_merge(
+            vector_hits, keyword_hits, settings.rag_top_k, settings.rag_rrf_k
+        )
+
     async def enrich_prompt(
         self,
         source_language: str,
@@ -124,7 +180,12 @@ class RAGPipeline:
         if not settings.enable_rag:
             return base_prompt
 
-        query = self._build_query(source_language, target_language, source_code)
+        symbols = self._extract_code_signals(
+            source_code, settings.rag_query_max_symbols
+        )
+        query = self._build_query(
+            source_language, target_language, source_code, symbols
+        )
 
         cache_key = hashlib.sha256(query.encode()).hexdigest()
         cached = self._query_cache.get(cache_key)
@@ -137,11 +198,11 @@ class RAGPipeline:
                     if settings.rag_filter_by_target_language
                     else None
                 )
-                results = await self._search(query, where)
+                results = await self._retrieve(query, symbols, where)
                 # Prefer target-language examples, but never regress to zero
                 # grounding: if that corpus is empty, retry unfiltered.
                 if not results and where is not None:
-                    results = await self._search(query, None)
+                    results = await self._retrieve(query, symbols, None)
                 cached = results
                 self._query_cache[cache_key] = results
                 if len(self._query_cache) > self._max_cache:

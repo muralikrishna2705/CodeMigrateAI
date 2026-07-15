@@ -27,13 +27,29 @@ class LLMClient:
             )
         return self._client
 
+    @property
+    def fast_model(self) -> str:
+        """Model for lightweight tasks (analysis/planning).
+
+        Falls back to the main model when ``fast_llm_model`` is unset, so routing
+        is an opt-in optimization that never introduces a second model unless the
+        operator configures (and pulls) one.
+        """
+        return self.settings.fast_llm_model or self.settings.llm_model
+
     async def call_llm(
-        self, prompt: str, system_prompt: str = "", fmt: str | None = None
+        self,
+        prompt: str,
+        system_prompt: str = "",
+        fmt: str | None = None,
+        model: str | None = None,
     ) -> str:
-        payload = self._build_payload(prompt, system_prompt, stream=False, fmt=fmt)
+        payload = self._build_payload(
+            prompt, system_prompt, stream=False, fmt=fmt, model=model
+        )
         log.info(
             "Ollama call: model=%s, prompt=%d chars%s",
-            self.settings.llm_model,
+            payload["model"],
             len(prompt),
             f", format={fmt}" if fmt else "",
         )
@@ -46,9 +62,15 @@ class LLMClient:
         return response.json().get("response", "").strip()
 
     async def stream_llm(
-        self, prompt: str, system_prompt: str = "", fmt: str | None = None
+        self,
+        prompt: str,
+        system_prompt: str = "",
+        fmt: str | None = None,
+        model: str | None = None,
     ) -> AsyncIterator[str]:
-        payload = self._build_payload(prompt, system_prompt, stream=True, fmt=fmt)
+        payload = self._build_payload(
+            prompt, system_prompt, stream=True, fmt=fmt, model=model
+        )
 
         async with self.client.stream(
             "POST",
@@ -75,9 +97,10 @@ class LLMClient:
         system_prompt: str,
         stream: bool,
         fmt: str | None = None,
+        model: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
-            "model": self.settings.llm_model,
+            "model": model or self.settings.llm_model,
             "prompt": prompt,
             "stream": stream,
             "options": {

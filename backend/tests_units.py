@@ -15,6 +15,7 @@ import pytest
 
 from agents.analyzer_agent import AnalyzerAgent
 from agents.migrator_agent import MigratorAgent
+from config import Settings
 from llm.client import LLMClient
 from llm.language_profiles import get_profile, get_supported_profiles
 from llm.prompt_composer import PromptComposer
@@ -40,6 +41,14 @@ class MockLLM:
             except json.JSONDecodeError:
                 continue
         return json.loads(raw_text)
+
+
+def _settings_with(**overrides) -> Settings:
+    # Force fast_llm_model empty by default so the fallback test is not affected
+    # by any FAST_LLM_MODEL in the environment/.env.
+    base = {"fast_llm_model": ""}
+    base.update(overrides)
+    return Settings(**base)
 
 
 def make_state(**overrides) -> MigrationState:
@@ -266,3 +275,103 @@ def test_registry_discovers_runtime_and_domain_agents():
         "ValidatorAgent",
         "FixerAgent",
     ]
+
+
+# --- Anti-hallucination: confidence gating + grounding report ---------------
+
+
+def _migrator_report(state):
+    return next(r for r in state.reports if r.agent == "MigratorAgent")
+
+
+@pytest.mark.asyncio
+async def test_migrator_injects_ungrounded_notice_without_rag():
+    response = json.dumps({"plan_summary": "ok", "migrated_code": "print('x')"})
+    llm = MockLLM(response)
+    agent = MigratorAgent(llm)
+    state = make_state(
+        source_language="python",
+        source_version="3.8",
+        target_language="python",
+        target_version="3.12",
+        code_metrics={"total_lines": 1},
+    )
+
+    await agent(state)
+
+    prompt = llm.call_llm.call_args.args[0]
+    assert "GROUNDING NOTICE" in prompt
+
+
+@pytest.mark.asyncio
+async def test_migrator_uses_rag_context_and_skips_notice():
+    response = json.dumps({"plan_summary": "ok", "migrated_code": "print('x')"})
+    llm = MockLLM(response)
+    agent = MigratorAgent(llm)
+    state = make_state(
+        source_language="python",
+        source_version="3.8",
+        target_language="python",
+        target_version="3.12",
+        code_metrics={"total_lines": 1},
+    )
+    state.rag_context = "## Reference Examples\nprint('grounded')\n\n---\n\n"
+
+    await agent(state)
+
+    prompt = llm.call_llm.call_args.args[0]
+    assert "Reference Examples" in prompt
+    assert "GROUNDING NOTICE" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_migrator_flags_ungrounded_imports_in_report():
+    response = json.dumps(
+        {
+            "plan_summary": "ok",
+            "migrated_code": "import superfastjson\nprint('x')\n",
+        }
+    )
+    agent = MigratorAgent(MockLLM(response))
+    state = make_state(
+        source_language="python",
+        source_version="3.8",
+        target_language="python",
+        target_version="3.12",
+    )
+
+    await agent(state)
+
+    grounding = _migrator_report(state).details["grounding"]
+    assert "superfastjson" in grounding["unverified_imports"]
+
+
+# --- Model routing ----------------------------------------------------------
+
+
+def test_fast_model_falls_back_to_main_when_unset():
+    client = LLMClient(_settings_with())
+    assert client.fast_model == client.settings.llm_model
+
+
+def test_fast_model_used_when_configured():
+    client = LLMClient(_settings_with(fast_llm_model="fast:1b"))
+    assert client.fast_model == "fast:1b"
+
+
+def test_build_payload_honors_model_override():
+    client = LLMClient(_settings_with())
+    payload = client._build_payload("p", "s", stream=False, model="override:7b")
+    assert payload["model"] == "override:7b"
+    default_payload = client._build_payload("p", "s", stream=False)
+    assert default_payload["model"] == client.settings.llm_model
+
+
+def test_fast_model_kwargs_empty_for_stub_llm():
+    # A stub LLM exposes no fast_model, so routing is a no-op (kwargs stay empty).
+    assert MigratorAgent(MockLLM())._fast_model_kwargs() == {}
+
+
+def test_fast_model_kwargs_present_for_real_client():
+    agent = MigratorAgent(LLMClient(_settings_with(fast_llm_model="fast:1b")))
+    assert agent._fast_model_kwargs() == {"model": "fast:1b"}

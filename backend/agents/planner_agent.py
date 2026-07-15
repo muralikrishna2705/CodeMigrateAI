@@ -24,7 +24,11 @@ class PlannerAgent(BaseAgent):
         )
         system_prompt = self._build_system_prompt(migration_type, state)
 
-        raw = await self.llm.call_llm(prompt, system_prompt, fmt="json")
+        # Planning is structured reasoning, not code generation — route to the
+        # fast model when configured (falls back to the main model otherwise).
+        raw = await self.llm.call_llm(
+            prompt, system_prompt, fmt="json", **self._fast_model_kwargs()
+        )
         plan = self._extract_plan(raw)
 
         state.inline_plan = plan

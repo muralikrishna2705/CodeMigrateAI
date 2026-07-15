@@ -66,6 +66,49 @@ class VectorStore:
             log.warning("All %d results below threshold %.2f, returning empty", len(docs_with_scores), score_threshold)
         return filtered
 
+    def keyword_search(
+        self, symbols: list[str], k: int = 4, where: dict | None = None
+    ) -> list[tuple[Document, float]]:
+        """Exact-symbol keyword leg for hybrid retrieval (no embedding cost).
+
+        Uses Chroma's ``where_document`` ``$contains`` to find docs that literally
+        contain each query symbol, then ranks by how many distinct symbols each
+        doc matches. Returns ``(doc, match_ratio)`` where match_ratio is
+        matched/queried symbols — complements the dense vector leg for exact
+        API/type names that embeddings tend to miss.
+        """
+        if not self._store:
+            self.initialize()
+        if not symbols:
+            return []
+
+        limit = max(k * 5, 20)
+        matches: dict[str, list] = {}  # doc id -> [Document, match_count]
+        for symbol in symbols:
+            try:
+                res = self._store.get(
+                    where_document={"$contains": symbol},
+                    where=where or None,
+                    limit=limit,
+                    include=["documents", "metadatas"],
+                )
+            except Exception as exc:
+                log.debug("keyword get failed for %r: %s", symbol, exc)
+                continue
+            documents = res.get("documents") or []
+            metadatas = res.get("metadatas") or []
+            ids = res.get("ids") or []
+            for i, content in enumerate(documents):
+                doc_id = ids[i] if i < len(ids) else content
+                if doc_id not in matches:
+                    metadata = metadatas[i] if i < len(metadatas) else {}
+                    matches[doc_id] = [Document(page_content=content, metadata=metadata), 0]
+                matches[doc_id][1] += 1
+
+        total = len(symbols)
+        ranked = sorted(matches.values(), key=lambda m: m[1], reverse=True)[:k]
+        return [(doc, count / total) for doc, count in ranked]
+
     def count(self) -> int:
         if not self._store:
             return 0

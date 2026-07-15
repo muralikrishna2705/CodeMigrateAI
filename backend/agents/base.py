@@ -84,3 +84,14 @@ class BaseAgent(ABC, metaclass=AgentMeta):
 
     def should_run(self, state: MigrationState) -> bool:
         return True
+
+    def _fast_model_kwargs(self) -> dict:
+        """Return call kwargs routing to the fast model, when supported.
+
+        Analysis/planning agents don't need the heavyweight coder model. This
+        returns ``{"model": <fast>}`` for a real :class:`LLMClient` and ``{}`` for
+        LLM stubs (which expose neither ``fast_model`` nor a ``model`` kwarg), so
+        routing is safe to apply unconditionally at call sites.
+        """
+        fast = getattr(self.llm, "fast_model", None)
+        return {"model": fast} if fast else {}

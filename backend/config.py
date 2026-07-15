@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     # Ollama
     ollama_url: str = "http://host.docker.internal:11434"
     llm_model: str = "deepseek-coder:1.3b"
+    # Optional lighter/faster model for analysis + planning (not code generation).
+    # Empty -> reuse llm_model, so routing is a no-op until an operator sets and
+    # pulls a distinct model (e.g. "llama3.2:1b"), keeping default startup safe.
+    fast_llm_model: str = ""
     embedding_model: str = "nomic-embed-text"
     ollama_auto_pull: bool = True  # pull missing models on startup
     llm_timeout_sec: float = 120.0
@@ -71,6 +75,16 @@ class Settings(BaseSettings):
     # actually ground target-language API usage). Falls back to an unfiltered
     # search when the target-language corpus yields nothing.
     rag_filter_by_target_language: bool = True
+    # Hybrid retrieval: combine the dense vector leg with a keyword leg (exact
+    # symbol matches via Chroma's where_document) merged by reciprocal rank
+    # fusion. Improves recall for exact API/symbol names that dense embeddings
+    # miss. Degrades gracefully to vector-only if the store lacks keyword search.
+    rag_hybrid_enabled: bool = True
+    rag_rrf_k: int = 60
+
+    # Anti-hallucination: flag library imports in migrated code that are not
+    # grounded by the source, retrieved context, or target stdlib (advisory).
+    enable_grounding_check: bool = True
 
     # Web Document Fetching (Phase 2)
     enable_web_docs: bool = True

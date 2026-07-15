@@ -91,6 +91,23 @@ class _RecordingStore:
         return self._unfiltered
 
 
+class _HybridStore:
+    """Fake store with both a vector and a keyword leg for hybrid tests."""
+
+    def __init__(self, vector_hits, keyword_hits):
+        self._vector = vector_hits
+        self._keyword = keyword_hits
+        self.calls = {"vector": 0, "keyword": 0}
+
+    def similarity_search(self, query, k=4, score_threshold=0.7, where=None):
+        self.calls["vector"] += 1
+        return list(self._vector)
+
+    def keyword_search(self, symbols, k=4, where=None):
+        self.calls["keyword"] += 1
+        return list(self._keyword)
+
+
 class _MockSettings:
     enable_rag = True
     rag_top_k = 4
@@ -98,6 +115,8 @@ class _MockSettings:
     rag_query_max_symbols = 12
     rag_query_code_chars = 600
     rag_filter_by_target_language = True
+    rag_hybrid_enabled = True
+    rag_rrf_k = 60
 
 
 def _patch_settings(monkeypatch, **overrides):
@@ -146,7 +165,8 @@ class TestRAGPipeline:
         _patch_settings(monkeypatch)
         pipeline = RAGPipeline(None, None)
         code = "import pandas as pd\n\nframe = DataFrame()\nstats = compute_stats(frame)\n"
-        query = pipeline._build_query("python", "java", code)
+        symbols = pipeline._extract_code_signals(code, max_symbols=12)
+        query = pipeline._build_query("python", "java", code, symbols)
         assert "python to java migration" in query
         # The query now depends on the actual code, not just the language pair.
         assert "pandas" in query
@@ -190,3 +210,47 @@ class TestRAGPipeline:
             pipeline.enrich_prompt("python", "java", "print('x')", "BASE")
         )
         assert out == "BASE"
+
+
+class TestHybridRetrieval:
+    def test_rrf_merge_orders_by_fused_rank(self):
+        doc_a = _FakeDoc("A", "java")
+        doc_b = _FakeDoc("B", "java")
+        doc_c = _FakeDoc("C", "java")
+        vector = [(doc_a, 0.9), (doc_b, 0.8)]
+        keyword = [(doc_b, 1.0), (doc_c, 0.5)]
+        merged = RAGPipeline._rrf_merge(vector, keyword, k=3, rrf_k=60)
+        keys = [doc.page_content for doc, _ in merged]
+        # B ranks in both legs -> highest fused score -> first.
+        assert keys[0] == "B"
+        assert set(keys) == {"A", "B", "C"}
+        # A doc from the vector leg keeps its calibrated cosine score.
+        by_key = {doc.page_content: score for doc, score in merged}
+        assert by_key["A"] == 0.9
+
+    def test_hybrid_surfaces_keyword_only_doc(self, monkeypatch):
+        _patch_settings(monkeypatch)
+        vec_doc = _FakeDoc("vector doc using Foo", "java")
+        kw_doc = _FakeDoc("keyword doc using BarBaz", "java")
+        store = _HybridStore(vector_hits=[(vec_doc, 0.82)], keyword_hits=[(kw_doc, 1.0)])
+        pipeline = RAGPipeline(store, None)
+
+        out = asyncio.run(
+            pipeline.enrich_prompt("python", "java", "BarBaz()", "BASE")
+        )
+        assert "vector doc using Foo" in out
+        # The keyword leg surfaced a doc the vector leg missed.
+        assert "keyword doc using BarBaz" in out
+        assert store.calls["keyword"] == 1
+
+    def test_hybrid_disabled_is_vector_only(self, monkeypatch):
+        _patch_settings(monkeypatch, rag_hybrid_enabled=False)
+        vec_doc = _FakeDoc("vector only", "java")
+        kw_doc = _FakeDoc("keyword only", "java")
+        store = _HybridStore(vector_hits=[(vec_doc, 0.82)], keyword_hits=[(kw_doc, 1.0)])
+        pipeline = RAGPipeline(store, None)
+
+        out = asyncio.run(pipeline.enrich_prompt("python", "java", "x()", "BASE"))
+        assert "vector only" in out
+        assert "keyword only" not in out
+        assert store.calls["keyword"] == 0

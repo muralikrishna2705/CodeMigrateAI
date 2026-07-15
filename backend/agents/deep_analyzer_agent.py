@@ -40,6 +40,8 @@ class DeepAnalyzerAgent(BaseAgent):
             "}"
         )
 
+        # Analysis is a lightweight, structured task — route to the fast model
+        # when one is configured (falls back to the main model otherwise).
         raw = await self.llm.call_llm(
             prompt,
             system_prompt=(
@@ -47,6 +49,7 @@ class DeepAnalyzerAgent(BaseAgent):
                 "cross-language analysis. Output only valid JSON."
             ),
             fmt="json",
+            **self._fast_model_kwargs(),
         )
 
         parsed = {}
