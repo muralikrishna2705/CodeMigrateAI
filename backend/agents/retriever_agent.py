@@ -26,6 +26,7 @@ class RetrieverAgent(BaseAgent):
             target_language=state.target_language,
             source_code=state.source_code,
             base_prompt="",  # Consumed by MigratorAgent via state.rag_context
+            target_version=state.target_version,
         )
         state.rag_context = enriched if "Reference Examples" in enriched else ""
         return AgentResult(

@@ -71,24 +71,58 @@ class TestCachedEmbeddings:
 
 
 class _FakeDoc:
-    def __init__(self, content: str, language: str):
+    def __init__(self, content: str, language: str, **metadata):
         self.page_content = content
-        self.metadata = {"language": language}
+        self.metadata = {"language": language, **metadata}
+
+
+def _parse_where(where):
+    """Extract (language, versions_or_None) from either filter shape.
+
+    Mirrors how a real Chroma filter is built: a flat ``{"language": x}`` for the
+    language-only phase, or a compound ``{"$and": [{language}, {version $in}]}``
+    for the version-scoped phase.
+    """
+    if where is None:
+        return None, None
+    if "$and" in where:
+        lang = versions = None
+        for clause in where["$and"]:
+            if "language" in clause:
+                lang = clause["language"]
+            if "version" in clause:
+                versions = clause["version"].get("$in")
+        return lang, versions
+    return where.get("language"), None
 
 
 class _RecordingStore:
-    """Fake VectorStore that records queries and returns canned results."""
+    """Fake VectorStore that records queries and returns canned results.
 
-    def __init__(self, results_by_language=None, unfiltered=None):
+    ``results_by_version`` models the version-scoped phase (keyed by a version
+    the ``$in`` clause asks for); ``results_by_language`` models the language
+    phase; ``unfiltered`` models the final unfiltered phase.
+    """
+
+    def __init__(
+        self, results_by_language=None, unfiltered=None, results_by_version=None
+    ):
         self.calls = []
         self._by_lang = results_by_language or {}
+        self._by_version = results_by_version or {}
         self._unfiltered = unfiltered or []
 
     def similarity_search(self, query, k=4, score_threshold=0.7, where=None):
         self.calls.append({"query": query, "k": k, "where": where})
-        if where is not None:
-            return self._by_lang.get(where.get("language"), [])
-        return self._unfiltered
+        lang, versions = _parse_where(where)
+        if versions is not None:
+            for version in versions:
+                if version in self._by_version:
+                    return list(self._by_version[version])
+            return []
+        if lang is not None:
+            return list(self._by_lang.get(lang, []))
+        return list(self._unfiltered)
 
 
 class _HybridStore:
@@ -115,6 +149,12 @@ class _MockSettings:
     rag_query_max_symbols = 12
     rag_query_code_chars = 600
     rag_filter_by_target_language = True
+    rag_filter_by_target_version = True
+    rag_version_wildcard = "any"
+    rag_rank_weight_version = 0.15
+    rag_rank_weight_official = 0.10
+    rag_rank_weight_migration = 0.10
+    rag_migration_doc_types = ["migration-guide", "release-notes", "deprecation"]
     rag_hybrid_enabled = True
     rag_rrf_k = 60
 
@@ -254,3 +294,142 @@ class TestHybridRetrieval:
         assert "vector only" in out
         assert "keyword only" not in out
         assert store.calls["keyword"] == 0
+
+
+class TestDocClassification:
+    """Metadata derived from the corpus layout during ingestion."""
+
+    def test_flat_examples_get_wildcard_version_and_example_type(self):
+        from rag.loaders import derive_doc_metadata
+
+        meta = derive_doc_metadata([], "examples")
+        assert meta == {
+            "version": "any",
+            "doc_type": "example",
+            "is_official": False,
+        }
+
+    def test_version_and_doc_type_parsed_from_path(self):
+        from rag.loaders import derive_doc_metadata
+
+        meta = derive_doc_metadata(["3.12", "migration-guide"], "examples")
+        assert meta["version"] == "3.12"
+        assert meta["doc_type"] == "migration-guide"
+        assert meta["is_official"] is False
+
+    def test_fetched_docs_are_official_reference(self):
+        from rag.loaders import derive_doc_metadata
+
+        meta = derive_doc_metadata([], "_fetched")
+        assert meta["doc_type"] == "reference"
+        assert meta["is_official"] is True
+
+    def test_non_version_non_doctype_segment_is_ignored(self):
+        from rag.loaders import derive_doc_metadata
+
+        meta = derive_doc_metadata(["collections"], "examples")
+        assert meta["version"] == "any"
+        assert meta["doc_type"] == "example"
+
+    def test_es_style_version_is_recognised(self):
+        from rag.loaders import derive_doc_metadata
+
+        meta = derive_doc_metadata(["ES2020"], "user")
+        assert meta["version"] == "ES2020"
+        assert meta["doc_type"] == "user"
+
+
+class TestVersionAwareRetrieval:
+    def test_version_phase_runs_first(self, monkeypatch):
+        _patch_settings(monkeypatch)
+        exact = _FakeDoc("exact v21 doc", "java", version="21")
+        store = _RecordingStore(results_by_version={"21": [(exact, 0.88)]})
+        pipeline = RAGPipeline(store, None)
+
+        out = asyncio.run(
+            pipeline.enrich_prompt(
+                "python", "java", "x()", "BASE", target_version="21"
+            )
+        )
+        assert "exact v21 doc" in out
+        lang, versions = _parse_where(store.calls[0]["where"])
+        assert lang == "java"
+        assert versions == ["21", "any"]
+
+    def test_falls_back_to_language_when_version_empty(self, monkeypatch):
+        _patch_settings(monkeypatch)
+        langdoc = _FakeDoc("any-version java doc", "java", version="17")
+        store = _RecordingStore(
+            results_by_language={"java": [(langdoc, 0.8)]},
+            results_by_version={},  # nothing satisfies the version filter
+        )
+        pipeline = RAGPipeline(store, None)
+
+        out = asyncio.run(
+            pipeline.enrich_prompt(
+                "python", "java", "x()", "BASE", target_version="21"
+            )
+        )
+        assert "any-version java doc" in out
+        # Version phase (empty) then language-only phase.
+        assert len(store.calls) == 2
+        assert _parse_where(store.calls[0]["where"])[1] == ["21", "any"]
+        assert _parse_where(store.calls[1]["where"]) == ("java", None)
+
+    def test_version_filter_disabled_skips_version_phase(self, monkeypatch):
+        _patch_settings(monkeypatch, rag_filter_by_target_version=False)
+        langdoc = _FakeDoc("java doc", "java")
+        store = _RecordingStore(results_by_language={"java": [(langdoc, 0.8)]})
+        pipeline = RAGPipeline(store, None)
+
+        asyncio.run(
+            pipeline.enrich_prompt(
+                "python", "java", "x()", "BASE", target_version="21"
+            )
+        )
+        # First (and only needed) phase is the flat language filter.
+        assert store.calls[0]["where"] == {"language": "java"}
+
+    def test_ranking_lifts_exact_version_and_official_docs(self, monkeypatch):
+        _patch_settings(monkeypatch)
+        generic = _FakeDoc(
+            "generic example", "java", version="any", doc_type="example"
+        )
+        authoritative = _FakeDoc(
+            "official v21 guide",
+            "java",
+            version="21",
+            doc_type="migration-guide",
+            is_official=True,
+        )
+        # Generic has the higher RAW cosine; authority boosts must still win.
+        store = _RecordingStore(
+            results_by_version={"21": [(generic, 0.90), (authoritative, 0.82)]}
+        )
+        pipeline = RAGPipeline(store, None)
+
+        out = asyncio.run(
+            pipeline.enrich_prompt(
+                "python", "java", "x()", "BASE", target_version="21"
+            )
+        )
+        assert out.index("official v21 guide") < out.index("generic example")
+
+    def test_displayed_score_stays_raw_relevance(self, monkeypatch):
+        _patch_settings(monkeypatch)
+        doc = _FakeDoc(
+            "boosted", "java", version="21", doc_type="migration-guide",
+            is_official=True,
+        )
+        store = _RecordingStore(results_by_version={"21": [(doc, 0.80)]})
+        pipeline = RAGPipeline(store, None)
+
+        out = asyncio.run(
+            pipeline.enrich_prompt(
+                "python", "java", "x()", "BASE", target_version="21"
+            )
+        )
+        # Boosts change ordering only; the shown relevance is the raw 0.80.
+        assert "relevance: 0.80" in out
+        # And version/doc_type surface in the reference label for the model.
+        assert "21" in out and "migration-guide" in out

@@ -75,6 +75,27 @@ class Settings(BaseSettings):
     # actually ground target-language API usage). Falls back to an unfiltered
     # search when the target-language corpus yields nothing.
     rag_filter_by_target_language: bool = True
+    # Version-aware retrieval: a phased ladder retrieves target-VERSION docs
+    # first, broadens to any-version target-language docs if that is sparse, then
+    # falls back to an unfiltered search. Docs tagged with the wildcard version
+    # (unversioned corpus content) always match the version leg, so this degrades
+    # gracefully to language-only behavior until versioned docs are ingested.
+    rag_filter_by_target_version: bool = True
+    rag_version_wildcard: str = "any"
+    # Metadata-weighted ranking: after retrieval, boost each hit's base relevance
+    # by small authority signals so exact-version / official / migration docs win
+    # ties without overriding a genuinely more relevant (higher-cosine) example.
+    # Kept small relative to cosine scores (~0.7-1.0) on purpose.
+    rag_rank_weight_version: float = 0.15
+    rag_rank_weight_official: float = 0.10
+    rag_rank_weight_migration: float = 0.10
+    # Doc types treated as migration authority for ranking (guides/notes that
+    # describe how to move between versions or flag removed APIs).
+    rag_migration_doc_types: list[str] = [
+        "migration-guide",
+        "release-notes",
+        "deprecation",
+    ]
     # Hybrid retrieval: combine the dense vector leg with a keyword leg (exact
     # symbol matches via Chroma's where_document) merged by reciprocal rank
     # fusion. Improves recall for exact API/symbol names that dense embeddings

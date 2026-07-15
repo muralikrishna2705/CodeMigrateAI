@@ -169,12 +169,89 @@ class RAGPipeline:
             vector_hits, keyword_hits, settings.rag_top_k, settings.rag_rrf_k
         )
 
+    @staticmethod
+    def _filter_phases(target_language, target_version, settings):
+        """Ordered metadata filters, tightest first, for the retrieval ladder.
+
+        Phase A — target language AND (exact target version OR wildcard-version
+                  docs), so unversioned corpus content still qualifies.
+        Phase B — target language, any version.
+        Phase C — unfiltered, so we never regress to zero grounding.
+
+        Phases collapse when a filter is disabled or would duplicate another.
+        """
+        phases: list[dict | None] = []
+        if target_version and settings.rag_filter_by_target_version:
+            phases.append(
+                {
+                    "$and": [
+                        {"language": target_language},
+                        {
+                            "version": {
+                                "$in": [target_version, settings.rag_version_wildcard]
+                            }
+                        },
+                    ]
+                }
+            )
+        if settings.rag_filter_by_target_language:
+            phases.append({"language": target_language})
+        phases.append(None)
+
+        deduped: list[dict | None] = []
+        for phase in phases:
+            if phase not in deduped:
+                deduped.append(phase)
+        return deduped
+
+    async def _retrieve_ladder(self, query, symbols, phases):
+        """Return hits from the tightest filter phase that finds anything.
+
+        The target-version filter is tried first; only if it comes back empty do
+        we broaden to language-only, then unfiltered. Using one phase's results
+        (rather than topping up across phases) keeps exact-version grounding from
+        being diluted by off-target docs and bounds retrieval to one extra query
+        per empty phase — the same fallback contract the old code had, with the
+        version phase added in front.
+        """
+        for where in phases:
+            hits = await self._retrieve(query, symbols, where)
+            if hits:
+                return hits
+        return []
+
+    @staticmethod
+    def _rank(results, target_version, settings):
+        """Re-order hits by base relevance plus small authority boosts.
+
+        The displayed score stays the raw relevance; only the ordering shifts so
+        exact-version, official, and migration docs win ties without masking a
+        genuinely more relevant (higher-cosine) example.
+        """
+        migration_types = set(settings.rag_migration_doc_types)
+
+        def _boost(doc) -> float:
+            md = doc.metadata or {}
+            boost = 0.0
+            if target_version and md.get("version") == target_version:
+                boost += settings.rag_rank_weight_version
+            if md.get("is_official"):
+                boost += settings.rag_rank_weight_official
+            if md.get("doc_type") in migration_types:
+                boost += settings.rag_rank_weight_migration
+            return boost
+
+        return sorted(
+            results, key=lambda pair: pair[1] + _boost(pair[0]), reverse=True
+        )
+
     async def enrich_prompt(
         self,
         source_language: str,
         target_language: str,
         source_code: str,
         base_prompt: str,
+        target_version: str = "",
     ) -> str:
         settings = get_settings()
         if not settings.enable_rag:
@@ -187,24 +264,23 @@ class RAGPipeline:
             source_language, target_language, source_code, symbols
         )
 
-        cache_key = hashlib.sha256(query.encode()).hexdigest()
+        # Target version steers both the retrieval filter ladder and the ranking
+        # boosts, so it must be part of the cache identity.
+        cache_key = hashlib.sha256(
+            f"{target_version}\n{query}".encode()
+        ).hexdigest()
         cached = self._query_cache.get(cache_key)
         if cached is not None:
             self._query_cache.move_to_end(cache_key)
         else:
             try:
-                where = (
-                    {"language": target_language}
-                    if settings.rag_filter_by_target_language
-                    else None
+                phases = self._filter_phases(
+                    target_language, target_version, settings
                 )
-                results = await self._retrieve(query, symbols, where)
-                # Prefer target-language examples, but never regress to zero
-                # grounding: if that corpus is empty, retry unfiltered.
-                if not results and where is not None:
-                    results = await self._retrieve(query, symbols, None)
-                cached = results
-                self._query_cache[cache_key] = results
+                results = await self._retrieve_ladder(query, symbols, phases)
+                results = self._rank(results, target_version, settings)
+                cached = results[: settings.rag_top_k]
+                self._query_cache[cache_key] = cached
                 if len(self._query_cache) > self._max_cache:
                     self._query_cache.popitem(last=False)
             except Exception as e:
@@ -216,8 +292,19 @@ class RAGPipeline:
 
         context_parts = ["## Reference Examples\nHere are relevant code patterns from the target language:\n"]
         for doc, score in cached:
-            lang = doc.metadata.get("language", "unknown")
-            context_parts.append(f"### {lang} (relevance: {score:.2f})")
+            md = doc.metadata or {}
+            lang = md.get("language", "unknown")
+            version = md.get("version", "")
+            doc_type = md.get("doc_type", "")
+            # Surface version/authority so the model treats an official
+            # target-version migration guide as stronger than a generic example.
+            label_bits = [lang]
+            if version and version != settings.rag_version_wildcard:
+                label_bits.append(version)
+            if doc_type:
+                label_bits.append(doc_type)
+            label = " · ".join(label_bits)
+            context_parts.append(f"### {label} (relevance: {score:.2f})")
             context_parts.append(f"```{lang}\n{doc.page_content}\n```")
 
         context = "\n\n".join(context_parts)
