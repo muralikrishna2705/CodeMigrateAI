@@ -151,8 +151,9 @@ class Pipeline:
             "final_result": None,
         }
 
+        callback_token = None
         if stream_handler:
-            graph_nodes.set_stream_callback(stream_handler.send_token)
+            callback_token = graph_nodes.set_stream_callback(stream_handler.send_token)
 
         final_graph_state = graph_state
         try:
@@ -172,8 +173,8 @@ class Pipeline:
                     )
                     await stream_handler.send_agent_complete(agent_name, report)
         finally:
-            if stream_handler:
-                graph_nodes.set_stream_callback(None)
+            if callback_token is not None:
+                graph_nodes.reset_stream_callback(callback_token)
 
         return graph_nodes.hydrate_state(final_graph_state)
 

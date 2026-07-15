@@ -19,7 +19,7 @@ class VectorStore:
         PERSIST_DIR.mkdir(parents=True, exist_ok=True)
         self._store = Chroma(
             collection_name=COLLECTION_NAME,
-            embedding_function=self._embedding_service._inner,
+            embedding_function=self._embedding_service,
             persist_directory=str(PERSIST_DIR),
             collection_metadata={
                 "hnsw:space": "cosine",
@@ -45,10 +45,21 @@ class VectorStore:
             )
         log.info("Added %d documents to vector store", len(documents))
 
-    def similarity_search(self, query: str, k: int = 4, score_threshold: float = 0.7):
+    def similarity_search(
+        self,
+        query: str,
+        k: int = 4,
+        score_threshold: float = 0.7,
+        where: dict | None = None,
+    ):
         if not self._store:
             self.initialize()
-        docs_with_scores = self._store.similarity_search_with_relevance_scores(query, k=k)
+        # `where` is a Chroma metadata filter (e.g. {"language": "python"}) used
+        # to restrict retrieval to a subset of docs; omitted -> search all docs.
+        kwargs = {"k": k}
+        if where:
+            kwargs["filter"] = where
+        docs_with_scores = self._store.similarity_search_with_relevance_scores(query, **kwargs)
         # Filter by threshold
         filtered = [(doc, score) for doc, score in docs_with_scores if score >= score_threshold]
         if not filtered and docs_with_scores:

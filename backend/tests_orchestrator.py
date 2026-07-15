@@ -9,12 +9,8 @@ Run: pytest tests_orchestrator.py -v
 
 import asyncio
 import json
-import os
-import sys
 
 import pytest
-
-sys.path.insert(0, os.path.dirname(__file__))
 
 from config import Settings
 from models.state import MigrationState, MigrationType

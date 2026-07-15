@@ -149,6 +149,7 @@ export default function App() {
     agentProgress,
     loading,
     error,
+    setError,
     runMigration,
     cancel,
   } = useMigrationStream(API_BASE);
@@ -183,9 +184,11 @@ export default function App() {
   // ── Run migration wrapper ──────────────────────────────────────────────────
   const handleRunMigration = useCallback(() => {
     if (!sourceCode.trim()) {
-      // The hook will handle error state
+      setError("Please enter some source code before running a migration.");
+      setActivePanel("output");
       return;
     }
+    setError(null);
     setActivePanel("output");
     runMigration({
       source_code: sourceCode,
@@ -194,7 +197,7 @@ export default function App() {
       target_language: tgtLang,
       target_version: tgtVer,
     });
-  }, [sourceCode, srcLang, srcVer, tgtLang, tgtVer, runMigration]);
+  }, [sourceCode, srcLang, srcVer, tgtLang, tgtVer, runMigration, setError]);
 
   // ── Render ─────────────────────────────────────────────────────────────────
   return (

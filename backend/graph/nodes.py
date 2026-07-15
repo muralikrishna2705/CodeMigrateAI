@@ -10,6 +10,7 @@ The project's agents require a real LLM client at construction time
 can substitute a stub via :func:`set_llm_client`.
 """
 
+import contextvars
 import logging
 
 # Importing the agent modules triggers AgentMeta auto-registration so that
@@ -47,21 +48,30 @@ def set_llm_client(client) -> None:
     _llm_client = client
 
 
-# --- Shared token-stream callback (SSE token-by-token, MigratorAgent only) -
+# --- Per-request token-stream callback (SSE token-by-token, MigratorAgent) -
+#
+# The graph builds a fresh ``MigratorAgent`` per invocation instead of reusing a
+# persistent instance, so the SSE callback can't live on an agent instance. A
+# plain module global would be shared across every in-flight request on the
+# worker, letting two concurrent /migrate/stream calls clobber each other's
+# callback and cross-wire tokens between clients. A ``ContextVar`` scopes the
+# callback to the asyncio task running each request: ``.set()`` only mutates the
+# calling task's context, and LangGraph's per-superstep tasks inherit it at
+# creation time, so concurrent requests stay isolated.
 
-_stream_token_callback = None
+_stream_token_callback: contextvars.ContextVar = contextvars.ContextVar(
+    "codemigrate_stream_token_callback", default=None
+)
 
 
-def set_stream_callback(callback) -> None:
-    """Set/clear the callback MigratorAgent streams generated tokens through.
+def set_stream_callback(callback) -> "contextvars.Token":
+    """Set the per-request token callback; returns a token to reset it with."""
+    return _stream_token_callback.set(callback)
 
-    Mirrors the pre-graph orchestrator's ``agent.stream_callback = ...`` wiring:
-    the graph builds a fresh ``MigratorAgent`` per invocation instead of reusing
-    a persistent instance, so the callback is threaded through module state
-    instead of set directly on an instance.
-    """
-    global _stream_token_callback
-    _stream_token_callback = callback
+
+def reset_stream_callback(token: "contextvars.Token") -> None:
+    """Restore the callback to its previous (per-request) value."""
+    _stream_token_callback.reset(token)
 
 
 # --- Helpers --------------------------------------------------------------
@@ -140,8 +150,9 @@ def _make_node(agent_name: str):
 
         mig_state = hydrate_state(state)
         config = None
-        if agent_name == "MigratorAgent" and _stream_token_callback is not None:
-            config = {"stream_callback": _stream_token_callback}
+        stream_callback = _stream_token_callback.get()
+        if agent_name == "MigratorAgent" and stream_callback is not None:
+            config = {"stream_callback": stream_callback}
         agent = agent_cls(get_llm_client(), config)  # LLM client injected here
         mig_state = await agent(mig_state)
         return writeback(state, mig_state)

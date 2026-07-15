@@ -61,6 +61,16 @@ class Settings(BaseSettings):
     rag_top_k: int = 4
     rag_min_score: float = 0.7
     chroma_url: str = "http://chromadb:8002"
+    # Grounding: the retrieval query is built from the actual source code's
+    # imports/APIs/type names (not just the language pair) so retrieved examples
+    # are code-specific. Cap how many symbols and how much of a code excerpt feed
+    # the query so a large blob can't wash out the symbol signal.
+    rag_query_max_symbols: int = 12
+    rag_query_code_chars: int = 600
+    # Prefer reference examples written in the TARGET language (the ones that
+    # actually ground target-language API usage). Falls back to an unfiltered
+    # search when the target-language corpus yields nothing.
+    rag_filter_by_target_language: bool = True
 
     # Web Document Fetching (Phase 2)
     enable_web_docs: bool = True

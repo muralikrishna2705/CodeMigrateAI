@@ -70,6 +70,44 @@ class TestCachedEmbeddings:
         assert emb.embed_query("cache me") == sentinel
 
 
+class _FakeDoc:
+    def __init__(self, content: str, language: str):
+        self.page_content = content
+        self.metadata = {"language": language}
+
+
+class _RecordingStore:
+    """Fake VectorStore that records queries and returns canned results."""
+
+    def __init__(self, results_by_language=None, unfiltered=None):
+        self.calls = []
+        self._by_lang = results_by_language or {}
+        self._unfiltered = unfiltered or []
+
+    def similarity_search(self, query, k=4, score_threshold=0.7, where=None):
+        self.calls.append({"query": query, "k": k, "where": where})
+        if where is not None:
+            return self._by_lang.get(where.get("language"), [])
+        return self._unfiltered
+
+
+class _MockSettings:
+    enable_rag = True
+    rag_top_k = 4
+    rag_min_score = 0.7
+    rag_query_max_symbols = 12
+    rag_query_code_chars = 600
+    rag_filter_by_target_language = True
+
+
+def _patch_settings(monkeypatch, **overrides):
+    settings = _MockSettings()
+    for key, value in overrides.items():
+        setattr(settings, key, value)
+    monkeypatch.setattr("rag.retrieval_pipeline.get_settings", lambda: settings)
+    return settings
+
+
 class TestRAGPipeline:
     def test_returns_base_prompt_when_rag_disabled(self, monkeypatch):
         class MockSettings:
@@ -83,3 +121,72 @@ class TestRAGPipeline:
             pipeline.enrich_prompt("python", "java", "code", "base_prompt")
         )
         assert result == "base_prompt"
+
+    def test_extract_code_signals_pulls_imports_and_skips_stopwords(self):
+        pipeline = RAGPipeline(None, None)
+        code = (
+            "import requests\n"
+            "from collections import OrderedDict\n"
+            "if True:\n"
+            "    resp = requests.get(url)\n"
+            "    data = parse_response(resp)\n"
+        )
+        signals = pipeline._extract_code_signals(code, max_symbols=12)
+        # Import targets and distinctive call/type names are captured.
+        assert "requests" in signals
+        assert "collections" in signals
+        assert "parse_response" in signals
+        assert "OrderedDict" in signals
+        # Language keywords carry no retrieval signal and are dropped.
+        assert "if" not in signals
+        assert "True" not in signals
+        assert "import" not in signals
+
+    def test_build_query_is_code_aware(self, monkeypatch):
+        _patch_settings(monkeypatch)
+        pipeline = RAGPipeline(None, None)
+        code = "import pandas as pd\n\nframe = DataFrame()\nstats = compute_stats(frame)\n"
+        query = pipeline._build_query("python", "java", code)
+        assert "python to java migration" in query
+        # The query now depends on the actual code, not just the language pair.
+        assert "pandas" in query
+        assert "DataFrame" in query
+        assert "compute_stats" in query
+
+    def test_enrich_prompt_filters_to_target_language(self, monkeypatch):
+        _patch_settings(monkeypatch)
+        doc = _FakeDoc("System.out.println();", "java")
+        store = _RecordingStore(results_by_language={"java": [(doc, 0.91)]})
+        pipeline = RAGPipeline(store, None)
+
+        out = asyncio.run(
+            pipeline.enrich_prompt("python", "java", "print('x')", "BASE")
+        )
+        assert "Reference Examples" in out
+        assert "BASE" in out
+        assert store.calls[0]["where"] == {"language": "java"}
+
+    def test_enrich_prompt_falls_back_when_target_corpus_empty(self, monkeypatch):
+        _patch_settings(monkeypatch)
+        doc = _FakeDoc("print('x')", "python")
+        # No java docs -> filtered search is empty -> retry unfiltered.
+        store = _RecordingStore(results_by_language={}, unfiltered=[(doc, 0.8)])
+        pipeline = RAGPipeline(store, None)
+
+        out = asyncio.run(
+            pipeline.enrich_prompt("python", "java", "print('x')", "BASE")
+        )
+        assert "Reference Examples" in out
+        assert len(store.calls) == 2
+        assert store.calls[0]["where"] == {"language": "java"}
+        assert store.calls[1]["where"] is None
+
+    def test_enrich_prompt_returns_base_when_no_results(self, monkeypatch):
+        _patch_settings(monkeypatch)
+        store = _RecordingStore(results_by_language={}, unfiltered=[])
+        pipeline = RAGPipeline(store, None)
+
+        out = asyncio.run(
+            pipeline.enrich_prompt("python", "java", "print('x')", "BASE")
+        )
+        assert out == "BASE"

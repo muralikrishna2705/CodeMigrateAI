@@ -1,0 +1,22 @@
+# Repo-root pytest configuration.
+#
+# The backend is laid out as a set of top-level packages (graph, rag, models,
+# agents, …) that live under backend/ rather than being installed. Adding
+# backend/ to `pythonpath` lets `python -m pytest` run from the repo root (as CI
+# does) and import those packages, so tests no longer depend on the process cwd
+# being backend/ or on ad-hoc `sys.path.insert(...)` shims inside test files.
+[tool.pytest.ini_options]
+pythonpath = ["backend"]
+
+# importlib import mode loads each test file by path under a unique name instead
+# of registering by basename; it is pytest's recommended mode for non-installed
+# test layouts and avoids sys.path/sys.modules surprises.
+addopts = "--import-mode=importlib"
+
+# Collect the tests/ package plus the loose end-to-end files at backend/ root
+# (tests_graph.py, tests_orchestrator.py, tests_units.py). The default
+# `python_files` pattern (test_*.py) does not match `tests_*.py`, so widen it;
+# the glob in testpaths keeps collection targeted and avoids walking reference
+# corpora / chroma_db under backend/.
+testpaths = ["backend/tests", "backend/tests_*.py"]
+python_files = ["test_*.py", "tests_*.py"]

@@ -3,12 +3,18 @@ import logging
 from collections import OrderedDict
 
 from langchain_community.embeddings import OllamaEmbeddings
+from langchain_core.embeddings import Embeddings
 
 log = logging.getLogger("CodeMigrateAI.Embeddings")
 
 
-class CachedEmbeddings:
-    """LRU-cached wrapper around OllamaEmbeddings."""
+class CachedEmbeddings(Embeddings):
+    """LRU-cached, failure-tolerant wrapper around OllamaEmbeddings.
+
+    Subclasses LangChain's :class:`Embeddings` so it can be handed directly to
+    Chroma (and any component that ``isinstance``-checks the interface) while
+    still routing every call through the LRU cache and the zero-vector fallback.
+    """
 
     def __init__(self, model: str = "nomic-embed-text", base_url: str = "http://host.docker.internal:11434", max_cache: int = 200):
         self._inner = OllamaEmbeddings(model=model, base_url=base_url)

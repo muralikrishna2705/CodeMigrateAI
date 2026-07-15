@@ -1,16 +1,17 @@
 """
 Unit tests for CodeMigrateAI backend.
-Run: pytest tests.py -v
+Run: pytest tests_units.py -v
+
+Named tests_units.py (not tests.py) so it does not collide with the tests/
+package: a lone module named ``tests`` beside a ``tests/`` directory can only be
+imported as one or the other, which silently drops this file from a full-tree
+collection.
 """
 
 import json
-import os
-import sys
 from unittest.mock import AsyncMock
 
 import pytest
-
-sys.path.insert(0, os.path.dirname(__file__))
 
 from agents.analyzer_agent import AnalyzerAgent
 from agents.migrator_agent import MigratorAgent
