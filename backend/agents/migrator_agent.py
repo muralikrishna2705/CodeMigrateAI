@@ -17,6 +17,7 @@ log = logging.getLogger("CodeMigrateAI.MigratorAgent")
 class MigratorAgent(BaseAgent):
     name = "MigratorAgent"
     requires_llm = True
+    needs = ("stream_callback",)
 
     def __init__(self, llm_client, config: dict | None = None):
         super().__init__(llm_client, config)
@@ -105,6 +106,20 @@ class MigratorAgent(BaseAgent):
                     "Ungrounded imports in migrated code: %s", ", ".join(unverified)
                 )
                 summary += f" · ⚠ {len(unverified)} ungrounded import(s)"
+
+                # Adaptive RAG (feedback bus): when enough imports look invented
+                # and the re-retrieval budget remains, enqueue them as targeted
+                # retrieval queries. migrate_condition then loops the graph back
+                # through retrieve -> plan -> migrate with grounded examples for
+                # exactly these imports, instead of silently accepting them.
+                settings = get_settings()
+                if (
+                    len(unverified) >= settings.rag_grounding_reretrieval_threshold
+                    and state.reretrieval_count < settings.max_reretrievals
+                ):
+                    state.retrieval_requests = list(unverified)
+                    details["reretrieval_requested"] = True
+                    summary += " · requesting re-retrieval"
 
         return AgentResult(success=True, summary=summary, details=details)
 

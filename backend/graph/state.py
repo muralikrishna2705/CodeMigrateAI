@@ -32,8 +32,19 @@ class GraphState(TypedDict, total=False):
     errors: list[str]
     agents_completed: list[str]
 
+    # --- Adaptive-RAG feedback bus ---
+    retrieval_requests: list[str]
+    reretrieval_count: int
+    max_reretrievals: int
+
+    # --- Dynamic routing (DispatcherAgent -> dispatch_condition) ---
+    route_plan: dict
+
     # --- Graph-specific fields ---
     retry_count: int
     max_retries: int
     best_effort_code: str
     final_result: Optional[str]
+    # Seeded from settings by the orchestrator; gates the post-migration
+    # service-validation node so offline runs never touch the validator service.
+    enable_validation: bool

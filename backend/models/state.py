@@ -37,6 +37,18 @@ class MigrationState(BaseModel):
     migrated_code: str = ""
     validation_result: Optional[dict] = None
 
+    # Adaptive-RAG feedback bus: agents enqueue targeted retrieval queries here
+    # (e.g. ungrounded imports the MigratorAgent produced) and the retrieve node
+    # consumes them to refine retrieval. reretrieval_count bounds the
+    # migrate -> retrieve loop the way retry_count bounds the fix loop.
+    retrieval_requests: list[str] = Field(default_factory=list)
+    reretrieval_count: int = 0
+
+    # Dynamic routing: the DispatcherAgent writes its decision here (e.g.
+    # {"deep_analyze": bool, "sequence": [...]}) and the graph's edge conditions
+    # consult it instead of recomputing the branch from complexity.
+    route_plan: dict = Field(default_factory=dict)
+
     reports: list[AgentReport] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
     agents_done: list[str] = Field(default_factory=list)

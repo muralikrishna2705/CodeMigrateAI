@@ -38,6 +38,14 @@ class TestImportGrounding:
         report = check_import_grounding(code, "go")
         assert report["unverified_imports"] == ["github.com/gin-gonic/gin"]
 
+    def test_go_invented_single_word_package_is_flagged(self):
+        # A made-up dot-free package must be flagged now that stdlib detection
+        # uses an explicit root list (not "any dot-free import is stdlib").
+        code = 'import (\n  "fmt"\n  "fastjson"\n)'
+        report = check_import_grounding(code, "go")
+        assert "fastjson" in report["unverified_imports"]
+        assert "fmt" not in report["unverified_imports"]
+
     def test_js_relative_and_builtin_are_grounded(self):
         code = (
             "import a from './local.js'\n"

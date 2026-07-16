@@ -9,13 +9,29 @@ import logging
 log = logging.getLogger("CodeMigrateAI.GraphConditions")
 
 
-def complexity_condition(state: dict) -> str:
-    """Route: low/medium -> standard path, high -> deep analysis."""
-    metrics = state.get("code_metrics") or {}
-    complexity = metrics.get("complexity", "low")
+def dispatch_condition(state: dict) -> str:
+    """Route after dispatch: honor the DispatcherAgent's plan, else fall back.
+
+    The ``dispatch`` node (DispatcherAgent) writes ``route_plan`` with its routing
+    decision, so routing is data-driven and LLM-pluggable rather than a hardcoded
+    complexity check here. If the plan is absent (e.g. a unit test invoking this
+    condition directly), fall back to the original complexity heuristic.
+    """
+    plan = state.get("route_plan") or {}
+    if "deep_analyze" in plan:
+        route = "deep_analyze" if plan["deep_analyze"] else "retrieve"
+        log.info("Dispatch plan: deep_analyze=%s -> %s", plan["deep_analyze"], route)
+        return route
+
+    complexity = (state.get("code_metrics") or {}).get("complexity", "low")
     route = "deep_analyze" if complexity == "high" else "retrieve"
-    log.info("Complexity: %s -> %s", complexity, route)
+    log.info("Dispatch fallback (no plan): complexity=%s -> %s", complexity, route)
     return route
+
+
+# Back-compat alias: the routing decision moved from an analyze-time complexity
+# check to the DispatcherAgent, but the branch semantics are identical.
+complexity_condition = dispatch_condition
 
 
 def migrate_condition(state: dict) -> str:
@@ -30,6 +46,20 @@ def migrate_condition(state: dict) -> str:
     if not state.get("migrated_code"):
         log.info("MigratorAgent produced no code -> end")
         return "end"
+    # Adaptive RAG: the MigratorAgent enqueues ungrounded imports as targeted
+    # retrieval queries. While any are pending and the re-retrieval budget is not
+    # spent, loop back through retrieve -> plan -> migrate for better grounding.
+    requests = state.get("retrieval_requests") or []
+    reretrieval_count = state.get("reretrieval_count", 0)
+    max_reretrievals = state.get("max_reretrievals", 0)
+    if requests and reretrieval_count < max_reretrievals:
+        log.info(
+            "Ungrounded imports pending (%d) -> retrieve (re-retrieval %d/%d)",
+            len(requests),
+            reretrieval_count + 1,
+            max_reretrievals,
+        )
+        return "retrieve"
     return "validate"
 
 

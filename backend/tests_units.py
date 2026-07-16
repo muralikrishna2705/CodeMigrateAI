@@ -276,15 +276,12 @@ async def test_migrator_retries_invalid_json():
     assert llm.call_llm.await_count == 2
 
 
-def test_registry_discovers_runtime_and_domain_agents():
+def test_registry_discovers_domain_and_runtime_agents():
     registry = AgentRegistry(MockLLM())
-    assert [agent.name for agent in registry.get_order()] == [
-        "ProviderAgent",
-        "RuntimeAgent",
-        "DispatcherAgent",
-        "ObserverAgent",
-        "RecoveryAgent",
-        "RuntimeValidatorAgent",
+    names = set(registry._agents)
+    # Every agent the graph runs is discovered, including the dynamic router
+    # (DispatcherAgent), the terminal observer, and the external-service validator.
+    for expected in (
         "AnalyzerAgent",
         "DeepAnalyzerAgent",
         "RetrieverAgent",
@@ -292,7 +289,41 @@ def test_registry_discovers_runtime_and_domain_agents():
         "MigratorAgent",
         "ValidatorAgent",
         "FixerAgent",
-    ]
+        "DispatcherAgent",
+        "ObserverAgent",
+        "RuntimeValidatorAgent",
+    ):
+        assert expected in names
+    # Provider (DI container) and Runtime (executor) are infrastructure classes,
+    # not registered agents; the old RecoveryAgent became module-level functions.
+    for gone in ("ProviderAgent", "RuntimeAgent", "RecoveryAgent"):
+        assert gone not in names
+
+
+@pytest.mark.asyncio
+async def test_fixer_prompt_includes_offending_lines_and_rag_context():
+    from agents.fixer_agent import FixerAgent
+
+    llm = MockLLM("fixed_code_here")
+    agent = FixerAgent(llm)
+    state = make_state(target_language="python", target_version="3.12")
+    state.migrated_code = "line1\nline2 BAD\nline3\n"
+    state.rag_context = "## Reference Examples\nprint('grounded')"
+    state.code_metrics = {"summary": "3 lines of python"}
+    state.validation_result = {
+        "valid": False,
+        "errors": [{"line": 2, "column": 1, "message": "bad syntax"}],
+        "warnings": [],
+    }
+
+    await agent(state)
+
+    prompt = llm.call_llm.await_args.args[0]
+    assert "OFFENDING LINES:" in prompt
+    assert "line2 BAD" in prompt  # the exact offending source line, not just "line 2"
+    assert "Reference Examples" in prompt  # retrieved context reused for grounding
+    assert "3 lines of python" in prompt  # analyzer summary threaded in
+    assert state.migrated_code == "fixed_code_here"
 
 
 # --- Anti-hallucination: confidence gating + grounding report ---------------

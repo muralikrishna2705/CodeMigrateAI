@@ -537,3 +537,67 @@ class TestVersionedDocFetch:
         assert meta["version"] == "3.12"
         assert meta["doc_type"] == VERSIONED_DOC_TYPE
         assert meta["is_official"] is True
+
+
+class TestQueryEnrichment:
+    """Code-metric + feedback-bus enrichment of the retrieval query."""
+
+    def test_merge_prioritizes_extra_then_symbols_then_metrics(self):
+        from rag.retrieval_pipeline import RAGPipeline
+
+        merged = RAGPipeline._merge_query_terms(
+            extra_terms=["requests"],
+            symbols=["Foo", "bar"],
+            code_metrics={
+                "key_constructs": ["generics"],
+                "deep_analysis": {"complex_constructs": ["reflection"]},
+            },
+            cap=10,
+        )
+        # Re-retrieval term leads; symbols + analyzer constructs all survive
+        # (stopword-like construct names such as "async" are intentionally
+        # filtered, so non-stopword terms are used here).
+        assert merged[0] == "requests"
+        assert {"Foo", "bar", "generics", "reflection"} <= set(merged)
+
+    def test_merge_drops_stopwords_and_overlong_terms(self):
+        from rag.retrieval_pipeline import RAGPipeline
+
+        merged = RAGPipeline._merge_query_terms(
+            extra_terms=None,
+            symbols=["class", "x" * 50, "ValidToken"],
+            code_metrics=None,
+            cap=10,
+        )
+        assert "ValidToken" in merged
+        assert "class" not in merged  # stopword
+        assert all(len(t) <= 40 for t in merged)
+
+    def test_enrich_prompt_folds_extra_terms_and_metrics_into_query(self):
+        from rag.retrieval_pipeline import RAGPipeline
+
+        class _RecordingStore:
+            def __init__(self):
+                self.queries = []
+
+            def similarity_search(self, query, k=4, score_threshold=0.7, where=None):
+                self.queries.append(query)
+                return []  # no hits -> ladder falls through, base prompt returned
+
+        store = _RecordingStore()
+        pipeline = RAGPipeline(store, None)
+        out = asyncio.run(
+            pipeline.enrich_prompt(
+                "python",
+                "java",
+                "import os\n",
+                "BASE",
+                target_version="21",
+                code_metrics={"key_constructs": ["generics"]},
+                extra_terms=["numpy"],
+            )
+        )
+        assert out == "BASE"
+        assert store.queries, "similarity_search should have been called"
+        assert "numpy" in store.queries[0]
+        assert "generics" in store.queries[0]

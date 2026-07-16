@@ -59,12 +59,21 @@ class Settings(BaseSettings):
 
     # LangGraph (Phase 3)
     max_retries: int = 2
+    # Dynamic routing: when on, the DispatcherAgent asks the fast model whether a
+    # migration needs deep analysis (falling back to the complexity rule on any
+    # failure). Off by default so routing stays deterministic and offline-safe.
+    dispatcher_llm_routing: bool = False
+    # Adaptive RAG: when the MigratorAgent emits at least this many ungrounded
+    # imports, it enqueues them as targeted retrieval queries and the graph loops
+    # migrate -> retrieve -> plan -> migrate, bounded by max_reretrievals (kept
+    # to 1 by default so a single corrective pass never spirals).
+    rag_grounding_reretrieval_threshold: int = 1
+    max_reretrievals: int = 1
 
     # RAG Pipeline (Phase 2)
     enable_rag: bool = True
     rag_top_k: int = 4
     rag_min_score: float = 0.7
-    chroma_url: str = "http://chromadb:8002"
     # Grounding: the retrieval query is built from the actual source code's
     # imports/APIs/type names (not just the language pair) so retrieved examples
     # are code-specific. Cap how many symbols and how much of a code excerpt feed
@@ -106,6 +115,12 @@ class Settings(BaseSettings):
     # Anti-hallucination: flag library imports in migrated code that are not
     # grounded by the source, retrieved context, or target stdlib (advisory).
     enable_grounding_check: bool = True
+
+    # Optional LLM-based query expansion: reformulate the extracted code signals
+    # into a targeted natural-language retrieval query via the fast model. Off by
+    # default (adds one LLM call per retrieval); falls back to the concatenated
+    # signal query on any error.
+    rag_query_expansion: bool = False
 
     # Web Document Fetching (Phase 2)
     enable_web_docs: bool = True

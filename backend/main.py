@@ -20,6 +20,7 @@ from config import get_settings
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from graph import nodes as graph_nodes
 from llm.client import LLMClient
 from llm.language_profiles import get_supported_profiles
 from llm.streaming import sse_event_generator
@@ -27,6 +28,7 @@ from models.requests import MigrateRequest, MigrateResponse
 from models.state import MigrationState
 from pipeline.orchestrator import Pipeline
 from rag import CachedEmbeddings, IngestionPipeline, RAGPipeline, VectorStore
+from runtime.agent_observer import ObserverAgent
 
 logging.basicConfig(
     level=logging.INFO,
@@ -100,7 +102,10 @@ async def lifespan(app: FastAPI):
                 [lang["id"] for lang in settings.supported_languages]
             )
             app.state.rag_pipeline = RAGPipeline(rag_vector_store, rag_embeddings)
-            pipeline.registry.attach_rag_pipeline(app.state.rag_pipeline)
+            # The graph builds a fresh RetrieverAgent per call, so the pipeline is
+            # threaded through module state (like the LLM client) rather than an
+            # instance — see graph/nodes.set_rag_pipeline.
+            graph_nodes.set_rag_pipeline(app.state.rag_pipeline)
             log.info("RAG pipeline ready")
         except asyncio.CancelledError:
             raise
@@ -158,6 +163,7 @@ async def health():
         "rag": "ready" if getattr(app.state, "rag_pipeline", None) else "unavailable",
         "language_profiles": sorted(profiles),
         "language_profile_count": len(profiles),
+        "metrics": ObserverAgent.get_metrics(),
     }
 
 

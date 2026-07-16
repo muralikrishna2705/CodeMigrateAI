@@ -87,4 +87,22 @@ VERSIONED_DOC_URLS: dict[str, dict[str, list[str]]] = {
         "1.20": ["https://go.dev/doc/go1.20"],
         "1.18": ["https://go.dev/doc/go1.18"],
     },
+    # Kotlin ships an official "What's new in Kotlin <version>" page per release.
+    "kotlin": {
+        "2.0": ["https://kotlinlang.org/docs/whatsnew20.html"],
+        "1.9": ["https://kotlinlang.org/docs/whatsnew19.html"],
+        "1.7": ["https://kotlinlang.org/docs/whatsnew17.html"],
+    },
+    # Rust's per-release announcement posts are the authoritative "what changed".
+    "rust": {
+        "1.80": ["https://blog.rust-lang.org/2024/07/25/Rust-1.80.0.html"],
+        "1.70": ["https://blog.rust-lang.org/2023/06/01/Rust-1.70.0.html"],
+    },
+    # cppreference maintains a per-standard language page listing what each added.
+    "cpp": {
+        "23": ["https://en.cppreference.com/w/cpp/23"],
+        "20": ["https://en.cppreference.com/w/cpp/20"],
+        "17": ["https://en.cppreference.com/w/cpp/17"],
+        "14": ["https://en.cppreference.com/w/cpp/14"],
+    },
 }

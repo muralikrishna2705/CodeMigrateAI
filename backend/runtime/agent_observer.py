@@ -3,6 +3,7 @@ import logging
 from models.state import MigrationState
 
 from agents.base import AgentResult, BaseAgent
+from runtime import agent_recovery
 
 log = logging.getLogger("CodeMigrateAI.ObserverAgent")
 
@@ -42,12 +43,14 @@ class ObserverAgent(BaseAgent):
                 f"Observed {len(state.agents_done)} agents "
                 f"({_metrics['success_count']} ok, {_metrics['error_count']} errors)"
             ),
-            details=dict(_metrics),
+            details=self.get_metrics(),
         )
 
     @classmethod
     def get_metrics(cls) -> dict:
-        return dict(_metrics)
+        # The circuit breaker is fed by graph.nodes._make_node (per-node); the
+        # observer just surfaces its current state alongside the run metrics.
+        return {**_metrics, "circuit": agent_recovery.snapshot()}
 
     @classmethod
     def reset_metrics(cls):

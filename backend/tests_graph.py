@@ -15,7 +15,12 @@ import pytest
 
 from graph import nodes
 from graph.cicd_graph import build_cicd_graph
-from graph.conditions import complexity_condition, migrate_condition, validate_condition
+from graph.conditions import (
+    complexity_condition,
+    dispatch_condition,
+    migrate_condition,
+    validate_condition,
+)
 from graph.migration_graph import build_migration_graph
 
 VALID_PY = "def greet():\n    return 'hello'\n"
@@ -79,8 +84,37 @@ def _initial_state() -> dict:
 def test_graph_compiles_with_all_nodes():
     app = build_migration_graph()
     node_names = set(getattr(app, "nodes", {}) or {})
-    for expected in {"analyze", "deep_analyze", "plan", "migrate", "validate", "fix"}:
+    for expected in {
+        "analyze",
+        "dispatch",
+        "deep_analyze",
+        "retrieve",
+        "plan",
+        "migrate",
+        "validate",
+        "fix",
+        "service_validate",
+        "observe",
+    }:
         assert expected in node_names
+
+
+@pytest.mark.asyncio
+async def test_open_circuit_skips_agent_node():
+    """A node whose circuit is open is skipped without running the agent."""
+    from graph.nodes import _make_node
+    from runtime import agent_recovery
+
+    agent_recovery.reset()
+    for _ in range(3):  # trip the breaker
+        agent_recovery.record_failure("AnalyzerAgent")
+    assert agent_recovery.is_circuit_open("AnalyzerAgent")
+
+    node = _make_node("AnalyzerAgent")
+    result = await node(_initial_state())
+    # Skipped: the agent never ran, so it isn't recorded as completed.
+    assert "AnalyzerAgent" not in result.get("agents_completed", [])
+    agent_recovery.reset()
 
 
 def test_cicd_graph_compiles():
@@ -91,16 +125,92 @@ def test_cicd_graph_compiles():
 
 
 def test_complexity_condition_routes_both_branches():
+    # No route_plan -> falls back to the complexity heuristic (back-compat alias).
     assert complexity_condition({"code_metrics": {"complexity": "high"}}) == "deep_analyze"
     assert complexity_condition({"code_metrics": {"complexity": "medium"}}) == "retrieve"
     assert complexity_condition({"code_metrics": {"complexity": "low"}}) == "retrieve"
     assert complexity_condition({}) == "retrieve"  # missing metrics default
 
 
+def test_dispatch_condition_honors_route_plan():
+    # The dispatcher's plan wins over the raw complexity metric.
+    assert (
+        dispatch_condition(
+            {"route_plan": {"deep_analyze": True}, "code_metrics": {"complexity": "low"}}
+        )
+        == "deep_analyze"
+    )
+    assert (
+        dispatch_condition(
+            {"route_plan": {"deep_analyze": False}, "code_metrics": {"complexity": "high"}}
+        )
+        == "retrieve"
+    )
+    # Absent plan -> complexity fallback.
+    assert dispatch_condition({"code_metrics": {"complexity": "high"}}) == "deep_analyze"
+    assert dispatch_condition({}) == "retrieve"
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_agent_writes_route_plan():
+    """DispatcherAgent turns detected complexity into a consumable route plan."""
+    from models.state import MigrationState
+    from runtime.agent_dispatcher import DispatcherAgent
+
+    def _state(complexity: str) -> MigrationState:
+        s = MigrationState(
+            source_code="x",
+            source_language="python",
+            source_version="3.8",
+            target_language="python",
+            target_version="3.12",
+        )
+        s.code_metrics = {"complexity": complexity}
+        return s
+
+    agent = DispatcherAgent(None)
+
+    high = await agent(_state("high"))
+    assert high.route_plan["deep_analyze"] is True
+    assert "DeepAnalyzerAgent" in high.route_plan["sequence"]
+
+    low = await agent(_state("low"))
+    assert low.route_plan["deep_analyze"] is False
+    assert "DeepAnalyzerAgent" not in low.route_plan["sequence"]
+
+
 def test_migrate_condition_routes_empty_code_to_end():
     assert migrate_condition({"migrated_code": ""}) == "end"
     assert migrate_condition({}) == "end"
     assert migrate_condition({"migrated_code": "x = 1"}) == "validate"
+
+
+def test_migrate_condition_routes_to_retrieve_on_ungrounded_with_budget():
+    assert (
+        migrate_condition(
+            {
+                "migrated_code": "x = 1",
+                "retrieval_requests": ["numpy"],
+                "reretrieval_count": 0,
+                "max_reretrievals": 1,
+            }
+        )
+        == "retrieve"
+    )
+
+
+def test_migrate_condition_validates_when_reretrieval_budget_spent():
+    assert (
+        migrate_condition(
+            {
+                "migrated_code": "x = 1",
+                "retrieval_requests": ["numpy"],
+                "reretrieval_count": 1,
+                "max_reretrievals": 1,
+            }
+        )
+        == "validate"
+    )
 
 
 def test_validate_condition_routes_pass_fix_and_exhausted():
@@ -187,6 +297,67 @@ async def test_retry_loop_exhausts_and_keeps_best_effort():
     assert result["retry_count"] == 2  # == max_retries
     assert result["validation_result"]["valid"] is False
     assert result["best_effort_code"]  # preserved before ending
+
+
+@pytest.mark.asyncio
+async def test_retrieve_node_counts_and_clears_reretrieval():
+    """A re-retrieval pass advances the counter and drains the request queue."""
+    nodes.set_rag_pipeline(None)  # RetrieverAgent skips; wrapper still counts
+    nodes.set_llm_client(StubLLM())
+    try:
+        state = _initial_state()
+        state["retrieval_requests"] = ["numpy"]
+        state["reretrieval_count"] = 0
+        result = await nodes.retrieve_node(state)
+    finally:
+        nodes.set_llm_client(None)
+
+    assert result["reretrieval_count"] == 1
+    assert result["retrieval_requests"] == []
+
+
+@pytest.mark.asyncio
+async def test_adaptive_reretrieval_loop_on_ungrounded_imports():
+    """Ungrounded import -> retrieve -> re-migrate clean, bounded to one loop."""
+
+    class ReretrieveLLM:
+        def __init__(self):
+            self.migrator_calls = 0
+
+        async def call_llm(self, prompt, system_prompt="", fmt=None, **kwargs):
+            if "MIGRATION PLANNING TASK" in prompt:
+                return json.dumps(
+                    {"plan_summary": "plan", "steps": [], "risk_areas": []}
+                )
+            if "failed validation" in prompt:
+                return VALID_PY
+            self.migrator_calls += 1
+            # First migration invents a package; the second (post re-retrieval)
+            # is clean and grounded.
+            code = (
+                "import nonexistent_pkg\n\ndef greet():\n    return 'hi'\n"
+                if self.migrator_calls == 1
+                else VALID_PY
+            )
+            return json.dumps({"plan_summary": "m", "migrated_code": code})
+
+        def extract_json(self, raw_text):
+            return json.loads(raw_text)
+
+    nodes.set_rag_pipeline(None)
+    nodes.set_llm_client(ReretrieveLLM())
+    try:
+        app = build_migration_graph()
+        state = _initial_state()
+        state["max_reretrievals"] = 1
+        result = await app.ainvoke(state)
+    finally:
+        nodes.set_llm_client(None)
+
+    assert result["reretrieval_count"] == 1
+    assert result["migrated_code"].strip() == VALID_PY.strip()
+    # The observer terminal node ran, so its agent is recorded.
+    assert "ObserverAgent" in result["agents_completed"]
 
 
 async def _main() -> None:

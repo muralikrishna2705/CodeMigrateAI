@@ -1,8 +1,8 @@
 """Offline end-to-end tests for Pipeline.run() with the LangGraph backend.
 
-Exercises the full path main.py actually calls: runtime scaffolding agents ->
-RetrieverAgent -> compiled migration graph (analyze -> plan -> migrate ->
-validate, with the fix retry loop) -> optional external validation -> cache.
+Exercises the full path main.py actually calls: the compiled migration graph
+(analyze -> retrieve -> plan -> migrate -> validate, with the fix retry loop)
+-> optional external validation -> cache.
 
 Run: pytest tests_orchestrator.py -v
 """
@@ -70,12 +70,22 @@ async def test_pipeline_run_uses_graph_backend_end_to_end():
     assert result.migrated_code.strip() == VALID_PY.strip()
     assert result.migration_type == MigrationType.UPGRADE_VERSION
     assert result.completed_at is not None
-    # Runtime scaffolding + retriever ran before the graph.
-    for name in ("ProviderAgent", "RuntimeAgent", "RetrieverAgent"):
+    # The full flow — dynamic dispatch, retrieval, and the terminal observer
+    # included — now runs inside the graph.
+    for name in (
+        "AnalyzerAgent",
+        "DispatcherAgent",
+        "RetrieverAgent",
+        "PlannerAgent",
+        "MigratorAgent",
+        "ValidatorAgent",
+        "ObserverAgent",
+    ):
         assert name in result.agents_done
-    # Domain flow ran inside the graph.
-    for name in ("AnalyzerAgent", "PlannerAgent", "MigratorAgent", "ValidatorAgent"):
-        assert name in result.agents_done
+    # Provider (DI) and Runtime (executor) are infrastructure, not agents, so they
+    # never appear; with enable_validation=False the service validator self-skips.
+    for gone in ("ProviderAgent", "RuntimeAgent", "RuntimeValidatorAgent"):
+        assert gone not in result.agents_done
     assert result.validation_result["valid"] is True
 
 

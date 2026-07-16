@@ -84,6 +84,63 @@ class RAGPipeline:
 
         return signals[:max_symbols]
 
+    @staticmethod
+    def _metric_terms(code_metrics: dict | None) -> list[str]:
+        """Short construct terms from the AnalyzerAgent / DeepAnalyzerAgent output.
+
+        These name what the code actually *does* (generics, async, reflection,
+        specific stdlib deps) rather than just its import lines, so they sharpen
+        retrieval toward the constructs that need migrating.
+        """
+        if not code_metrics:
+            return []
+        terms: list[str] = []
+        for key in ("key_constructs", "deprecated_patterns"):
+            vals = code_metrics.get(key)
+            if isinstance(vals, list):
+                terms.extend(str(v) for v in vals if v)
+        deep = code_metrics.get("deep_analysis") or {}
+        for key in ("complex_constructs", "stdlib_dependencies"):
+            vals = deep.get(key)
+            if isinstance(vals, list):
+                terms.extend(str(v) for v in vals if v)
+        return terms
+
+    @classmethod
+    def _merge_query_terms(
+        cls,
+        extra_terms: list[str] | None,
+        symbols: list[str],
+        code_metrics: dict | None,
+        cap: int,
+    ) -> list[str]:
+        """Combine targeted re-retrieval terms, code symbols, and constructs.
+
+        Priority order — re-retrieval requests first, then the code's own
+        symbols, then analyzer-detected constructs — so the highest-signal terms
+        survive the cap. Deduplicated, stopword-free, and length-bounded so a
+        stray sentence-length metric can't drown the query.
+        """
+        merged: list[str] = []
+        seen: set[str] = set()
+
+        def _add(token: str) -> None:
+            token = (token or "").strip()
+            if not token or len(token) > 40 or "\n" in token:
+                return
+            if token.lower() in _STOPWORDS or token in seen:
+                return
+            seen.add(token)
+            merged.append(token)
+
+        for token in extra_terms or []:
+            _add(token)
+        for token in symbols:
+            _add(token)
+        for token in cls._metric_terms(code_metrics):
+            _add(token)
+        return merged[:cap]
+
     def _build_query(
         self,
         source_language: str,
@@ -252,6 +309,8 @@ class RAGPipeline:
         source_code: str,
         base_prompt: str,
         target_version: str = "",
+        code_metrics: dict | None = None,
+        extra_terms: list[str] | None = None,
     ) -> str:
         settings = get_settings()
         if not settings.enable_rag:
@@ -260,12 +319,19 @@ class RAGPipeline:
         symbols = self._extract_code_signals(
             source_code, settings.rag_query_max_symbols
         )
+        # Enrich raw code symbols with analyzer-detected constructs and any
+        # targeted re-retrieval terms (feedback bus) so the query reflects what
+        # the code actually does, not just its import lines.
+        symbols = self._merge_query_terms(
+            extra_terms, symbols, code_metrics, settings.rag_query_max_symbols
+        )
         query = self._build_query(
             source_language, target_language, source_code, symbols
         )
 
         # Target version steers both the retrieval filter ladder and the ranking
-        # boosts, so it must be part of the cache identity.
+        # boosts, so it must be part of the cache identity. Re-retrieval terms and
+        # metric constructs are already folded into `query`.
         cache_key = hashlib.sha256(
             f"{target_version}\n{query}".encode()
         ).hexdigest()

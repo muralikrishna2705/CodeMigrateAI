@@ -20,32 +20,58 @@ import agents.deep_analyzer_agent  # noqa: F401
 import agents.fixer_agent  # noqa: F401
 import agents.migrator_agent  # noqa: F401
 import agents.planner_agent  # noqa: F401
+import agents.retriever_agent  # noqa: F401
 import agents.validator_agent  # noqa: F401
-from agents.base import BaseAgent
+import runtime.agent_dispatcher  # noqa: F401
+import runtime.agent_observer  # noqa: F401
+import runtime.agent_validator  # noqa: F401
 from models.state import AgentReport, MigrationState, MigrationType
+from runtime.agent_providers import Provider
+from runtime.agent_runtime import Runtime
 
 log = logging.getLogger("CodeMigrateAI.GraphNodes")
 
 
-# --- Shared LLM client (injectable for tests) -----------------------------
+# --- Dynamic wiring: Provider (DI container) + Runtime (executor) ----------
+#
+# Shared dependencies (LLM client, RAG pipeline, per-request stream callback) are
+# registered into a single Provider; the Runtime resolves each agent's declared
+# ``needs`` from it when a graph node runs. This replaces the old scatter of
+# module globals and the hardcoded per-agent config block.
 
-_llm_client = None
+_provider = Provider()
+_runtime = Runtime(_provider)
 
 
 def get_llm_client():
-    """Return the shared LLM client, creating it lazily on first use."""
-    global _llm_client
-    if _llm_client is None:
+    """Return the shared LLM client, creating it lazily if none is registered.
+
+    A registered ``None`` (tests clear the client this way between runs) is
+    treated as "unset", so lazy creation still kicks in — matching the old
+    ``if _llm_client is None`` behaviour.
+    """
+    client = _provider.get("llm")
+    if client is None:
         from llm.client import LLMClient
 
-        _llm_client = LLMClient()
-    return _llm_client
+        client = LLMClient()
+        _provider.register("llm", client)
+    return client
 
 
 def set_llm_client(client) -> None:
     """Override the shared LLM client (used by tests to inject a stub)."""
-    global _llm_client
-    _llm_client = client
+    _provider.register("llm", client)
+
+
+def set_rag_pipeline(pipeline) -> None:
+    """Register the shared RAG pipeline used by the ``retrieve`` node.
+
+    Built lazily in the app lifespan, after this module is imported. Until then
+    (and whenever ``None`` is registered) the Provider resolves it to nothing, so
+    the RetrieverAgent simply skips retrieval.
+    """
+    _provider.register("rag_pipeline", pipeline)
 
 
 # --- Per-request token-stream callback (SSE token-by-token, MigratorAgent) -
@@ -57,11 +83,14 @@ def set_llm_client(client) -> None:
 # callback and cross-wire tokens between clients. A ``ContextVar`` scopes the
 # callback to the asyncio task running each request: ``.set()`` only mutates the
 # calling task's context, and LangGraph's per-superstep tasks inherit it at
-# creation time, so concurrent requests stay isolated.
+# creation time, so concurrent requests stay isolated. It is exposed through the
+# Provider as a factory (resolved per ``get``) so ``stream_callback`` flows
+# through the same needs-based DI as every other dependency.
 
 _stream_token_callback: contextvars.ContextVar = contextvars.ContextVar(
     "codemigrate_stream_token_callback", default=None
 )
+_provider.register_factory("stream_callback", _stream_token_callback.get)
 
 
 def set_stream_callback(callback) -> "contextvars.Token":
@@ -119,6 +148,9 @@ def hydrate_state(state: dict) -> MigrationState:
     mig_state.reports = [AgentReport(**r) for r in state.get("reports", [])]
     mig_state.errors = list(state.get("errors", []))
     mig_state.agents_done = list(state.get("agents_completed", []))
+    mig_state.retrieval_requests = list(state.get("retrieval_requests", []))
+    mig_state.reretrieval_count = state.get("reretrieval_count", 0)
+    mig_state.route_plan = state.get("route_plan") or {}
     return mig_state
 
 
@@ -133,29 +165,35 @@ def writeback(state: dict, mig_state: MigrationState) -> dict:
     state["reports"] = [r.model_dump() for r in mig_state.reports]
     state["errors"] = mig_state.errors
     state["agents_completed"] = mig_state.agents_done
+    state["retrieval_requests"] = mig_state.retrieval_requests
+    state["reretrieval_count"] = mig_state.reretrieval_count
+    state["route_plan"] = mig_state.route_plan
     return state
 
 
+def last_report_status(mig_state: MigrationState, agent_name: str) -> str | None:
+    """Status of the most recent report this agent produced, if any.
+
+    Public because the Runtime executor (``runtime.agent_runtime``) reads it to
+    decide whether a run should trip the circuit breaker.
+    """
+    report = next(
+        (r for r in reversed(mig_state.reports) if r.agent == agent_name), None
+    )
+    return report.status if report else None
+
+
 def _make_node(agent_name: str):
-    """Factory: creates a node function for a given agent."""
+    """Factory: a graph node that delegates the agent's execution to the Runtime.
+
+    All the per-run mechanics — the circuit-breaker guard, needs-based dependency
+    injection from the Provider, failure recording, and hydrate/writeback — live
+    in ``Runtime.execute`` so every node shares one implementation instead of
+    inlining it.
+    """
 
     async def node(state: dict) -> dict:
-        agent_cls = BaseAgent.get_registry().get(agent_name)
-        if not agent_cls:
-            log.error("Agent %s not found in registry", agent_name)
-            state["errors"] = state.get("errors", []) + [
-                f"Agent {agent_name} not found"
-            ]
-            return state
-
-        mig_state = hydrate_state(state)
-        config = None
-        stream_callback = _stream_token_callback.get()
-        if agent_name == "MigratorAgent" and stream_callback is not None:
-            config = {"stream_callback": stream_callback}
-        agent = agent_cls(get_llm_client(), config)  # LLM client injected here
-        mig_state = await agent(mig_state)
-        return writeback(state, mig_state)
+        return await _runtime.execute(agent_name, state)
 
     return node
 
@@ -163,12 +201,53 @@ def _make_node(agent_name: str):
 # --- Individual node functions --------------------------------------------
 
 analyze_node = _make_node("AnalyzerAgent")
+dispatch_node = _make_node("DispatcherAgent")
 deep_analyze_node = _make_node("DeepAnalyzerAgent")
 plan_node = _make_node("PlannerAgent")
 migrate_node = _make_node("MigratorAgent")
 validate_node = _make_node("ValidatorAgent")
+observe_node = _make_node("ObserverAgent")
 
+_retriever_node = _make_node("RetrieverAgent")
 _fixer_node = _make_node("FixerAgent")
+_service_validate_node = _make_node("RuntimeValidatorAgent")
+
+
+async def service_validate_node(state: dict) -> dict:
+    """Optional deep validation against the external validator *service*.
+
+    The in-graph ``validate`` node (ValidatorAgent) is an offline syntax gate that
+    drives the fix loop; this terminal node adds an authoritative service check
+    once that loop settles. It self-skips unless the orchestrator seeded
+    ``enable_validation`` — so offline/unit runs (which build the graph directly
+    without seeding it) never touch the network — and there is clean code worth
+    validating.
+    """
+    if not state.get("enable_validation") or not state.get("migrated_code"):
+        return state
+    if state.get("errors"):
+        return state
+    return await _service_validate_node(state)
+
+
+async def retrieve_node(state: dict) -> dict:
+    """Run the RetrieverAgent; count + consume a re-retrieval request.
+
+    On the first pass ``retrieval_requests`` is empty and this simply provisions
+    RAG context. When the MigratorAgent has enqueued ungrounded imports it is a
+    *re*-retrieval: advance ``reretrieval_count`` (which bounds the
+    migrate -> retrieve loop, mirroring the fix loop's ``retry_count``) and clear
+    the queue so the loop can't spin on the same request.
+    """
+    was_reretrieval = bool(state.get("retrieval_requests"))
+    state = await _retriever_node(state)
+    if was_reretrieval:
+        state["reretrieval_count"] = state.get("reretrieval_count", 0) + 1
+        state["retrieval_requests"] = []
+        log.info(
+            "Re-retrieval done; reretrieval_count now %d", state["reretrieval_count"]
+        )
+    return state
 
 
 async def fix_node(state: dict) -> dict:

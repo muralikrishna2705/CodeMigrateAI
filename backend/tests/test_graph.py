@@ -88,5 +88,15 @@ class TestGraphState:
         app = build_migration_graph()
         assert app is not None
         nodes = getattr(app, "nodes", {}) or {}
-        for expected in ("analyze", "plan", "migrate", "validate", "fix"):
+        for expected in (
+            "analyze",
+            "dispatch",
+            "retrieve",
+            "plan",
+            "migrate",
+            "validate",
+            "fix",
+            "service_validate",
+            "observe",
+        ):
             assert expected in nodes, f"Missing node: {expected}"

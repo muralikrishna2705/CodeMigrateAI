@@ -39,6 +39,10 @@ class BaseAgent(ABC, metaclass=AgentMeta):
 
     name: str = "BaseAgent"
     requires_llm: bool = True
+    # Names of shared dependencies this agent needs from the Provider (DI). The
+    # graph runtime resolves these and passes them in ``config`` at construction,
+    # so agents don't reach for module globals. Empty means "no extra deps".
+    needs: tuple[str, ...] = ()
 
     def __init__(self, llm_client, config: dict | None = None):
         self.llm = llm_client

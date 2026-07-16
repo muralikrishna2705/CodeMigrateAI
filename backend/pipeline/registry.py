@@ -9,6 +9,14 @@ log = logging.getLogger("CodeMigrateAI.Pipeline")
 
 
 class AgentRegistry:
+    """Discovers and constructs the domain agents via AgentMeta auto-registration.
+
+    The migration flow itself runs inside the LangGraph (see graph/nodes.py),
+    which resolves agents by name from ``BaseAgent.get_registry()``. This registry
+    remains the single place that imports every agent module so that registration
+    happens, and it constructs one instance of each as a startup sanity check.
+    """
+
     def __init__(self, llm_client: "LLMClient", settings=None):
         self._llm_client = llm_client
         self._settings = settings
@@ -16,7 +24,7 @@ class AgentRegistry:
         self._discover_agents()
 
     def _discover_agents(self):
-        # Import all agent modules to trigger AgentMeta registration
+        # Import all agent modules to trigger AgentMeta registration.
         import agents.analyzer_agent  # noqa: F401
         import agents.deep_analyzer_agent  # noqa: F401
         import agents.fixer_agent  # noqa: F401
@@ -26,9 +34,6 @@ class AgentRegistry:
         import agents.validator_agent  # noqa: F401
         import runtime.agent_dispatcher  # noqa: F401
         import runtime.agent_observer  # noqa: F401
-        import runtime.agent_providers  # noqa: F401
-        import runtime.agent_recovery  # noqa: F401
-        import runtime.agent_runtime  # noqa: F401
         import runtime.agent_validator  # noqa: F401
 
         from agents.base import BaseAgent
@@ -53,42 +58,5 @@ class AgentRegistry:
     def get_agent(self, name: str) -> "BaseAgent":
         return self._agents[name]
 
-    def get_order(self) -> list["BaseAgent"]:
-        # Runtime agents first (setup/teardown), then domain agents
-        runtime_order = [
-            "ProviderAgent",
-            "RuntimeAgent",
-            "DispatcherAgent",
-            "ObserverAgent",
-            "RecoveryAgent",
-            "RuntimeValidatorAgent",
-        ]
-        domain_order = [
-            "AnalyzerAgent",
-            "DeepAnalyzerAgent",
-            "RetrieverAgent",
-            "PlannerAgent",
-            "MigratorAgent",
-            "ValidatorAgent",
-            "FixerAgent",
-        ]
-        order = []
-        for name in runtime_order + domain_order:
-            if name in self._agents:
-                order.append(self._agents[name])
-        return order
-
     def register(self, name: str, agent: "BaseAgent"):
         self._agents[name] = agent
-
-    def attach_rag_pipeline(self, rag_pipeline) -> None:
-        """Inject the RAG pipeline into the RetrieverAgent after discovery.
-
-        Agents are constructed at registry-build time, which is before the RAG
-        pipeline (ChromaDB + embeddings) is initialized in the app lifespan, so
-        the dependency is wired in here once it is available.
-        """
-        agent = self._agents.get("RetrieverAgent")
-        if agent is not None:
-            agent._rag_pipeline = rag_pipeline
-            log.info("RAG pipeline attached to RetrieverAgent")

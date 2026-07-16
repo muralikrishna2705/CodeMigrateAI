@@ -120,10 +120,28 @@ def _root(imp: str, language: str) -> str:
     return imp.split(".", 1)[0]
 
 
+# Top-level roots of the Go standard library. An import is stdlib iff its first
+# path segment is one of these (so "net/http", "encoding/json" resolve via "net"
+# / "encoding"). This replaces the old "any dot-free import is stdlib" heuristic,
+# which wrongly grounded invented single-word packages like "fastjson".
+_GO_STDLIB_ROOTS = frozenset(
+    {
+        "archive", "bufio", "builtin", "bytes", "cmp", "compress", "container",
+        "context", "crypto", "database", "debug", "embed", "encoding", "errors",
+        "expvar", "flag", "fmt", "go", "hash", "html", "image", "index", "io",
+        "iter", "log", "maps", "math", "mime", "net", "os", "path", "plugin",
+        "reflect", "regexp", "runtime", "slices", "sort", "strconv", "strings",
+        "sync", "syscall", "testing", "text", "time", "unicode", "unsafe",
+    }
+)
+
+
 def _is_go_stdlib(imp: str) -> bool:
-    # Third-party Go imports carry a dotted host in the first path segment.
     first = imp.split("/", 1)[0]
-    return "." not in first
+    # A dotted first segment is a module host (github.com/...) — always 3rd-party.
+    if "." in first:
+        return False
+    return first in _GO_STDLIB_ROOTS
 
 
 def _is_relative_js(imp: str) -> bool:
