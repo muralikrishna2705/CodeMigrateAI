@@ -302,6 +302,61 @@ class RAGPipeline:
             results, key=lambda pair: pair[1] + _boost(pair[0]), reverse=True
         )
 
+    async def search(
+        self,
+        query: str,
+        target_language: str = "",
+        target_version: str = "",
+        symbols: list[str] | None = None,
+    ) -> list[tuple]:
+        """Retrieve against an explicitly supplied query. Returns ``(doc, score)``.
+
+        ``enrich_prompt`` derives its query from the source code; this is the
+        entry point for a caller that has *formulated its own* query — the
+        VectorDBTool, which lets an agent ask a targeted question ("Java 21
+        virtual threads replacement for ExecutorService") instead of taking
+        whatever the code-signal heuristic produces.
+
+        Shares the filter ladder, ranking, and cache with ``enrich_prompt`` so
+        both paths retrieve identically once a query exists.
+        """
+        settings = get_settings()
+        if not settings.enable_rag or not query.strip():
+            return []
+
+        # Symbols drive the keyword leg of hybrid retrieval; absent an explicit
+        # list, mine them from the query itself so the leg still contributes.
+        if symbols is None:
+            symbols = self._extract_code_signals(query, settings.rag_query_max_symbols)
+
+        cache_key = hashlib.sha256(
+            f"search\n{target_language}\n{target_version}\n{query}".encode()
+        ).hexdigest()
+        cached = self._query_cache.get(cache_key)
+        if cached is not None:
+            self._query_cache.move_to_end(cache_key)
+            return cached
+
+        try:
+            # Without a target language the language/version filters would build
+            # a `{"language": ""}` phase that matches nothing, costing a wasted
+            # query before the ladder broadens; go straight to unfiltered.
+            phases = (
+                self._filter_phases(target_language, target_version, settings)
+                if target_language
+                else [None]
+            )
+            results = await self._retrieve_ladder(query, symbols, phases)
+            results = self._rank(results, target_version, settings)[: settings.rag_top_k]
+        except Exception as e:
+            log.warning("RAG search failed: %s", e)
+            return []
+
+        self._query_cache[cache_key] = results
+        if len(self._query_cache) > self._max_cache:
+            self._query_cache.popitem(last=False)
+        return results
+
     async def enrich_prompt(
         self,
         source_language: str,

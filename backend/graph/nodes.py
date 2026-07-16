@@ -72,6 +72,44 @@ def set_rag_pipeline(pipeline) -> None:
     the RetrieverAgent simply skips retrieval.
     """
     _provider.register("rag_pipeline", pipeline)
+    rebuild_tools()
+
+
+def set_migration_memory(memory) -> None:
+    """Register the cross-session migration memory backing ``semantic_search``."""
+    _provider.register("migration_memory", memory)
+    rebuild_tools()
+
+
+# --- Tools ----------------------------------------------------------------
+#
+# The tool registry is a Provider dependency like any other; agents opt in with
+# `needs = ("tools",)`. It is rebuilt whenever a backing service is registered
+# because VectorDBTool/SemanticSearchTool are constructed with the pipeline and
+# memory respectively — both of which are wired lazily in the app lifespan, after
+# this module is imported. Rebuilding (rather than registering once at import)
+# is what lets those tools exist at all in a live app, while the dependency-free
+# tools (metrics, syntax, source reader) work from import time in offline runs.
+
+
+def rebuild_tools() -> None:
+    """Rebuild the tool registry from the Provider's current services."""
+    from agents.tools import build_registry
+
+    registry = build_registry(
+        rag_pipeline=_provider.get("rag_pipeline"),
+        migration_memory=_provider.get("migration_memory"),
+    )
+    _provider.register_tools(registry)
+    log.info("Tools available: %s", ", ".join(registry.names()) or "(none)")
+
+
+def set_tools(registry) -> None:
+    """Override the tool registry (used by tests to inject stub tools)."""
+    _provider.register_tools(registry)
+
+
+rebuild_tools()
 
 
 # --- Per-request token-stream callback (SSE token-by-token, MigratorAgent) -

@@ -17,7 +17,7 @@ log = logging.getLogger("CodeMigrateAI.MigratorAgent")
 class MigratorAgent(BaseAgent):
     name = "MigratorAgent"
     requires_llm = True
-    needs = ("stream_callback",)
+    needs = ("stream_callback", "tools")
 
     def __init__(self, llm_client, config: dict | None = None):
         super().__init__(llm_client, config)
@@ -101,6 +101,20 @@ class MigratorAgent(BaseAgent):
             )
             details["grounding"] = grounding
             unverified = grounding.get("unverified_imports") or []
+
+            # On-demand verification: the grounding check is corpus-relative, so
+            # it flags any import the retrieved context happens not to mention —
+            # including perfectly real APIs the corpus simply lacks. Before
+            # spending a re-retrieval loop on them, ask the official docs whether
+            # they exist. Confirmed imports are dropped from the flag list; only
+            # the ones no authoritative source knows about stay suspect.
+            if unverified:
+                confirmed = await self._verify_imports(unverified, state)
+                if confirmed:
+                    details["confirmed_imports"] = confirmed
+                    unverified = [i for i in unverified if i not in confirmed]
+                    grounding["unverified_imports"] = unverified
+
             if unverified:
                 log.warning(
                     "Ungrounded imports in migrated code: %s", ", ".join(unverified)
@@ -121,7 +135,52 @@ class MigratorAgent(BaseAgent):
                     details["reretrieval_requested"] = True
                     summary += " · requesting re-retrieval"
 
+        if self._tool_calls:
+            details["tool_calls"] = self.tool_call_log()
+
         return AgentResult(success=True, summary=summary, details=details)
+
+    async def _verify_imports(
+        self, unverified: list[str], state: MigrationState
+    ) -> list[str]:
+        """Check flagged imports against official docs; return the ones that exist.
+
+        Note this runs *after* generation, not during it. A single
+        ``/api/generate`` completion is one indivisible call — there is no point
+        mid-stream at which the model can pause, consult a tool, and resume — so
+        "verify APIs the model just wrote" is the achievable form of the idea,
+        and it catches the same hallucinated imports a mid-generation check would.
+
+        Bounded and best-effort: each import costs a network round trip, so only
+        the first few are checked, and an unavailable search leaves the flags
+        exactly as the grounding check set them.
+        """
+        if "web_search" not in self.tools:
+            return []
+
+        settings = get_settings()
+        confirmed: list[str] = []
+        for name in unverified[: settings.migrator_max_import_checks]:
+            result = await self._call_tool(
+                "web_search",
+                query=f"{name} module documentation",
+                language=state.target_language,
+            )
+            if not result.success:
+                # Search is down or rate-limited: stop rather than retry per
+                # import, and leave the remaining flags untouched.
+                log.info("Import verification unavailable: %s", result.error)
+                break
+            results = (result.data or {}).get("results") or []
+            # The search is already restricted to official documentation domains,
+            # so any hit mentioning the import is authoritative evidence it exists.
+            if any(
+                name.lower() in (hit.get("title", "") + hit.get("snippet", "")).lower()
+                for hit in results
+            ):
+                confirmed.append(name)
+                log.info("Import %r confirmed against official docs", name)
+        return confirmed
 
     async def _call_llm(
         self, prompt: str, system_prompt: str, fmt: str | None = None

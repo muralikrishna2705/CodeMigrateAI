@@ -70,6 +70,15 @@ class WebDocFetcher:
 
         return saved_files
 
+    async def fetch_as_markdown(self, url: str) -> str:
+        """Fetch one URL and return its main content as markdown.
+
+        Public because the WebSearchTool reads a result page through the same
+        boilerplate-stripping extraction the corpus ingestion uses, rather than
+        reimplementing it.
+        """
+        return await self._fetch_and_convert(url)
+
     async def _fetch_and_convert(self, url: str) -> str:
         response = await self.client.get(url)
         response.raise_for_status()

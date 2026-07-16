@@ -1,5 +1,7 @@
+import asyncio
 import logging
 
+from config import get_settings
 from models.state import MigrationState
 
 from agents.base import AgentResult, BaseAgent
@@ -19,6 +21,11 @@ _metrics: dict = {
 class ObserverAgent(BaseAgent):
     name = "ObserverAgent"
     requires_llm = False
+    needs = ("migration_memory",)
+
+    def __init__(self, llm_client, config: dict | None = None):
+        super().__init__(llm_client, config)
+        self._memory = (config or {}).get("migration_memory")
 
     async def run(self, state: MigrationState) -> AgentResult:
         global _metrics
@@ -37,14 +44,58 @@ class ObserverAgent(BaseAgent):
             if report.status == "error":
                 _metrics["by_agent"][agent_name]["errors"] += 1
 
+        remembered = await self._remember(state)
+
+        summary = (
+            f"Observed {len(state.agents_done)} agents "
+            f"({_metrics['success_count']} ok, {_metrics['error_count']} errors)"
+        )
+        if remembered:
+            summary += " · migration remembered"
+
         return AgentResult(
             success=True,
-            summary=(
-                f"Observed {len(state.agents_done)} agents "
-                f"({_metrics['success_count']} ok, {_metrics['error_count']} errors)"
-            ),
-            details=self.get_metrics(),
+            summary=summary,
+            details={**self.get_metrics(), "remembered": remembered},
         )
+
+    async def _remember(self, state: MigrationState) -> bool:
+        """Record a clean migration into cross-session memory. Returns success.
+
+        The observer is the terminal graph node, so it is the only place that
+        sees a run's final outcome — including whether the fix loop settled on
+        valid code.
+
+        Only clean runs are recorded. A migration with errors, or one whose code
+        failed validation, is exactly the precedent a future run must not copy:
+        ``semantic_search`` presents hits as known-good prior art, so storing a
+        bad one would launder a failure into grounding.
+        """
+        if not self._memory or not get_settings().enable_migration_memory:
+            return False
+        if state.errors or not state.migrated_code:
+            return False
+        validation = state.validation_result or {}
+        if not validation.get("valid", True):
+            return False
+
+        try:
+            # Chroma writes (and the embedding call behind them) are blocking;
+            # keep them off the event loop like every other store access.
+            await asyncio.to_thread(
+                self._memory.remember,
+                source_code=state.source_code,
+                source_language=state.source_language,
+                source_version=state.source_version,
+                target_language=state.target_language,
+                target_version=state.target_version,
+                migrated_code=state.migrated_code,
+                plan_summary=state.inline_plan,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001 — memory is an optimization
+            log.warning("Could not record migration memory: %s", exc)
+            return False
 
     @classmethod
     def get_metrics(cls) -> dict:

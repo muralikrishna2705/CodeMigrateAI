@@ -27,7 +27,13 @@ from llm.streaming import sse_event_generator
 from models.requests import MigrateRequest, MigrateResponse
 from models.state import MigrationState
 from pipeline.orchestrator import Pipeline
-from rag import CachedEmbeddings, IngestionPipeline, RAGPipeline, VectorStore
+from rag import (
+    CachedEmbeddings,
+    IngestionPipeline,
+    MigrationMemory,
+    RAGPipeline,
+    VectorStore,
+)
 from runtime.agent_observer import ObserverAgent
 
 logging.basicConfig(
@@ -104,9 +110,20 @@ async def lifespan(app: FastAPI):
             app.state.rag_pipeline = RAGPipeline(rag_vector_store, rag_embeddings)
             # The graph builds a fresh RetrieverAgent per call, so the pipeline is
             # threaded through module state (like the LLM client) rather than an
-            # instance — see graph/nodes.set_rag_pipeline.
+            # instance — see graph/nodes.set_rag_pipeline. Registering it also
+            # rebuilds the tool registry, which is what brings VectorDBTool up.
             graph_nodes.set_rag_pipeline(app.state.rag_pipeline)
             log.info("RAG pipeline ready")
+
+            # Cross-session migration memory shares the embedding service but
+            # lives in its own Chroma collection, so past migrations can never
+            # outrank official documentation during reference retrieval.
+            if settings.enable_migration_memory:
+                memory = MigrationMemory(rag_embeddings)
+                memory.initialize()
+                app.state.migration_memory = memory
+                graph_nodes.set_migration_memory(memory)
+                log.info("Migration memory ready (%d entries)", memory.count())
         except asyncio.CancelledError:
             raise
         except Exception as exc:

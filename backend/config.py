@@ -70,6 +70,39 @@ class Settings(BaseSettings):
     rag_grounding_reretrieval_threshold: int = 1
     max_reretrievals: int = 1
 
+    # Agent Tools
+    #
+    # Agents call tools on demand (see agents/tools/). `tools_enabled=False` is
+    # the kill switch: build_registry returns an empty registry and every agent
+    # falls back to its pre-tool behaviour.
+    tools_enabled: bool = True
+    tool_timeout_sec: float = 20.0
+    tool_vector_db_enabled: bool = True
+    tool_code_metrics_enabled: bool = True
+    tool_syntax_check_enabled: bool = True
+    tool_source_reader_enabled: bool = True
+    # Off by default: the only tool that reaches the public internet, and the
+    # DuckDuckGo HTML endpoint it uses rate-limits datacenter IPs.
+    tool_web_search_enabled: bool = False
+    # Off by default: the memory collection is empty until migrations have run.
+    tool_semantic_search_enabled: bool = False
+
+    # Cross-session migration memory (backs the semantic_search tool). Recorded
+    # by the ObserverAgent for successful, validated migrations only.
+    enable_migration_memory: bool = False
+    memory_top_k: int = 3
+    # Higher than rag_min_score: a weak "similar past migration" is worse than
+    # none, since it grounds new code in a precedent that doesn't really apply.
+    memory_min_score: float = 0.8
+
+    # Retriever tool loop: when on, the RetrieverAgent asks the LLM which tool to
+    # call and with what query, instead of running one heuristic retrieval pass.
+    # Off by default — deepseek-coder:1.3b is not tool-call trained, so selection
+    # is prompt-driven and unreliable; any failure falls back to the heuristic
+    # pass, which is exactly the pre-tool behaviour.
+    retriever_tool_loop: bool = False
+    retriever_max_tool_calls: int = 3
+
     # RAG Pipeline (Phase 2)
     enable_rag: bool = True
     rag_top_k: int = 4
@@ -115,6 +148,10 @@ class Settings(BaseSettings):
     # Anti-hallucination: flag library imports in migrated code that are not
     # grounded by the source, retrieved context, or target stdlib (advisory).
     enable_grounding_check: bool = True
+    # When the web_search tool is enabled, how many flagged imports the
+    # MigratorAgent checks against official docs before giving up. Each check is
+    # a network round trip, so this is deliberately small.
+    migrator_max_import_checks: int = 3
 
     # Optional LLM-based query expansion: reformulate the extracted code signals
     # into a targeted natural-language retrieval query via the fast model. Off by

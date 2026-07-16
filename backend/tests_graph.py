@@ -30,10 +30,17 @@ INVALID_PY = "def broken(:\n    pass\n"
 class StubLLM:
     """Scripted LLM: routes responses by prompt content.
 
-    - Planner prompts -> a plan JSON object.
+    - Analyzer prompts -> a semantic-analysis JSON object.
+    - Planner prompts  -> a plan JSON object.
     - Fixer prompts    -> raw corrected source code.
     - Migrator prompts -> JSON; the first N migrator calls return invalid code
       (controlled by ``invalid_migrations``), the rest return valid code.
+
+    Every caller must be routed explicitly, because the migrator branch is the
+    fall-through and it is *stateful*: an unrouted prompt silently consumes the
+    ``invalid_migrations`` budget, so the migrator returns valid code earlier
+    than the test intends and the fix loop never runs. Add a branch here when an
+    agent starts calling the LLM.
     """
 
     def __init__(self, invalid_migrations: int = 1):
@@ -42,9 +49,26 @@ class StubLLM:
         self.calls: list[str] = []
 
     async def call_llm(
-        self, prompt: str, system_prompt: str = "", fmt: str | None = None
+        self,
+        prompt: str,
+        system_prompt: str = "",
+        fmt: str | None = None,
+        model: str | None = None,
     ) -> str:
         self.calls.append(prompt)
+
+        # AnalyzerAgent: keyed on ANALYZER_PROMPT's opening line. Matching on a
+        # schema key like "deprecated_patterns" would be wrong — the migrator
+        # prompt embeds code_metrics, so it contains those key names too.
+        if prompt.startswith("Analyze this"):
+            return json.dumps(
+                {
+                    "deprecated_patterns": [],
+                    "migration_challenges": [],
+                    "key_constructs": ["print statement"],
+                    "summary": "Stub analysis.",
+                }
+            )
 
         if "MIGRATION PLANNING TASK" in prompt:
             return json.dumps(
@@ -325,6 +349,17 @@ async def test_adaptive_reretrieval_loop_on_ungrounded_imports():
             self.migrator_calls = 0
 
         async def call_llm(self, prompt, system_prompt="", fmt=None, **kwargs):
+            # Routed before the stateful migrator fall-through, so the analyzer's
+            # semantic call cannot consume one of the scripted migrations.
+            if prompt.startswith("Analyze this"):
+                return json.dumps(
+                    {
+                        "deprecated_patterns": [],
+                        "migration_challenges": [],
+                        "key_constructs": [],
+                        "summary": "Stub analysis.",
+                    }
+                )
             if "MIGRATION PLANNING TASK" in prompt:
                 return json.dumps(
                     {"plan_summary": "plan", "steps": [], "risk_areas": []}

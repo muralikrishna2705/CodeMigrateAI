@@ -50,6 +50,24 @@ class Provider:
     def has(self, name: str) -> bool:
         return name in self._factories or name in self._instances
 
+    # --- Tools -----------------------------------------------------------
+    #
+    # Tools are just another registered dependency ("tools"), so an agent opts in
+    # with `needs = ("tools",)` and receives the registry in its config like any
+    # other service. These are thin named wrappers over register/get: the tool
+    # registry is the one dependency nearly every agent touches, so it earns an
+    # explicit, greppable API rather than a bare string key at each call site.
+
+    TOOLS_KEY = "tools"
+
+    def register_tools(self, registry: Any) -> None:
+        """Register the shared :class:`~agents.tools.base.ToolRegistry`."""
+        self.register(self.TOOLS_KEY, registry)
+
+    def get_tools(self) -> Optional[Any]:
+        """Resolve the tool registry, or ``None`` if none was registered."""
+        return self.get(self.TOOLS_KEY)
+
     def resolve(self, names) -> dict[str, Any]:
         """Build a config dict for the given dependency names.
 
