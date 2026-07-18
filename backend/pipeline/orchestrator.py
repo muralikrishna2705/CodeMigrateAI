@@ -105,6 +105,14 @@ class Pipeline:
             "reretrieval_count": 0,
             "max_reretrievals": self.settings.max_reretrievals,
             "route_plan": dict(state.route_plan),
+            # Reflection (Dimension 3): seeded from settings so the reflect node
+            # self-skips unless enabled, bounded by max_reflections like the fix loop.
+            "reflection_score": 0.0,
+            "reflection_feedback": "",
+            "reflection_recommendation": "pass",
+            "reflection_count": 0,
+            "max_reflections": self.settings.max_reflections,
+            "enable_reflection": self.settings.enable_reflection,
             "retry_count": 0,
             "max_retries": self.settings.max_retries,
             "best_effort_code": "",

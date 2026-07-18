@@ -2,25 +2,33 @@
 
 Flow::
 
-    analyze ──▶ dispatch ──(deep?)──▶ deep_analyze ──▶ retrieve ──▶ plan ──▶ migrate ──▶ validate
-                    └──────(no)────────────────────▶ retrieve                     │           │
-                                       fix ◀─────────────────────────────────────(fail)───────┘
-                                        └──▶ migrate                                           │
+    analyze ─▶ dispatch ─(deep?)─▶ deep_analyze ─▶ retrieve ─▶ plan ─▶ migrate ─▶ reflect ─▶ validate
+                  └─────(no)──────────────────▶ retrieve              ▲            │            │
+                                     fix ◀───────────────────────────(fail)────────┼────────────┘
+                                      └──▶ migrate                                  │
+                                            ▲──────(re-generate, low confidence)────┘
                                                                                           (pass/done)
                                                                                                ▼
                                      END ◀── observe ◀── service_validate ◀────────────────────┘
 
 ``dispatch`` (DispatcherAgent) writes a route plan the branch consults; ``retrieve``
-(RetrieverAgent) provisions RAG context; ``service_validate`` (RuntimeValidatorAgent)
-runs the optional external validator once the offline validate/fix loop settles;
-``observe`` records terminal metrics.
+(RetrieverAgent) provisions RAG context; ``reflect`` (ReflectorAgent) self-critiques
+the migrated code and routes low-confidence output back to ``migrate`` with feedback
+(bounded by max_reflections); ``service_validate`` (RuntimeValidatorAgent) runs the
+optional external validator once the offline validate/fix loop settles; ``observe``
+records terminal metrics.
 """
 
 import logging
 
 from langgraph.graph import END, StateGraph
 
-from .conditions import dispatch_condition, migrate_condition, validate_condition
+from .conditions import (
+    dispatch_condition,
+    migrate_condition,
+    reflect_condition,
+    validate_condition,
+)
 from .nodes import (
     analyze_node,
     deep_analyze_node,
@@ -29,6 +37,7 @@ from .nodes import (
     migrate_node,
     observe_node,
     plan_node,
+    reflect_node,
     retrieve_node,
     service_validate_node,
     validate_node,
@@ -49,6 +58,7 @@ def build_migration_graph():
     workflow.add_node("retrieve", retrieve_node)
     workflow.add_node("plan", plan_node)
     workflow.add_node("migrate", migrate_node)
+    workflow.add_node("reflect", reflect_node)
     workflow.add_node("validate", validate_node)
     workflow.add_node("fix", fix_node)
     workflow.add_node("service_validate", service_validate_node)
@@ -70,16 +80,26 @@ def build_migration_graph():
     workflow.add_edge("retrieve", "plan")
     workflow.add_edge("plan", "migrate")
 
-    # Conditional: produced code -> validate; ungrounded imports + budget left ->
-    # retrieve (adaptive re-retrieval loop); produced nothing -> service_validate.
+    # Conditional: produced code -> reflect (self-critique before validating);
+    # ungrounded imports + budget left -> retrieve (adaptive re-retrieval loop);
+    # produced nothing -> service_validate. The reflect node self-skips when
+    # reflection is disabled, so this stays a straight path to validate by default.
     workflow.add_conditional_edges(
         "migrate",
         migrate_condition,
         {
-            "validate": "validate",
+            "validate": "reflect",
             "retrieve": "retrieve",
             "end": "service_validate",
         },
+    )
+
+    # Conditional: reflection passed (or was skipped) -> validate; low confidence
+    # with budget left -> migrate (regenerate with the reflection feedback).
+    workflow.add_conditional_edges(
+        "reflect",
+        reflect_condition,
+        {"validate": "validate", "re_migrate": "migrate"},
     )
 
     # Conditional: pass/exhausted -> service_validate, fail -> fix (retry loop)

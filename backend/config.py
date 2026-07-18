@@ -70,6 +70,26 @@ class Settings(BaseSettings):
     rag_grounding_reretrieval_threshold: int = 1
     max_reretrievals: int = 1
 
+    # Agent reflection + decision-making (Dimension 3)
+    #
+    # When on, agents self-critique their own output (Reflexion pattern): the
+    # PlannerAgent reflects on its plan and refines it, the MigratorAgent reflects
+    # on the migrated code's correctness and regenerates low-confidence output, and
+    # a dedicated ReflectorAgent runs as a `reflect` graph node between migrate and
+    # validate, routing low-confidence code back to migrate with actionable
+    # feedback (bounded by max_reflections, mirroring the fix loop's max_retries).
+    # Off by default so decisions stay deterministic/offline-safe; every reflection
+    # degrades to "pass" when no LLM is wired, so switching this on can improve
+    # quality but never blocks a migration.
+    enable_reflection: bool = False
+    # Graph-level regeneration budget: how many times reflect -> migrate may loop
+    # for a single migration. Kept to 1 so a single corrective pass never spirals.
+    max_reflections: int = 1
+    # Confidence floor the in-agent reflection uses to decide an in-place refine
+    # (the model's own 0.0-1.0 self-rating). The graph ReflectorAgent routes on the
+    # model's explicit recommendation instead, so this only gates internal refines.
+    reflection_min_confidence: float = 0.6
+
     # Agent Tools
     #
     # Agents call tools on demand (see agents/tools/). `tools_enabled=False` is

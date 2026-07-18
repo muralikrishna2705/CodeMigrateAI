@@ -1,9 +1,11 @@
-from .base import AgentResult, BaseAgent
+from .base import AgentResult, BaseAgent, ReflectionResult
 from .analyzer_agent import AnalyzerAgent
+from .critic_agent import CriticAgent
 from .deep_analyzer_agent import DeepAnalyzerAgent
 from .fixer_agent import FixerAgent
 from .migrator_agent import MigratorAgent
 from .planner_agent import PlannerAgent
+from .reflector_agent import ReflectorAgent
 from .retriever_agent import RetrieverAgent
 from .validator_agent import ValidatorAgent
 
@@ -21,11 +23,14 @@ import runtime.agent_validator  # noqa: F401
 __all__ = [
     "BaseAgent",
     "AgentResult",
+    "ReflectionResult",
     "AnalyzerAgent",
+    "CriticAgent",
     "DeepAnalyzerAgent",
     "FixerAgent",
     "MigratorAgent",
     "PlannerAgent",
+    "ReflectorAgent",
     "RetrieverAgent",
     "ValidatorAgent",
 ]

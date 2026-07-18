@@ -8,6 +8,7 @@ the Provider, from which agents receive it via ``needs = ("tools",)``.
 
 from agents.tools.base import AgentTool, ToolCall, ToolRegistry, ToolResult
 from agents.tools.code_metrics import CodeMetricsTool
+from agents.tools.reflection import ReflectionTool
 from agents.tools.semantic_search import SemanticSearchTool
 from agents.tools.source_reader import SourceReaderTool
 from agents.tools.syntax_checker import SyntaxCheckTool
@@ -20,6 +21,7 @@ __all__ = [
     "ToolRegistry",
     "ToolResult",
     "CodeMetricsTool",
+    "ReflectionTool",
     "SemanticSearchTool",
     "SourceReaderTool",
     "SyntaxCheckTool",
@@ -29,7 +31,9 @@ __all__ = [
 ]
 
 
-def build_registry(rag_pipeline=None, migration_memory=None, settings=None) -> ToolRegistry:
+def build_registry(
+    rag_pipeline=None, migration_memory=None, llm_client=None, settings=None
+) -> ToolRegistry:
     """Construct the enabled tools.
 
     Tools whose backing dependency is missing are skipped rather than registered
@@ -59,5 +63,10 @@ def build_registry(rag_pipeline=None, migration_memory=None, settings=None) -> T
         tools.append(WebSearchTool())  # keeps its own network timeout
     if settings.tool_semantic_search_enabled and migration_memory is not None:
         tools.append(SemanticSearchTool(migration_memory, timeout_sec=timeout))
+    # The reflect_output tool needs an LLM to critique with, and it only earns a
+    # slot in the catalog when reflection is switched on — an extra tool a small
+    # model might mis-select is a cost, so it stays out of the default catalog.
+    if settings.enable_reflection and llm_client is not None:
+        tools.append(ReflectionTool(llm_client, timeout_sec=timeout))
 
     return ToolRegistry(tools)

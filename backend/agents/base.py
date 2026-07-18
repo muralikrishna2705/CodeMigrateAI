@@ -21,6 +21,36 @@ class AgentResult:
     error: str | None = None
 
 
+@dataclass
+class ReflectionResult:
+    """An agent's self-critique of one piece of its own output.
+
+    ``confidence`` is the model's own 0.0-1.0 rating that the output is correct
+    and complete. ``recommendation`` is the action to take — one of ``"pass"``,
+    ``"re-generate"``, or ``"gather-more-info"`` — which the graph's
+    ``reflect_condition`` routes on. ``feedback`` is the actionable critique a
+    regeneration should address (the Reflexion "verbal reinforcement" signal).
+
+    The degraded case (no LLM, unparseable answer) is a *passing* result on
+    purpose: reflection is quality enrichment layered on top of a working
+    migration, so an unavailable critique must never block one.
+    """
+
+    confidence: float = 1.0
+    recommendation: str = "pass"
+    feedback: str = ""
+    details: dict | None = None
+
+    @property
+    def passed(self) -> bool:
+        return self.recommendation == "pass"
+
+    @classmethod
+    def neutral(cls) -> "ReflectionResult":
+        """A passing, no-op result used when a critique can't be produced."""
+        return cls(confidence=1.0, recommendation="pass", details={"degraded": True})
+
+
 class AgentMeta(ABCMeta):
     """Metaclass that auto-registers all BaseAgent subclasses.
 
@@ -105,6 +135,54 @@ class BaseAgent(ABC, metaclass=AgentMeta):
 
     def should_run(self, state: MigrationState) -> bool:
         return True
+
+    # --- Reflection (Dimension 3) -----------------------------------------
+
+    async def reflect(
+        self,
+        state: MigrationState,
+        output: str,
+        *,
+        criteria=None,
+        stage: str = "output",
+        context: str = "",
+    ) -> "ReflectionResult":
+        """Self-critique ``output`` and recommend pass / re-generate / gather-info.
+
+        The default hook is generic: it prefers the ``reflect_output`` tool when
+        one is registered (so reflection flows through the same on-demand tool
+        interface as every other agent capability) and otherwise reasons with the
+        agent's own LLM. Specialized agents override this — the MigratorAgent
+        passes code criteria, the CriticAgent scans for stub markers first — but
+        every override returns a :class:`ReflectionResult`, so callers branch on
+        ``recommendation`` alone.
+
+        Never raises and never blocks: with no LLM (unit stubs) or an unparseable
+        answer it returns :meth:`ReflectionResult.neutral` — a passing verdict.
+        """
+        from agents.tools.reflection import GENERIC_CRITERIA, evaluate_output
+
+        chosen = criteria or GENERIC_CRITERIA
+
+        if self.tools.get("reflect_output") is not None:
+            result = await self._call_tool(
+                "reflect_output",
+                output=output,
+                criteria=chosen,
+                stage=stage,
+                context=context,
+            )
+            if result.success and isinstance(result.data, dict):
+                return ReflectionResult(
+                    confidence=result.data.get("confidence", 1.0),
+                    recommendation=result.data.get("recommendation", "pass"),
+                    feedback=result.data.get("feedback", ""),
+                    details=result.data.get("details"),
+                )
+
+        return await evaluate_output(
+            self.llm, output=output, criteria=chosen, stage=stage, context=context
+        )
 
     # --- Tool use ---------------------------------------------------------
 

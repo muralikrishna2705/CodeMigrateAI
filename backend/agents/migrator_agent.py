@@ -54,6 +54,18 @@ class MigratorAgent(BaseAgent):
         else:
             prompt = f"{self._ungrounded_notice(state)}\n\n---\n\n{prompt}"
 
+        # Reflection feedback (Dimension 3): on a reflect-driven re-migration the
+        # graph carries the reviewer's critique here. Prepend it so the model
+        # regenerates *addressing* the flaws instead of reproducing them. Gated on
+        # an active (non-pass) verdict — the same signal migrate_node uses to detect
+        # the re-entry — so a passing reflection's notes never leak into an
+        # unrelated fix-loop re-migration.
+        if state.reflection_feedback and state.reflection_recommendation != "pass":
+            prompt = (
+                "REVIEWER FEEDBACK on your previous attempt — address every point:\n"
+                f"{state.reflection_feedback}\n\n---\n\n{prompt}"
+            )
+
         raw_output = await self._call_llm(prompt, system_prompt, fmt="json")
         try:
             parsed = self._parse_llm_output(raw_output)
@@ -75,6 +87,16 @@ class MigratorAgent(BaseAgent):
         if not state.migrated_code:
             raise ValueError("LLM returned empty migrated_code")
 
+        # Self-reflection (Dimension 3): critique the generated code for
+        # correctness/completeness and regenerate once if the model isn't
+        # confident. Opt-in, best-effort, and independent of the graph's outer
+        # reflect node — off by default so a run is unchanged unless enabled.
+        reflection_note = None
+        if get_settings().enable_reflection:
+            reflection_note = await self._reflect_and_regenerate(
+                state, prompt, system_prompt
+            )
+
         output_lines = len(state.migrated_code.splitlines())
         details = {
             "input_lines": (state.code_metrics or {}).get("total_lines"),
@@ -82,6 +104,8 @@ class MigratorAgent(BaseAgent):
             "migration_type": state.migration_type.value,
             "plan_summary": state.inline_plan,
         }
+        if reflection_note:
+            details["reflection"] = reflection_note
 
         summary = (
             f"Generated {output_lines} lines of "
@@ -139,6 +163,55 @@ class MigratorAgent(BaseAgent):
             details["tool_calls"] = self.tool_call_log()
 
         return AgentResult(success=True, summary=summary, details=details)
+
+    async def _reflect_and_regenerate(
+        self, state: MigrationState, prompt: str, system_prompt: str
+    ) -> dict:
+        """Critique the migrated code; regenerate once when confidence is low.
+
+        Delegates the critique to the code-specialized :class:`CriticAgent` (which
+        also scans for stub markers), then, if the verdict is a low-confidence
+        non-pass with actionable feedback, regenerates the code once with that
+        feedback folded into the prompt. Mutates ``state.migrated_code`` in place
+        and returns a note for the agent's report. Never raises.
+        """
+        from agents.critic_agent import CriticAgent
+
+        critic = CriticAgent(self.llm, self.config)
+        reflection = await critic.critique(state.migrated_code, state=state)
+        note = {
+            "confidence": reflection.confidence,
+            "recommendation": reflection.recommendation,
+            "feedback": reflection.feedback,
+        }
+
+        settings = get_settings()
+        should_regen = (
+            not reflection.passed
+            and reflection.confidence < settings.reflection_min_confidence
+            and bool(reflection.feedback)
+        )
+        if not should_regen:
+            return note
+
+        refine_prompt = (
+            f"{prompt}\n\n---\n\nYOUR PREVIOUS ATTEMPT was reviewed and had these "
+            f"problems:\n{reflection.feedback}\n\nRegenerate the migrated code so it "
+            "addresses every point above. Return the same JSON object."
+        )
+        try:
+            raw = await self._call_llm(refine_prompt, system_prompt, fmt="json")
+            parsed = self._parse_llm_output(raw)
+        except Exception as exc:  # noqa: BLE001 — regeneration is optional
+            log.warning("Reflection-driven regeneration failed: %s", exc)
+            return note
+
+        if parsed["migrated_code"].strip():
+            state.migrated_code = parsed["migrated_code"].strip()
+            if parsed["plan_summary"].strip():
+                state.inline_plan = parsed["plan_summary"].strip()
+            note["regenerated"] = True
+        return note
 
     async def _verify_imports(
         self, unverified: list[str], state: MigrationState

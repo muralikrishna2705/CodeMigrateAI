@@ -16,10 +16,12 @@ import logging
 # Importing the agent modules triggers AgentMeta auto-registration so that
 # BaseAgent.get_registry() can resolve them by name below.
 import agents.analyzer_agent  # noqa: F401
+import agents.critic_agent  # noqa: F401
 import agents.deep_analyzer_agent  # noqa: F401
 import agents.fixer_agent  # noqa: F401
 import agents.migrator_agent  # noqa: F401
 import agents.planner_agent  # noqa: F401
+import agents.reflector_agent  # noqa: F401
 import agents.retriever_agent  # noqa: F401
 import agents.validator_agent  # noqa: F401
 import runtime.agent_dispatcher  # noqa: F401
@@ -62,6 +64,10 @@ def get_llm_client():
 def set_llm_client(client) -> None:
     """Override the shared LLM client (used by tests to inject a stub)."""
     _provider.register("llm", client)
+    # The reflect_output tool is built with this client, so rebuild the registry
+    # whenever it changes — without this, reflection would have no tool in a live
+    # app that never re-registers the RAG pipeline (e.g. RAG disabled).
+    rebuild_tools()
 
 
 def set_rag_pipeline(pipeline) -> None:
@@ -99,6 +105,7 @@ def rebuild_tools() -> None:
     registry = build_registry(
         rag_pipeline=_provider.get("rag_pipeline"),
         migration_memory=_provider.get("migration_memory"),
+        llm_client=_provider.get("llm"),
     )
     _provider.register_tools(registry)
     log.info("Tools available: %s", ", ".join(registry.names()) or "(none)")
@@ -189,6 +196,9 @@ def hydrate_state(state: dict) -> MigrationState:
     mig_state.retrieval_requests = list(state.get("retrieval_requests", []))
     mig_state.reretrieval_count = state.get("reretrieval_count", 0)
     mig_state.route_plan = state.get("route_plan") or {}
+    mig_state.reflection_score = state.get("reflection_score", 0.0)
+    mig_state.reflection_feedback = state.get("reflection_feedback", "")
+    mig_state.reflection_recommendation = state.get("reflection_recommendation", "pass")
     return mig_state
 
 
@@ -206,6 +216,9 @@ def writeback(state: dict, mig_state: MigrationState) -> dict:
     state["retrieval_requests"] = mig_state.retrieval_requests
     state["reretrieval_count"] = mig_state.reretrieval_count
     state["route_plan"] = mig_state.route_plan
+    state["reflection_score"] = mig_state.reflection_score
+    state["reflection_feedback"] = mig_state.reflection_feedback
+    state["reflection_recommendation"] = mig_state.reflection_recommendation
     return state
 
 
@@ -242,13 +255,56 @@ analyze_node = _make_node("AnalyzerAgent")
 dispatch_node = _make_node("DispatcherAgent")
 deep_analyze_node = _make_node("DeepAnalyzerAgent")
 plan_node = _make_node("PlannerAgent")
-migrate_node = _make_node("MigratorAgent")
 validate_node = _make_node("ValidatorAgent")
 observe_node = _make_node("ObserverAgent")
 
+_migrate_node = _make_node("MigratorAgent")
 _retriever_node = _make_node("RetrieverAgent")
+_reflect_node = _make_node("ReflectorAgent")
 _fixer_node = _make_node("FixerAgent")
 _service_validate_node = _make_node("RuntimeValidatorAgent")
+
+
+async def migrate_node(state: dict) -> dict:
+    """Run the MigratorAgent; consume a reflection-driven regeneration.
+
+    On the first pass (from ``plan``) or a fix-driven re-migration, the reflection
+    fields are unset/passing and this is a plain migration. When the ``reflect``
+    node has sent the run back with a non-pass verdict, the MigratorAgent
+    regenerates *using* ``reflection_feedback``; this wrapper then advances
+    ``reflection_count`` (which bounds the reflect -> migrate loop, mirroring how
+    ``retry_count`` bounds the fix loop) and clears the verdict so the next
+    reflection starts fresh. Detecting the re-entry from the feedback signal
+    mirrors how ``retrieve_node`` detects a re-retrieval.
+    """
+    was_regeneration = (
+        bool(state.get("reflection_feedback"))
+        and (state.get("reflection_recommendation") or "pass") != "pass"
+    )
+    state = await _migrate_node(state)
+    if was_regeneration:
+        state["reflection_count"] = state.get("reflection_count", 0) + 1
+        state["reflection_feedback"] = ""
+        state["reflection_recommendation"] = "pass"
+        log.info(
+            "Reflection-driven re-migration done; reflection_count now %d",
+            state["reflection_count"],
+        )
+    return state
+
+
+async def reflect_node(state: dict) -> dict:
+    """Optional self-reflection on the migrated code (Reflexion outer loop).
+
+    Self-skips unless the orchestrator seeded ``enable_reflection`` — so offline /
+    direct-graph runs (which build the graph without seeding it) never reflect —
+    and there is code worth reflecting on. When it runs, the ReflectorAgent writes
+    ``reflection_score``/``reflection_feedback``/``reflection_recommendation``,
+    which ``reflect_condition`` routes on.
+    """
+    if not state.get("enable_reflection") or not state.get("migrated_code"):
+        return state
+    return await _reflect_node(state)
 
 
 async def service_validate_node(state: dict) -> dict:

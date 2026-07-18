@@ -49,6 +49,17 @@ class MigrationState(BaseModel):
     # consult it instead of recomputing the branch from complexity.
     route_plan: dict = Field(default_factory=dict)
 
+    # Agent reflection (Dimension 3): the ReflectorAgent (the graph `reflect` node)
+    # writes its self-critique here. reflection_score is the model's 0.0-1.0
+    # confidence in the current output; reflection_feedback is the actionable
+    # critique a regeneration should address; reflection_recommendation is the
+    # routing verdict ("pass" | "re-generate" | "gather-more-info") the
+    # reflect_condition consults. Defaults are a passing no-op, so a run that never
+    # reflects (reflection disabled) routes straight through.
+    reflection_score: float = 0.0
+    reflection_feedback: str = ""
+    reflection_recommendation: str = "pass"
+
     reports: list[AgentReport] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
     agents_done: list[str] = Field(default_factory=list)

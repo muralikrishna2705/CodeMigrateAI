@@ -40,6 +40,16 @@ class GraphState(TypedDict, total=False):
     # --- Dynamic routing (DispatcherAgent -> dispatch_condition) ---
     route_plan: dict
 
+    # --- Agent reflection (ReflectorAgent -> reflect_condition) ---
+    reflection_score: float
+    reflection_feedback: str
+    reflection_recommendation: str
+    reflection_count: int
+    max_reflections: int
+    # Seeded from settings by the orchestrator; gates the `reflect` node so offline
+    # / direct-graph runs never reflect unless a test opts in.
+    enable_reflection: bool
+
     # --- Graph-specific fields ---
     retry_count: int
     max_retries: int
