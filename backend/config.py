@@ -159,6 +159,34 @@ class Settings(BaseSettings):
     # signal query on any error.
     rag_query_expansion: bool = False
 
+    # Agentic RAG strategies (Dimension 2)
+    #
+    # Which retrieval strategy enrich_prompt / the VectorDBTool use. Options:
+    #   single_hop (default) · hyde · multi_query · multi_hop ·
+    #   contextual_compression · parent_document · corrective · self_rag
+    # Default is single_hop = the original one-shot behaviour: offline-safe and
+    # free of per-retrieval LLM calls. The LLM-driven strategies activate only
+    # when a client is wired, and every one degrades to single_hop on any failure,
+    # so switching this can improve grounding but never break a migration.
+    rag_strategy: str = "single_hop"
+    # HyDE: retrieve against an LLM-written hypothetical target-language answer.
+    rag_hyde_enabled: bool = True
+    # Multi-Query: how many LLM-generated query paraphrases to fan out over.
+    rag_multi_query_count: int = 5
+    # Multi-hop: bounds on the query-graph BFS (nodes expanded, graph depth).
+    rag_multi_hop_max_subqueries: int = 4
+    rag_multi_hop_max_depth: int = 2
+    # Contextual compression: LLM-extract only query-relevant lines per doc. Off by
+    # default — one LLM call per retrieved doc.
+    rag_compression_enabled: bool = False
+    # CRAG: min relevance for the offline grade heuristic; web fallback reaches the
+    # live internet so it stays opt-in (like tool_web_search_enabled).
+    rag_crag_relevance_threshold: float = 0.5
+    rag_crag_web_fallback: bool = False
+    # Self-RAG: honour the model's "skip retrieval" decision. Off by default so the
+    # anti-hallucination retrieval always runs; reflection filtering is unaffected.
+    rag_self_rag_enabled: bool = False
+
     # Web Document Fetching (Phase 2)
     enable_web_docs: bool = True
     web_docs_refresh_days: int = 7

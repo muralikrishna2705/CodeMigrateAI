@@ -1,3 +1,5 @@
+import hashlib
+
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 
@@ -30,7 +32,32 @@ class DocSplitter:
             separators=separators,
             length_function=len,
         )
-        chunks = splitter.split_documents(documents)
-        for chunk in chunks:
-            chunk.metadata["chunk_size"] = len(chunk.page_content)
+        # Split per source document so each chunk can be linked back to its parent
+        # (parent_id) and ordered within it (chunk_index). The Parent Document
+        # retrieval strategy uses these to reassemble the full parent from a child
+        # hit; both are Chroma-safe scalars. Iterating documents in order preserves
+        # the overall chunk sequence the previous batch call produced.
+        chunks: list[Document] = []
+        for document in documents:
+            parent_id = self._parent_id(document)
+            doc_chunks = splitter.split_documents([document])
+            for index, chunk in enumerate(doc_chunks):
+                chunk.metadata["chunk_size"] = len(chunk.page_content)
+                chunk.metadata["parent_id"] = parent_id
+                chunk.metadata["chunk_index"] = index
+            chunks.extend(doc_chunks)
         return chunks
+
+    @staticmethod
+    def _parent_id(document: Document) -> str:
+        """Stable id for the source document a chunk belongs to.
+
+        Derived from the source path (when known) plus a hash of the full content,
+        so two distinct source docs never collide and re-ingesting the same doc
+        yields the same parent id.
+        """
+        source = (document.metadata or {}).get("source", "")
+        digest = hashlib.sha256(
+            f"{source}\n{document.page_content}".encode()
+        ).hexdigest()
+        return digest[:16]

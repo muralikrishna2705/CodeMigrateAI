@@ -109,6 +109,39 @@ class VectorStore:
         ranked = sorted(matches.values(), key=lambda m: m[1], reverse=True)[:k]
         return [(doc, count / total) for doc, count in ranked]
 
+    def get_by_metadata(
+        self, where: dict, limit: int = 50
+    ) -> list[Document]:
+        """Fetch documents by a metadata filter (no embedding/query involved).
+
+        Backs the Parent Document strategy: given a chunk's ``parent_id``, pull
+        every sibling chunk so they can be reassembled into the full parent doc.
+        Returns an empty list on any store error — the caller then degrades to the
+        original child chunk.
+        """
+        if not self._store:
+            self.initialize()
+        if not where:
+            return []
+        try:
+            res = self._store.get(
+                where=where,
+                limit=limit,
+                include=["documents", "metadatas"],
+            )
+        except Exception as exc:
+            log.debug("get_by_metadata failed for %s: %s", where, exc)
+            return []
+        documents = res.get("documents") or []
+        metadatas = res.get("metadatas") or []
+        return [
+            Document(
+                page_content=content,
+                metadata=metadatas[i] if i < len(metadatas) else {},
+            )
+            for i, content in enumerate(documents)
+        ]
+
     def count(self) -> int:
         if not self._store:
             return 0

@@ -1,8 +1,11 @@
 import asyncio
 import hashlib
+import json
 import logging
 import re
+from abc import ABC, abstractmethod
 from collections import OrderedDict
+from dataclasses import dataclass
 
 from config import get_settings
 
@@ -49,12 +52,154 @@ _STOPWORDS = frozenset(
 )
 
 
+# --- Agentic retrieval strategies ------------------------------------------
+#
+# The default retrieval is one passive pass. These strategies turn retrieval
+# into an active step an agent reasons through: reformulating the query (HyDE,
+# multi-query), decomposing it (multi-hop), grading what came back (CRAG,
+# Self-RAG), expanding chunks to their parents, or compressing them. Each is a
+# thin layer over ``RAGPipeline.run_query`` — so it inherits hybrid retrieval,
+# the version/language filter ladder, and metadata ranking for free — plus
+# optional LLM reasoning that always degrades to plain single-hop retrieval when
+# no model is wired or a call fails.
+
+
+@dataclass
+class RetrievalRequest:
+    """The unit every retrieval strategy consumes.
+
+    Carries the formulated query plus the surrounding migration context, so a
+    strategy can reformulate, decompose, or grade before it ever touches the
+    vector store. ``symbols`` still drives the hybrid keyword leg; the source
+    fields let a strategy ground its LLM reasoning in the actual code.
+    """
+
+    query: str
+    target_language: str = ""
+    target_version: str = ""
+    symbols: list[str] | None = None
+    source_language: str = ""
+    source_code: str = ""
+    code_metrics: dict | None = None
+    extra_terms: list[str] | None = None
+
+
+def merge_hits(hitlists: list[list[tuple]], k: int) -> list[tuple]:
+    """Fuse several ``(doc, score)`` lists: dedup by content, keep the best score.
+
+    Used by the multi-pass strategies (multi-query, multi-hop, CRAG) to combine
+    the results of several retrievals into one ranked, deduplicated list. Dedup
+    is by page-content hash — the same identity ``RAGPipeline._rrf_merge`` uses —
+    so a document that surfaces for several sub-queries is counted once, at its
+    highest observed score.
+    """
+    best: dict[str, tuple] = {}
+    for hits in hitlists:
+        for doc, score in hits:
+            key = hashlib.sha256(doc.page_content.encode()).hexdigest()
+            if key not in best or score > best[key][1]:
+                best[key] = (doc, score)
+    return sorted(best.values(), key=lambda pair: pair[1], reverse=True)[:k]
+
+
+class RetrievalStrategy(ABC):
+    """Base for an agentic retrieval strategy.
+
+    A strategy turns a :class:`RetrievalRequest` into ranked ``(doc, score)``
+    hits, reusing the pipeline's ``run_query`` for store access. Its LLM helpers
+    are deliberately failure-tolerant: they return neutral values (empty string,
+    empty dict) when no client is wired or a call raises, so a strategy collapses
+    to plain retrieval rather than breaking the migration — the same contract the
+    RetrieverAgent tool loop already honors.
+    """
+
+    name = "base"
+
+    def __init__(self, pipeline: "RAGPipeline", llm=None) -> None:
+        self.pipeline = pipeline
+        self.llm = llm
+
+    @abstractmethod
+    async def retrieve(self, request: RetrievalRequest) -> list[tuple]:
+        """Return ranked ``(doc, score)`` hits for the request."""
+
+    async def _run_query(self, query: str, request: RetrievalRequest) -> list[tuple]:
+        """One retrieval pass through the shared pipeline core; ``[]`` on failure."""
+        try:
+            return await self.pipeline.run_query(
+                query,
+                request.target_language,
+                request.target_version,
+                request.symbols,
+            )
+        except Exception as exc:  # noqa: BLE001 — retrieval degrades, never breaks
+            log.warning("[%s] run_query failed: %s", self.name, exc)
+            return []
+
+    async def _ask(self, prompt: str, system: str = "", fmt: str | None = None) -> str:
+        """Fast-model LLM call; empty string when unavailable or on error."""
+        call = getattr(self.llm, "call_llm", None)
+        if call is None:
+            return ""
+        try:
+            return (
+                await call(
+                    prompt,
+                    system_prompt=system,
+                    fmt=fmt,
+                    model=getattr(self.llm, "fast_model", None),
+                )
+                or ""
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[%s] LLM call failed: %s", self.name, exc)
+            return ""
+
+    async def _ask_json(self, prompt: str, system: str = "") -> dict:
+        """Fast-model JSON call parsed to a dict; ``{}`` when unavailable/bad."""
+        raw = await self._ask(prompt, system=system, fmt="json")
+        if not raw:
+            return {}
+        extract = getattr(self.llm, "extract_json", None)
+        try:
+            return extract(raw) if extract else json.loads(raw)
+        except Exception:  # noqa: BLE001
+            return {}
+
+    @property
+    def has_llm(self) -> bool:
+        return getattr(self.llm, "call_llm", None) is not None
+
+
+class SingleHopStrategy(RetrievalStrategy):
+    """The default: one retrieval pass, exactly the pre-strategy behavior."""
+
+    name = "single_hop"
+
+    async def retrieve(self, request: RetrievalRequest) -> list[tuple]:
+        return await self._run_query(request.query, request)
+
+
 class RAGPipeline:
-    def __init__(self, vector_store, embedding_service):
+    def __init__(self, vector_store, embedding_service, llm_client=None):
         self._vector_store = vector_store
         self._embeddings = embedding_service
+        # Optional — only the LLM-driven strategies (HyDE, multi-query, CRAG,
+        # Self-RAG, …) use it. Left None (the default, and what every existing
+        # caller/test passes) the pipeline behaves exactly as before: single-hop
+        # retrieval with no LLM reasoning.
+        self._llm = llm_client
         self._query_cache: OrderedDict[str, list] = OrderedDict()
         self._max_cache = 100
+
+    @property
+    def vector_store(self):
+        """The backing store, for strategies that need direct access.
+
+        The Parent Document strategy uses it to pull sibling chunks by
+        ``parent_id``; everything else goes through ``run_query``.
+        """
+        return self._vector_store
 
     def _extract_code_signals(self, source_code: str, max_symbols: int) -> list[str]:
         """Pull the salient, code-specific symbols to seed the retrieval query.
@@ -302,6 +447,116 @@ class RAGPipeline:
             results, key=lambda pair: pair[1] + _boost(pair[0]), reverse=True
         )
 
+    async def run_query(
+        self,
+        query: str,
+        target_language: str = "",
+        target_version: str = "",
+        symbols: list[str] | None = None,
+    ) -> list[tuple]:
+        """Execute one retrieval: phases → ladder → rank → top-k. No caching.
+
+        The shared retrieval core behind ``search``, ``enrich_prompt``, and every
+        strategy. Kept cache-free and exception-raising so callers own their own
+        caching and degradation policy — ``search``/``enrich_prompt`` wrap it in
+        their existing try/except-and-cache, strategies in ``_run_query``.
+        """
+        settings = get_settings()
+        if not settings.enable_rag or not query.strip():
+            return []
+        if symbols is None:
+            symbols = self._extract_code_signals(query, settings.rag_query_max_symbols)
+        # An empty target language would build a `{"language": ""}` phase that
+        # matches nothing, wasting a query before the ladder broadens — so with no
+        # target we go straight to unfiltered (mirrors the old `search`).
+        phases = (
+            self._filter_phases(target_language, target_version, settings)
+            if target_language
+            else [None]
+        )
+        results = await self._retrieve_ladder(query, symbols, phases)
+        return self._rank(results, target_version, settings)[: settings.rag_top_k]
+
+    async def retrieve(
+        self, request: RetrievalRequest, strategy: str | None = None
+    ) -> list[tuple]:
+        """Retrieve for ``request`` using a named strategy (default from settings).
+
+        The single entry point for agentic retrieval: the VectorDBTool routes
+        here by intent, and ``enrich_prompt`` routes here when a non-default
+        ``rag_strategy`` is configured.
+        """
+        name = strategy or getattr(get_settings(), "rag_strategy", "single_hop")
+        return await self._build_strategy(name).retrieve(request)
+
+    def _build_strategy(self, name: str) -> RetrievalStrategy:
+        """Resolve a strategy name to an instance (lazy imports avoid cycles).
+
+        Unknown names fall back to single-hop rather than raising, so a bad
+        config value degrades to the safe default instead of breaking retrieval.
+        """
+        key = (name or "single_hop").lower()
+        if key in ("single_hop", "single", "none", ""):
+            return SingleHopStrategy(self, self._llm)
+        if key == "hyde":
+            from rag.hyde import HyDEStrategy
+
+            return HyDEStrategy(self, self._llm)
+        if key in ("multi_query", "multiquery"):
+            from rag.multi_query import MultiQueryStrategy
+
+            return MultiQueryStrategy(self, self._llm)
+        if key in ("multi_hop", "multihop"):
+            from rag.multi_hop import MultiHopStrategy
+
+            return MultiHopStrategy(self, self._llm)
+        if key in ("contextual_compression", "compression"):
+            from rag.contextual_compression import ContextualCompressionStrategy
+
+            return ContextualCompressionStrategy(self, self._llm)
+        if key in ("parent_document", "parent"):
+            from rag.parent_retriever import ParentDocumentStrategy
+
+            return ParentDocumentStrategy(self, self._llm)
+        if key in ("corrective", "crag"):
+            from rag.corrective_rag import CorrectiveRAGStrategy
+
+            return CorrectiveRAGStrategy(self, self._llm)
+        if key in ("self_rag", "selfrag"):
+            from rag.self_rag import SelfRAGStrategy
+
+            return SelfRAGStrategy(self, self._llm)
+        log.warning("Unknown rag_strategy %r; using single_hop", name)
+        return SingleHopStrategy(self, self._llm)
+
+    @staticmethod
+    def render_reference_context(hits: list[tuple]) -> str:
+        """Render hits as the ``## Reference Examples`` block.
+
+        The single source of truth for reference-context formatting — shared by
+        ``enrich_prompt`` and ``VectorDBTool.format_context``. The MigratorAgent
+        keys off the literal "Reference Examples" heading, so every retrieval path
+        must render identically or downstream would silently drop the context.
+        """
+        settings = get_settings()
+        parts = [
+            "## Reference Examples\nHere are relevant code patterns from the "
+            "target language:\n"
+        ]
+        for doc, score in hits:
+            md = doc.metadata or {}
+            lang = md.get("language", "unknown")
+            version = md.get("version", "")
+            doc_type = md.get("doc_type", "")
+            label_bits = [lang]
+            if version and version != settings.rag_version_wildcard:
+                label_bits.append(version)
+            if doc_type:
+                label_bits.append(doc_type)
+            parts.append(f"### {' · '.join(label_bits)} (relevance: {score:.2f})")
+            parts.append(f"```{lang}\n{doc.page_content}\n```")
+        return "\n\n".join(parts)
+
     async def search(
         self,
         query: str,
@@ -338,16 +593,9 @@ class RAGPipeline:
             return cached
 
         try:
-            # Without a target language the language/version filters would build
-            # a `{"language": ""}` phase that matches nothing, costing a wasted
-            # query before the ladder broadens; go straight to unfiltered.
-            phases = (
-                self._filter_phases(target_language, target_version, settings)
-                if target_language
-                else [None]
+            results = await self.run_query(
+                query, target_language, target_version, symbols
             )
-            results = await self._retrieve_ladder(query, symbols, phases)
-            results = self._rank(results, target_version, settings)[: settings.rag_top_k]
         except Exception as e:
             log.warning("RAG search failed: %s", e)
             return []
@@ -384,49 +632,57 @@ class RAGPipeline:
             source_language, target_language, source_code, symbols
         )
 
-        # Target version steers both the retrieval filter ladder and the ranking
-        # boosts, so it must be part of the cache identity. Re-retrieval terms and
-        # metric constructs are already folded into `query`.
-        cache_key = hashlib.sha256(
-            f"{target_version}\n{query}".encode()
-        ).hexdigest()
-        cached = self._query_cache.get(cache_key)
-        if cached is not None:
-            self._query_cache.move_to_end(cache_key)
-        else:
+        hits: list[tuple] | None = None
+        # Agentic strategies are opt-in and LLM-driven: take that path only when a
+        # non-default strategy is configured AND a client is wired. Any failure or
+        # empty result falls through to the single-hop path below, so enrichment
+        # is never worse than the default one-shot retrieval.
+        strategy_name = getattr(settings, "rag_strategy", "single_hop")
+        if strategy_name and strategy_name != "single_hop" and self._llm is not None:
+            request = RetrievalRequest(
+                query=query,
+                target_language=target_language,
+                target_version=target_version,
+                symbols=symbols,
+                source_language=source_language,
+                source_code=source_code,
+                code_metrics=code_metrics,
+                extra_terms=extra_terms,
+            )
             try:
-                phases = self._filter_phases(
-                    target_language, target_version, settings
+                hits = await self.retrieve(request, strategy=strategy_name)
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "RAG strategy %r failed, using single-hop: %s", strategy_name, e
                 )
-                results = await self._retrieve_ladder(query, symbols, phases)
-                results = self._rank(results, target_version, settings)
-                cached = results[: settings.rag_top_k]
-                self._query_cache[cache_key] = cached
-                if len(self._query_cache) > self._max_cache:
-                    self._query_cache.popitem(last=False)
-            except Exception as e:
-                log.warning("RAG retrieval failed: %s", e)
-                cached = []
+                hits = None
 
-        if not cached:
+        if not hits:
+            # Single-hop path (the default) — cached by version+query identity.
+            # Target version steers both the filter ladder and the ranking boosts,
+            # so it must be part of the cache identity. Re-retrieval terms and
+            # metric constructs are already folded into `query`.
+            cache_key = hashlib.sha256(
+                f"{target_version}\n{query}".encode()
+            ).hexdigest()
+            cached = self._query_cache.get(cache_key)
+            if cached is not None:
+                self._query_cache.move_to_end(cache_key)
+                hits = cached
+            else:
+                try:
+                    hits = await self.run_query(
+                        query, target_language, target_version, symbols
+                    )
+                    self._query_cache[cache_key] = hits
+                    if len(self._query_cache) > self._max_cache:
+                        self._query_cache.popitem(last=False)
+                except Exception as e:
+                    log.warning("RAG retrieval failed: %s", e)
+                    hits = []
+
+        if not hits:
             return base_prompt
 
-        context_parts = ["## Reference Examples\nHere are relevant code patterns from the target language:\n"]
-        for doc, score in cached:
-            md = doc.metadata or {}
-            lang = md.get("language", "unknown")
-            version = md.get("version", "")
-            doc_type = md.get("doc_type", "")
-            # Surface version/authority so the model treats an official
-            # target-version migration guide as stronger than a generic example.
-            label_bits = [lang]
-            if version and version != settings.rag_version_wildcard:
-                label_bits.append(version)
-            if doc_type:
-                label_bits.append(doc_type)
-            label = " · ".join(label_bits)
-            context_parts.append(f"### {label} (relevance: {score:.2f})")
-            context_parts.append(f"```{lang}\n{doc.page_content}\n```")
-
-        context = "\n\n".join(context_parts)
+        context = self.render_reference_context(hits)
         return f"{context}\n\n---\n\n{base_prompt}"

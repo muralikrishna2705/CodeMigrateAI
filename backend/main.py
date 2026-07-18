@@ -107,7 +107,11 @@ async def lifespan(app: FastAPI):
             await ingestion.run(
                 [lang["id"] for lang in settings.supported_languages]
             )
-            app.state.rag_pipeline = RAGPipeline(rag_vector_store, rag_embeddings)
+            # Pass the LLM client so the agentic RAG strategies (HyDE, CRAG,
+            # multi-query, …) can reason; single-hop retrieval never touches it.
+            app.state.rag_pipeline = RAGPipeline(
+                rag_vector_store, rag_embeddings, llm_client
+            )
             # The graph builds a fresh RetrieverAgent per call, so the pipeline is
             # threaded through module state (like the LLM client) rather than an
             # instance — see graph/nodes.set_rag_pipeline. Registering it also

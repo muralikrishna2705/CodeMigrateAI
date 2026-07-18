@@ -13,7 +13,7 @@ on-demand queries are grounded exactly the way the passive ones are.
 """
 
 from agents.tools.base import AgentTool, ToolResult
-from config import get_settings
+from rag.retrieval_pipeline import RAGPipeline, RetrievalRequest
 
 
 class VectorDBTool(AgentTool):
@@ -27,6 +27,20 @@ class VectorDBTool(AgentTool):
         "query": "what to search for, as a specific question or API/symbol name",
         "target_language": "language to restrict results to (optional)",
         "target_version": "language version to prefer (optional)",
+        "intent": (
+            "retrieval style (optional): 'precise' for an exact answer (HyDE), "
+            "'exploratory' to cast wide (multi-query), 'verify' for a plain lookup"
+        ),
+    }
+
+    # Maps the agent's stated intent to the retrieval strategy that serves it:
+    # a precise question benefits from an answer-shaped HyDE query; an open-ended
+    # exploration from multi-query fan-out; a simple existence check from a plain
+    # single pass. Unknown/empty intent → the default single-hop search.
+    _INTENT_STRATEGY = {
+        "precise": "hyde",
+        "exploratory": "multi_query",
+        "verify": "single_hop",
     }
 
     def __init__(self, rag_pipeline, timeout_sec: float | None = None) -> None:
@@ -38,6 +52,7 @@ class VectorDBTool(AgentTool):
         query: str = "",
         target_language: str = "",
         target_version: str = "",
+        intent: str = "",
         **_,
     ) -> ToolResult:
         if not self._rag:
@@ -51,11 +66,7 @@ class VectorDBTool(AgentTool):
                 tool=self.name, success=False, error="query is required"
             )
 
-        hits = await self._rag.search(
-            query=query,
-            target_language=target_language,
-            target_version=target_version,
-        )
+        hits = await self._retrieve(query, target_language, target_version, intent)
         if not hits:
             return ToolResult(
                 tool=self.name,
@@ -85,6 +96,31 @@ class VectorDBTool(AgentTool):
             summary=f"{len(hits)} reference match(es) for {query!r}",
         )
 
+    async def _retrieve(
+        self, query: str, target_language: str, target_version: str, intent: str
+    ) -> list[tuple]:
+        """Route by intent to an agentic strategy, or the default search.
+
+        An intent maps to a strategy (see ``_INTENT_STRATEGY``) and goes through
+        the pipeline's ``retrieve``; without an intent — or against a pipeline
+        that predates strategy support — it falls back to the plain ``search``,
+        which is the historical behaviour. Either way results share the same
+        filter ladder, ranking, and cache.
+        """
+        strategy = self._INTENT_STRATEGY.get(intent.strip().lower()) if intent else None
+        if strategy and hasattr(self._rag, "retrieve"):
+            request = RetrievalRequest(
+                query=query,
+                target_language=target_language,
+                target_version=target_version,
+            )
+            return await self._rag.retrieve(request, strategy=strategy)
+        return await self._rag.search(
+            query=query,
+            target_language=target_language,
+            target_version=target_version,
+        )
+
     @staticmethod
     def format_context(hits: list[tuple]) -> str:
         """Render hits in the same shape ``enrich_prompt`` produces.
@@ -92,23 +128,7 @@ class VectorDBTool(AgentTool):
         The MigratorAgent keys off the literal "Reference Examples" heading (and
         RetrieverAgent checks for it before accepting context), so tool-retrieved
         context must render identically to passively-retrieved context or it
-        would be silently dropped downstream.
+        would be silently dropped downstream. Both now delegate to the single
+        renderer on RAGPipeline so the shape can never drift between paths.
         """
-        settings = get_settings()
-        parts = [
-            "## Reference Examples\nHere are relevant code patterns from the "
-            "target language:\n"
-        ]
-        for doc, score in hits:
-            md = doc.metadata or {}
-            lang = md.get("language", "unknown")
-            version = md.get("version", "")
-            doc_type = md.get("doc_type", "")
-            label_bits = [lang]
-            if version and version != settings.rag_version_wildcard:
-                label_bits.append(version)
-            if doc_type:
-                label_bits.append(doc_type)
-            parts.append(f"### {' · '.join(label_bits)} (relevance: {score:.2f})")
-            parts.append(f"```{lang}\n{doc.page_content}\n```")
-        return "\n\n".join(parts)
+        return RAGPipeline.render_reference_context(hits)
