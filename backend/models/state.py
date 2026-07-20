@@ -67,6 +67,16 @@ class MigrationState(BaseModel):
     reflection_feedback: str = ""
     reflection_recommendation: str = "pass"
 
+    # Persistent memory (Dimension 5): before planning, the pipeline recalls
+    # similar past migrations from the SQLite store (trie candidate filter +
+    # cosine rank) and records them here — each hit carries entry_id, similarity,
+    # score and the prior migrated_code. session_id is also the LangGraph
+    # checkpoint thread_id, so passing a previous run's id resumes that run's
+    # graph state instead of starting fresh. Empty session_id means "new run";
+    # the pipeline generates one.
+    memory_hits: list[dict] = Field(default_factory=list)
+    session_id: str = ""
+
     reports: list[AgentReport] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
     agents_done: list[str] = Field(default_factory=list)

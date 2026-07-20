@@ -4,7 +4,7 @@ import pytest
 
 from agents.tools.semantic_search import SemanticSearchTool
 from models.state import MigrationState
-from rag.migration_memory import MigrationMemory
+from rag.migration_memory import SemanticMigrationMemory
 from runtime.agent_observer import ObserverAgent
 
 
@@ -46,18 +46,18 @@ class _FakeMemory:
         return self.hits
 
 
-class TestMigrationMemoryEntryId:
+class TestSemanticMigrationMemoryEntryId:
     def test_same_migration_yields_the_same_id(self):
         # Stable ids make re-running a migration overwrite its memory rather than
         # accumulate near-duplicate entries that all match the next query.
-        first = MigrationMemory.entry_id("code", "java", "21")
-        second = MigrationMemory.entry_id("code", "java", "21")
+        first = SemanticMigrationMemory.entry_id("code", "java", "21")
+        second = SemanticMigrationMemory.entry_id("code", "java", "21")
         assert first == second
 
     def test_different_target_yields_a_different_id(self):
-        assert MigrationMemory.entry_id("code", "java", "21") != MigrationMemory.entry_id(
-            "code", "java", "17"
-        )
+        assert SemanticMigrationMemory.entry_id(
+            "code", "java", "21"
+        ) != SemanticMigrationMemory.entry_id("code", "java", "17")
 
 
 class TestSemanticSearchTool:

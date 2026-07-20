@@ -27,11 +27,12 @@ from llm.streaming import sse_event_generator
 from models.requests import MigrateRequest, MigrateResponse
 from models.state import MigrationState
 from pipeline.orchestrator import Pipeline
+from memory.migration_memory import build_memory
 from rag import (
     CachedEmbeddings,
     IngestionPipeline,
-    MigrationMemory,
     RAGPipeline,
+    SemanticMigrationMemory,
     VectorStore,
 )
 from runtime.agent_observer import ObserverAgent
@@ -77,7 +78,25 @@ async def lifespan(app: FastAPI):
         log.warning("Ollama is not reachable; check that Ollama is running")
 
     cache_manager = CacheManager()
-    pipeline = Pipeline(llm_client, cache_manager)
+
+    # Persistent memory (Dimension 5). Built before the pipeline and outside the
+    # RAG task on purpose: it is a local SQLite file with no model or network
+    # dependency, so it is ready on the first request rather than whenever
+    # background ingestion finishes. The semantic leg attaches later if it comes
+    # up. build_memory never raises — a bad path yields None and no recall.
+    app.state.persistent_memory = None
+    if settings.memory_enabled:
+        app.state.persistent_memory = build_memory(
+            settings.memory_db_path,
+            min_similarity=settings.memory_min_similarity,
+        )
+        if app.state.persistent_memory is not None:
+            log.info(
+                "Persistent memory ready (%d past migrations)",
+                app.state.persistent_memory.store.count("migrations"),
+            )
+
+    pipeline = Pipeline(llm_client, cache_manager, memory=app.state.persistent_memory)
 
     # RAG pipeline (Phase 2): embed reference docs into the vector store and
     # expose retrieval to the RetrieverAgent. This runs as a BACKGROUND task so
@@ -123,11 +142,16 @@ async def lifespan(app: FastAPI):
             # lives in its own Chroma collection, so past migrations can never
             # outrank official documentation during reference retrieval.
             if settings.enable_migration_memory:
-                memory = MigrationMemory(rag_embeddings)
+                memory = SemanticMigrationMemory(rag_embeddings)
                 memory.initialize()
                 app.state.migration_memory = memory
+                # The SemanticSearchTool talks to the Chroma store directly, so
+                # the graph keeps receiving that object; the SQL facade gets it
+                # as its semantic leg for merged recall.
                 graph_nodes.set_migration_memory(memory)
-                log.info("Migration memory ready (%d entries)", memory.count())
+                if app.state.persistent_memory is not None:
+                    app.state.persistent_memory.attach_semantic(memory)
+                log.info("Semantic migration memory ready (%d entries)", memory.count())
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -150,6 +174,12 @@ async def lifespan(app: FastAPI):
     ingestion = rag_state.get("ingestion")
     if ingestion is not None:
         await ingestion.close()
+    # Release the checkpointer's aiosqlite connection and the memory store's
+    # SQLite handle before the loop goes away.
+    if pipeline is not None:
+        await pipeline.aclose()
+    if app.state.persistent_memory is not None:
+        app.state.persistent_memory.store.close()
     await llm_client.close()
     log.info("Shutdown complete")
 

@@ -40,6 +40,13 @@ class GraphState(TypedDict, total=False):
     # --- Dynamic routing (DispatcherAgent -> dispatch_condition) ---
     route_plan: dict
 
+    # --- Persistent memory (Dimension 5) ---
+    # Seeded by the pipeline from MigrationMemory.recall before the graph runs,
+    # so nodes can ground on prior art without each re-querying the store.
+    # session_id doubles as the checkpoint thread_id.
+    memory_hits: list[dict]
+    session_id: str
+
     # --- Dynamic orchestration (OrchestratorAgent -> orchestrate_condition) ---
     # ``parallel_tasks`` is the sub-task decomposition the orchestrator planned
     # (task names resolved against graph.subgraphs.SUBGRAPH_TASKS); the parallel

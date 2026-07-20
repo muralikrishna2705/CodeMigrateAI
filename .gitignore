@@ -90,6 +90,11 @@ redis_data/
 
 # RAG (Phase 2) — generated artifacts, keep committed built-in examples only
 backend/rag/chroma_db/
+
+# Persistent memory + LangGraph checkpoints (runtime data)
+backend/memory/*.db
+backend/memory/*.db-wal
+backend/memory/*.db-shm
 cicd/chroma_data/
 backend/rag/reference/*/_fetched/
 backend/rag/reference/*/user/

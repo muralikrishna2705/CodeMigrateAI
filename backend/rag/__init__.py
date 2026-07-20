@@ -1,6 +1,6 @@
 from .embedding_service import CachedEmbeddings
 from .ingestion import IngestionPipeline
-from .migration_memory import MigrationMemory
+from .migration_memory import SemanticMigrationMemory
 
 # retrieval_pipeline defines the strategy base + request type the concrete
 # strategies import, so it must load before them.
@@ -21,7 +21,7 @@ __all__ = [
     "VectorStore",
     "CachedEmbeddings",
     "IngestionPipeline",
-    "MigrationMemory",
+    "SemanticMigrationMemory",
     # Agentic retrieval strategies (Dimension 2)
     "HyDEStrategy",
     "MultiQueryStrategy",

@@ -202,6 +202,8 @@ def hydrate_state(state: dict) -> MigrationState:
     mig_state.reflection_score = state.get("reflection_score", 0.0)
     mig_state.reflection_feedback = state.get("reflection_feedback", "")
     mig_state.reflection_recommendation = state.get("reflection_recommendation", "pass")
+    mig_state.memory_hits = list(state.get("memory_hits", []))
+    mig_state.session_id = state.get("session_id", "")
     return mig_state
 
 

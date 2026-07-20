@@ -31,6 +31,7 @@ terminal metrics.
 import logging
 
 from langgraph.graph import END, StateGraph
+from memory import build_checkpointer
 
 from .conditions import (
     migrate_condition,
@@ -58,8 +59,27 @@ from .state import GraphState
 log = logging.getLogger("CodeMigrateAI.MigrationGraph")
 
 
-def build_migration_graph():
-    """Construct and compile the migration workflow graph."""
+def build_migration_graph(checkpointer=None, settings=None):
+    """Construct and compile the migration workflow graph.
+
+    ``checkpointer`` controls graph-state persistence per ``thread_id``:
+
+    ``None`` (default)
+        No checkpointer. A compiled graph that *has* one rejects any invocation
+        without ``config={"configurable": {"thread_id": ...}}``, so making
+        persistence the default would break every direct caller. It also makes
+        thread ids load-bearing: two runs sharing an id resume each other's
+        state rather than starting clean. Opting in keeps that contract with
+        the callers equipped to honour it.
+    ``True``
+        Build one from settings via :func:`memory.build_checkpointer`
+        (AsyncSqliteSaver under a running loop, MemorySaver otherwise).
+    a saver instance
+        Use it as given.
+
+    :class:`pipeline.orchestrator.Pipeline` opts in and supplies each run's
+    session id as the thread id.
+    """
     workflow = StateGraph(GraphState)
 
     # Add nodes
@@ -142,7 +162,13 @@ def build_migration_graph():
     workflow.add_edge("service_validate", "observe")
     workflow.add_edge("observe", END)
 
-    app = workflow.compile()
+    if checkpointer is True:
+        checkpointer = build_checkpointer(settings)
+    app = workflow.compile(checkpointer=checkpointer or None)
     node_count = len(getattr(app, "nodes", {}) or {})
-    log.info("Migration graph compiled with %d nodes", node_count)
+    log.info(
+        "Migration graph compiled with %d nodes (checkpointer: %s)",
+        node_count,
+        type(checkpointer).__name__ if checkpointer else "none",
+    )
     return app

@@ -1,6 +1,17 @@
-"""MigrationMemory — a durable record of past migrations, searchable semantically.
+"""SemanticMigrationMemory — past migrations, searchable by meaning.
 
-This is the store behind ``SemanticSearchTool``. The reference corpus
+This is the *semantic leg* of persistent memory and the store behind
+``SemanticSearchTool``. The structured system of record lives in
+:mod:`memory.memory_store`; :class:`memory.migration_memory.MigrationMemory` is
+the facade that queries both and merges their hits by entry id. The two share
+the ``mem-<sha256>`` id scheme so that merge needs no join table.
+
+Kept separate from the SQL store rather than folded into it because they fail
+differently: this one needs a live embedding service and returns fuzzy matches,
+while SQLite is always available and returns exact ones. Collapsing them would
+make all recall depend on embeddings being up.
+
+The reference corpus
 (``VectorStore``, collection ``codemigrate_ref``) holds *documentation*: how the
 target language works in general. This holds *experience*: what this system
 actually did on a previous migration and whether it validated cleanly. They
@@ -24,7 +35,7 @@ from pathlib import Path
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 
-log = logging.getLogger("CodeMigrateAI.MigrationMemory")
+log = logging.getLogger("CodeMigrateAI.SemanticMigrationMemory")
 
 PERSIST_DIR = Path(__file__).resolve().parent / "chroma_db"
 COLLECTION_NAME = "codemigrate_memory"
@@ -35,7 +46,7 @@ COLLECTION_NAME = "codemigrate_memory"
 _MAX_SNIPPET_CHARS = 1500
 
 
-class MigrationMemory:
+class SemanticMigrationMemory:
     """Semantic store of completed migrations, keyed by the source code's shape."""
 
     def __init__(self, embedding_service):
@@ -97,6 +108,9 @@ class MigrationMemory:
         document = Document(
             page_content=content,
             metadata={
+                # Carried in metadata so a semantic hit can be joined back to its
+                # SQLite row (scores, user feedback) without a second lookup.
+                "entry_id": entry_id,
                 "source_language": source_language,
                 "source_version": source_version,
                 "language": target_language,

@@ -1,7 +1,7 @@
 """SemanticSearchTool — search past migrations across sessions.
 
 Answers "have we migrated code like this before, and what did we do?" against
-:class:`~rag.migration_memory.MigrationMemory`, which persists validated
+:class:`~rag.migration_memory.SemanticMigrationMemory`, which persists validated
 migrations to disk and therefore outlives the process.
 
 Distinct from ``vector_db``: that searches documentation (how the language works),

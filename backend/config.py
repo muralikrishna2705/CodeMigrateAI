@@ -128,6 +128,39 @@ class Settings(BaseSettings):
     # Off by default: the memory collection is empty until migrations have run.
     tool_semantic_search_enabled: bool = False
 
+    # Persistent memory (Dimension 5)
+    #
+    # Two stores, deliberately separate:
+    #
+    #   memory_enabled          -> the SQLite system of record (MemoryStore /
+    #                              MigrationMemory / PatternStore). On by default:
+    #                              it is a local file, needs no network or model,
+    #                              and starts empty, so the worst case is zero
+    #                              recall rather than a failure.
+    #   enable_migration_memory -> the Chroma semantic leg (SemanticMigrationMemory,
+    #                              backs the semantic_search tool). Off by default:
+    #                              it needs a live embedding service.
+    #
+    # With both on, MigrationMemory queries the trie/cosine leg and merges the
+    # semantic hits; with only the first, recall stays fully offline.
+    memory_enabled: bool = True
+    memory_db_path: str = "memory/codemigrate.db"
+    # Minimum lexical cosine for a past migration to count as a hit at all. Below
+    # this the "precedent" is noise, and injecting it costs prompt budget while
+    # grounding the model in unrelated code.
+    memory_min_similarity: float = 0.25
+    # Bloom filter sizing for PatternStore. Saturating past capacity degrades the
+    # false positive rate (never correctness — hits are confirmed against SQLite).
+    pattern_bloom_capacity: int = 10_000
+    pattern_bloom_error_rate: float = 0.01
+
+    # LangGraph checkpointing: persists in-run graph state per thread_id so an
+    # interrupted migration can resume. Uses AsyncSqliteSaver (the sync
+    # SqliteSaver raises on the astream path the pipeline uses) and degrades to
+    # MemorySaver when no event loop is running, e.g. tests.
+    checkpointer_enabled: bool = True
+    checkpoint_db_path: str = "memory/checkpoints.db"
+
     # Cross-session migration memory (backs the semantic_search tool). Recorded
     # by the ObserverAgent for successful, validated migrations only.
     enable_migration_memory: bool = False
