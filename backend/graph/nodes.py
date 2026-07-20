@@ -20,6 +20,7 @@ import agents.critic_agent  # noqa: F401
 import agents.deep_analyzer_agent  # noqa: F401
 import agents.fixer_agent  # noqa: F401
 import agents.migrator_agent  # noqa: F401
+import agents.orchestrator_agent  # noqa: F401
 import agents.planner_agent  # noqa: F401
 import agents.reflector_agent  # noqa: F401
 import agents.retriever_agent  # noqa: F401
@@ -196,6 +197,8 @@ def hydrate_state(state: dict) -> MigrationState:
     mig_state.retrieval_requests = list(state.get("retrieval_requests", []))
     mig_state.reretrieval_count = state.get("reretrieval_count", 0)
     mig_state.route_plan = state.get("route_plan") or {}
+    mig_state.parallel_tasks = list(state.get("parallel_tasks", []))
+    mig_state.subgraph_results = list(state.get("subgraph_results", []))
     mig_state.reflection_score = state.get("reflection_score", 0.0)
     mig_state.reflection_feedback = state.get("reflection_feedback", "")
     mig_state.reflection_recommendation = state.get("reflection_recommendation", "pass")
@@ -216,6 +219,8 @@ def writeback(state: dict, mig_state: MigrationState) -> dict:
     state["retrieval_requests"] = mig_state.retrieval_requests
     state["reretrieval_count"] = mig_state.reretrieval_count
     state["route_plan"] = mig_state.route_plan
+    state["parallel_tasks"] = mig_state.parallel_tasks
+    state["subgraph_results"] = mig_state.subgraph_results
     state["reflection_score"] = mig_state.reflection_score
     state["reflection_feedback"] = mig_state.reflection_feedback
     state["reflection_recommendation"] = mig_state.reflection_recommendation
@@ -253,6 +258,7 @@ def _make_node(agent_name: str):
 
 analyze_node = _make_node("AnalyzerAgent")
 dispatch_node = _make_node("DispatcherAgent")
+orchestrate_node = _make_node("OrchestratorAgent")
 deep_analyze_node = _make_node("DeepAnalyzerAgent")
 plan_node = _make_node("PlannerAgent")
 validate_node = _make_node("ValidatorAgent")
@@ -342,6 +348,43 @@ async def retrieve_node(state: dict) -> dict:
             "Re-retrieval done; reretrieval_count now %d", state["reretrieval_count"]
         )
     return state
+
+
+async def parallel_node(state: dict) -> dict:
+    """Execute the orchestrator's independent sub-tasks concurrently, then merge.
+
+    This is the "execute" half of Plan-and-Execute: it resolves the task names
+    ``OrchestratorAgent`` planned into compiled subgraphs, fans them out over
+    isolated copies of the state (bounded by ``max_parallel_tasks``), and folds
+    the branches back into one state.
+
+    Self-skips unless the orchestrator seeded ``parallel_enabled`` and planned at
+    least two tasks — so a direct-graph run that never seeds it, or a run whose
+    decomposition found no concurrent work, takes the sequential path. It also
+    degrades rather than fails: if every branch errors, ``merge_results`` returns
+    the base state plus the failure records, and the graph continues to planning
+    with whatever context it already had.
+
+    ``subgraphs`` is imported here rather than at module scope because that
+    module imports these node functions — a top-level import would be circular.
+    """
+    from .merge import merge_results
+    from .parallel import run_parallel
+    from .subgraphs import resolve_tasks
+
+    task_names = state.get("parallel_tasks") or []
+    if not state.get("parallel_enabled") or len(task_names) < 2:
+        return state
+
+    tasks = resolve_tasks(task_names)
+    if len(tasks) < 2:
+        log.info("Fewer than 2 resolvable subgraph tasks; staying sequential")
+        return state
+
+    branches = await run_parallel(
+        tasks, state, max_concurrency=state.get("max_parallel_tasks", 4)
+    )
+    return merge_results(state, branches)
 
 
 async def fix_node(state: dict) -> dict:

@@ -34,6 +34,29 @@ def dispatch_condition(state: dict) -> str:
 complexity_condition = dispatch_condition
 
 
+def orchestrate_condition(state: dict) -> str:
+    """Route after orchestrate: parallel fan-out, or the sequential flow.
+
+    The ``orchestrate`` node (OrchestratorAgent) writes ``parallel_tasks`` with
+    the sub-tasks it found safe to run concurrently. Two or more of them — with
+    the fan-out enabled — takes the ``parallel`` branch, where one node runs the
+    corresponding subgraphs and merges them.
+
+    Everything else falls through to the original sequential path, and reuses
+    ``dispatch_condition`` to pick between deep analysis and straight retrieval,
+    so the two routers can't drift apart: the sequential branch a run takes is
+    decided by exactly the code that decided it before orchestration existed.
+    """
+    tasks = state.get("parallel_tasks") or []
+    if state.get("parallel_enabled") and len(tasks) > 1:
+        log.info("Orchestrator planned %d parallel task(s) -> parallel", len(tasks))
+        return "parallel"
+
+    route = dispatch_condition(state)
+    log.info("No parallel work planned -> sequential (%s)", route)
+    return route
+
+
 def migrate_condition(state: dict) -> str:
     """Route: MigratorAgent produced code -> validate, produced nothing -> end.
 

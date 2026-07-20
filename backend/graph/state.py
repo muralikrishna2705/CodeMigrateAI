@@ -40,6 +40,15 @@ class GraphState(TypedDict, total=False):
     # --- Dynamic routing (DispatcherAgent -> dispatch_condition) ---
     route_plan: dict
 
+    # --- Dynamic orchestration (OrchestratorAgent -> orchestrate_condition) ---
+    # ``parallel_tasks`` is the sub-task decomposition the orchestrator planned
+    # (task names resolved against graph.subgraphs.SUBGRAPH_TASKS); the parallel
+    # node fans those out and appends one record per branch to
+    # ``subgraph_results`` — {task, ok, agents, error} — which the merge node and
+    # the final report read. Both stay empty on the sequential path.
+    parallel_tasks: list[str]
+    subgraph_results: list[dict]
+
     # --- Agent reflection (ReflectorAgent -> reflect_condition) ---
     reflection_score: float
     reflection_feedback: str
@@ -58,3 +67,7 @@ class GraphState(TypedDict, total=False):
     # Seeded from settings by the orchestrator; gates the post-migration
     # service-validation node so offline runs never touch the validator service.
     enable_validation: bool
+    # Seeded from settings by the orchestrator; gates the parallel fan-out so a
+    # direct-graph run that never seeds it takes the sequential path.
+    parallel_enabled: bool
+    max_parallel_tasks: int

@@ -49,6 +49,13 @@ class MigrationState(BaseModel):
     # consult it instead of recomputing the branch from complexity.
     route_plan: dict = Field(default_factory=dict)
 
+    # Dynamic orchestration (Dimension 4): the OrchestratorAgent decomposes the
+    # migration into sub-tasks and writes the independent ones here; the graph's
+    # parallel node fans them out over compiled subgraphs and records one result
+    # per branch. Both stay empty when the run takes the sequential path.
+    parallel_tasks: list[str] = Field(default_factory=list)
+    subgraph_results: list[dict] = Field(default_factory=list)
+
     # Agent reflection (Dimension 3): the ReflectorAgent (the graph `reflect` node)
     # writes its self-critique here. reflection_score is the model's 0.0-1.0
     # confidence in the current output; reflection_feedback is the actionable

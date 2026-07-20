@@ -105,6 +105,14 @@ class Pipeline:
             "reretrieval_count": 0,
             "max_reretrievals": self.settings.max_reretrievals,
             "route_plan": dict(state.route_plan),
+            # Dynamic orchestration (Dimension 4): seeded from settings so the
+            # parallel node self-skips unless enabled. The OrchestratorAgent
+            # fills parallel_tasks in-graph; subgraph_results accumulates one
+            # record per fanned-out branch.
+            "parallel_tasks": list(state.parallel_tasks),
+            "subgraph_results": list(state.subgraph_results),
+            "parallel_enabled": self.settings.parallel_enabled,
+            "max_parallel_tasks": self.settings.max_parallel_tasks,
             # Reflection (Dimension 3): seeded from settings so the reflect node
             # self-skips unless enabled, bounded by max_reflections like the fix loop.
             "reflection_score": 0.0,

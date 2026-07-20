@@ -4,6 +4,7 @@ from .critic_agent import CriticAgent
 from .deep_analyzer_agent import DeepAnalyzerAgent
 from .fixer_agent import FixerAgent
 from .migrator_agent import MigratorAgent
+from .orchestrator_agent import OrchestratorAgent
 from .planner_agent import PlannerAgent
 from .reflector_agent import ReflectorAgent
 from .retriever_agent import RetrieverAgent
@@ -29,6 +30,7 @@ __all__ = [
     "DeepAnalyzerAgent",
     "FixerAgent",
     "MigratorAgent",
+    "OrchestratorAgent",
     "PlannerAgent",
     "ReflectorAgent",
     "RetrieverAgent",

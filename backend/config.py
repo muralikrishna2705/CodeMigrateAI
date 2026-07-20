@@ -63,6 +63,27 @@ class Settings(BaseSettings):
     # migration needs deep analysis (falling back to the complexity rule on any
     # failure). Off by default so routing stays deterministic and offline-safe.
     dispatcher_llm_routing: bool = False
+    # Dynamic orchestration (Dimension 4)
+    #
+    # The OrchestratorAgent decomposes a migration into sub-tasks and the
+    # `parallel` node fans the independent ones out concurrently (deep analysis
+    # and RAG retrieval both depend only on AnalyzerAgent's metrics, never on
+    # each other), then a merge node folds the branches back into one state.
+    # On by default because the decomposition is rule-based and deterministic:
+    # the orchestrator only plans a parallel batch when it finds >= 2 genuinely
+    # independent tasks, and anything else routes down the untouched sequential
+    # path. Set False to force the original linear flow.
+    parallel_enabled: bool = True
+    # Concurrency ceiling for the fan-out. Each parallel branch is a subgraph
+    # invocation that can make LLM calls, so this bounds simultaneous load on
+    # the Ollama endpoint rather than just CPU.
+    max_parallel_tasks: int = 4
+    # When on, the OrchestratorAgent asks the fast model to decompose the
+    # migration instead of applying its rules (falling back to the rules on any
+    # failure), mirroring dispatcher_llm_routing. Off by default so the
+    # decomposition stays deterministic and offline-safe.
+    orchestrator_llm_planning: bool = False
+
     # Adaptive RAG: when the MigratorAgent emits at least this many ungrounded
     # imports, it enqueues them as targeted retrieval queries and the graph loops
     # migrate -> retrieve -> plan -> migrate, bounded by max_reretrievals (kept

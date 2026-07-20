@@ -2,21 +2,30 @@
 
 Flow::
 
-    analyze ─▶ dispatch ─(deep?)─▶ deep_analyze ─▶ retrieve ─▶ plan ─▶ migrate ─▶ reflect ─▶ validate
-                  └─────(no)──────────────────▶ retrieve              ▲            │            │
-                                     fix ◀───────────────────────────(fail)────────┼────────────┘
+    analyze ─▶ dispatch ─▶ orchestrate ─(parallel)─▶ parallel ─▶ plan ─▶ migrate ─▶ reflect ─▶ validate
+                              │                    [analysis ‖         ▲            │            │
+                              │                     retrieval]         │            │            │
+                              ├──(deep)──▶ deep_analyze ─▶ retrieve ───┤            │            │
+                              └──(no)─────────────────────▶ retrieve ──┘            │            │
+                                     fix ◀───────────────────────────(fail)─────────┼────────────┘
                                       └──▶ migrate                                  │
                                             ▲──────(re-generate, low confidence)────┘
                                                                                           (pass/done)
                                                                                                ▼
                                      END ◀── observe ◀── service_validate ◀────────────────────┘
 
-``dispatch`` (DispatcherAgent) writes a route plan the branch consults; ``retrieve``
-(RetrieverAgent) provisions RAG context; ``reflect`` (ReflectorAgent) self-critiques
-the migrated code and routes low-confidence output back to ``migrate`` with feedback
-(bounded by max_reflections); ``service_validate`` (RuntimeValidatorAgent) runs the
-optional external validator once the offline validate/fix loop settles; ``observe``
-records terminal metrics.
+``dispatch`` (DispatcherAgent) writes a route plan; ``orchestrate``
+(OrchestratorAgent) decomposes the migration into sub-tasks and marks the
+independent ones. When it finds concurrent work, ``parallel`` runs those as
+compiled subgraphs over isolated state copies and merges the branches (fan-out /
+fan-in); otherwise the run takes the original sequential path, routed by the same
+``dispatch_condition`` as before. Both paths converge on ``plan``.
+
+``reflect`` (ReflectorAgent) self-critiques the migrated code and routes
+low-confidence output back to ``migrate`` with feedback (bounded by
+max_reflections); ``service_validate`` (RuntimeValidatorAgent) runs the optional
+external validator once the offline validate/fix loop settles; ``observe`` records
+terminal metrics.
 """
 
 import logging
@@ -24,8 +33,8 @@ import logging
 from langgraph.graph import END, StateGraph
 
 from .conditions import (
-    dispatch_condition,
     migrate_condition,
+    orchestrate_condition,
     reflect_condition,
     validate_condition,
 )
@@ -36,6 +45,8 @@ from .nodes import (
     fix_node,
     migrate_node,
     observe_node,
+    orchestrate_node,
+    parallel_node,
     plan_node,
     reflect_node,
     retrieve_node,
@@ -54,6 +65,8 @@ def build_migration_graph():
     # Add nodes
     workflow.add_node("analyze", analyze_node)
     workflow.add_node("dispatch", dispatch_node)
+    workflow.add_node("orchestrate", orchestrate_node)
+    workflow.add_node("parallel", parallel_node)
     workflow.add_node("deep_analyze", deep_analyze_node)
     workflow.add_node("retrieve", retrieve_node)
     workflow.add_node("plan", plan_node)
@@ -67,15 +80,28 @@ def build_migration_graph():
     # Set entry point
     workflow.set_entry_point("analyze")
 
-    # Analysis -> the DispatcherAgent, which writes the route plan the branch below
-    # consults (deep analysis for complex code, otherwise straight to retrieval).
-    # Both paths converge on retrieve, which provisions RAG context before planning.
+    # Analysis -> the DispatcherAgent (writes the route plan) -> the
+    # OrchestratorAgent (decomposes the work into sub-tasks). The branch below
+    # consults that decomposition: independent sub-tasks go to the `parallel`
+    # fan-out node, and anything else falls back to the original sequential path
+    # (deep analysis for complex code, otherwise straight to retrieval).
+    #
+    # All three paths converge on `plan`, so the pre-planning phase is the only
+    # thing orchestration reshapes — planning onward is untouched, including the
+    # migrate -> retrieve re-retrieval loop, which still re-enters `retrieve`
+    # directly rather than re-running a whole fan-out for one targeted query.
     workflow.add_edge("analyze", "dispatch")
+    workflow.add_edge("dispatch", "orchestrate")
     workflow.add_conditional_edges(
-        "dispatch",
-        dispatch_condition,
-        {"deep_analyze": "deep_analyze", "retrieve": "retrieve"},
+        "orchestrate",
+        orchestrate_condition,
+        {
+            "parallel": "parallel",
+            "deep_analyze": "deep_analyze",
+            "retrieve": "retrieve",
+        },
     )
+    workflow.add_edge("parallel", "plan")
     workflow.add_edge("deep_analyze", "retrieve")
     workflow.add_edge("retrieve", "plan")
     workflow.add_edge("plan", "migrate")
