@@ -5,114 +5,84 @@ export default function AgentLog({ reports = [], compact = false }) {
 
   if (!reports.length) return null;
 
-  // ── Compact mode: just colored dots in the tab bar ─────────────────────────
+  // ── Compact: status dots in the view bar ───────────────────────────────────
   if (compact) {
     return (
-      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-        {reports.map((r, i) => (
-          <span
-            key={i}
-            title={`${r.agent}: ${r.summary}`}
-            style={{
-              width: 8, height: 8, borderRadius: "50%",
-              background: r.status === "success" ? "var(--green)" : "var(--red)",
-              boxShadow: r.status === "success"
-                ? "0 0 5px var(--green)" : "0 0 5px var(--red)",
-            }}
-          />
-        ))}
+      <div className="agent-dots">
+        {reports.map((r, i) => {
+          const ok = r.status === "success";
+          return (
+            <span
+              key={i}
+              className="dot"
+              title={`${r.agent}: ${r.summary}`}
+              style={{
+                background: ok ? "var(--success)" : "var(--danger)",
+                boxShadow: `0 0 6px ${ok ? "var(--success)" : "var(--danger)"}`,
+              }}
+            />
+          );
+        })}
       </div>
     );
   }
 
-  // ── Full mode: expandable cards ────────────────────────────────────────────
+  // ── Full: expandable cards ─────────────────────────────────────────────────
   return (
-    <div style={st.log}>
-      {reports.map((report, i) => (
-        <div key={i} style={{
-          ...st.card,
-          borderLeft: `3px solid ${report.status === "success" ? "var(--green)" : "var(--red)"}`,
-        }}>
-          {/* Card header — clickable to expand */}
-          <div style={st.cardHead} onClick={() => setExpanded(expanded === i ? null : i)}>
-            <span style={{
-              fontSize: 11, fontWeight: 700,
-              color: report.status === "success" ? "var(--green)" : "var(--red)",
-            }}>
-              {report.status === "success" ? "✓" : "✗"}
-            </span>
-            <span style={st.agentName}>{report.agent}</span>
-            <span style={st.chev}>{expanded === i ? "▲" : "▼"}</span>
+    <div className="pipeline-list">
+      {reports.map((report, i) => {
+        const ok = report.status === "success";
+        const open = expanded === i;
+        const hasDetail = Boolean(report.details && Object.keys(report.details).length);
+
+        return (
+          <div key={i} className={"agent-card" + (ok ? "" : " agent-card--fail")}>
+            <button
+              className="agent-head"
+              onClick={() => setExpanded(open ? null : i)}
+              aria-expanded={open}
+              disabled={!hasDetail}
+            >
+              <span className="agent-glyph" aria-hidden="true">{ok ? "✓" : "✗"}</span>
+              <span className="agent-name">{report.agent}</span>
+              {hasDetail && (
+                <span className={"agent-chev" + (open ? " agent-chev--open" : "")} aria-hidden="true">▾</span>
+              )}
+            </button>
+
+            <p className="agent-summary">{report.summary}</p>
+
+            {open && hasDetail && (
+              <div className="agent-detail">
+                <dl>
+                  {Object.entries(report.details)
+                    .filter(([, v]) => v != null && typeof v !== "object")
+                    .slice(0, 8)
+                    .map(([k, v]) => (
+                      <div className="kv" key={k}>
+                        <dt>{k.replace(/_/g, " ")}</dt>
+                        <dd>{String(v)}</dd>
+                      </div>
+                    ))}
+                </dl>
+
+                {Object.entries(report.details)
+                  .filter(([, v]) => Array.isArray(v) && v.length > 0)
+                  .map(([k, v]) => (
+                    <div className="kv-list" key={k}>
+                      <span>{k.replace(/_/g, " ")}</span>
+                      <ul>
+                        {v.slice(0, 5).map((item, j) => (
+                          <li key={j}>{String(item)}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  ))}
+              </div>
+            )}
           </div>
-
-          {/* Summary */}
-          <div style={st.summary}>{report.summary}</div>
-
-          {/* Expandable detail */}
-          {expanded === i && report.details && (
-            <div style={st.detail}>
-              {/* Scalar key-value pairs */}
-              {Object.entries(report.details)
-                .filter(([, v]) => !Array.isArray(v) && v != null && typeof v !== "object")
-                .slice(0, 8)
-                .map(([k, v]) => (
-                  <div key={k} style={st.kv}>
-                    <span style={st.k}>{k.replace(/_/g, " ")}</span>
-                    <span style={st.v}>{String(v)}</span>
-                  </div>
-                ))}
-              {/* Array fields */}
-              {Object.entries(report.details)
-                .filter(([, v]) => Array.isArray(v) && v.length > 0)
-                .map(([k, v]) => (
-                  <div key={k} style={st.kvList}>
-                    <span style={st.k}>{k.replace(/_/g, " ")}:</span>
-                    <ul style={st.ul}>
-                      {v.slice(0, 5).map((item, j) => (
-                        <li key={j} style={st.li}>{String(item)}</li>
-                      ))}
-                    </ul>
-                  </div>
-                ))}
-            </div>
-          )}
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
-
-const st = {
-  log:      { display: "flex", flexDirection: "column", gap: 5 },
-  card: {
-    background: "var(--bg-raised)", borderRadius: "var(--radius)",
-    border: "1px solid var(--border)", overflow: "hidden",
-    fontSize: 11,
-  },
-  cardHead: {
-    display: "flex", alignItems: "center", gap: 7,
-    padding: "7px 10px", cursor: "pointer", userSelect: "none",
-  },
-  agentName: {
-    flex: 1, fontFamily: "var(--font-code)",
-    fontSize: 10, fontWeight: 600, color: "var(--text-normal)",
-  },
-  chev: { color: "var(--text-dim)", fontSize: 9 },
-  summary: {
-    padding: "0 10px 7px", color: "var(--text-muted)",
-    fontSize: 10, lineHeight: 1.5,
-  },
-  detail: {
-    padding: "8px 10px", background: "var(--bg-root)",
-    borderTop: "1px solid var(--border)",
-  },
-  kv: { display: "flex", justifyContent: "space-between", gap: 6, padding: "2px 0" },
-  k:  { color: "var(--text-dim)", textTransform: "capitalize", fontSize: 10 },
-  v:  {
-    color: "var(--text-normal)", fontFamily: "var(--font-code)",
-    fontSize: 10, textAlign: "right",
-  },
-  kvList: { marginTop: 5, fontSize: 10 },
-  ul:  { paddingLeft: 13, marginTop: 2 },
-  li:  { color: "var(--text-muted)", marginBottom: 2, lineHeight: 1.4 },
-};

@@ -128,6 +128,12 @@ class DataFetcher(object):
   },
 };
 
+const VIEWS = [
+  { id: "source", label: "Source" },
+  { id: "split",  label: "Split"  },
+  { id: "output", label: "Output" },
+];
+
 export default function App() {
   // ── State ──────────────────────────────────────────────────────────────────
   const [sourceCode, setSourceCode]   = useState(EXAMPLES["Java 7 → Java 17"].code);
@@ -138,7 +144,10 @@ export default function App() {
 
   const [ollamaStatus, setOllamaStatus] = useState("checking");  // checking | ok | down
   const [ollamaModel,  setOllamaModel]  = useState("");          // configured LLM model
-  const [activePanel, setActivePanel] = useState("editor");      // editor | output
+
+  // Comparing input against output is the core task here, so both panes are
+  // visible by default rather than hidden behind tabs.
+  const [viewMode, setViewMode] = useState("split");
 
   const healthTimer = useRef(null);
 
@@ -178,38 +187,55 @@ export default function App() {
     setSourceCode(ex.code);
     setSrcLang(ex.sl); setSrcVer(ex.sv);
     setTgtLang(ex.tl); setTgtVer(ex.tv);
-    setActivePanel("editor");
+    setViewMode(v => (v === "output" ? "split" : v));
   }, []);
 
   // ── Run migration wrapper ──────────────────────────────────────────────────
   const handleRunMigration = useCallback(() => {
+    if (loading) return;
     if (!sourceCode.trim()) {
       setError("Please enter some source code before running a migration.");
-      setActivePanel("output");
       return;
     }
     setError(null);
-    setActivePanel("output");
+    setViewMode(v => (v === "source" ? "split" : v));
     runMigration({
       source_code: sourceCode,
       source_language: srcLang,
       source_version: srcVer,
       target_language: tgtLang,
       target_version: tgtVer,
-    });
-  }, [sourceCode, srcLang, srcVer, tgtLang, tgtVer, runMigration, setError]);
+    }).catch(() => { /* surfaced through `error` */ });
+  }, [loading, sourceCode, srcLang, srcVer, tgtLang, tgtVer, runMigration, setError]);
+
+  // ── Keyboard: run / cancel ─────────────────────────────────────────────────
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+        e.preventDefault();
+        if (ollamaStatus === "ok") handleRunMigration();
+      } else if (e.key === "Escape" && loading) {
+        e.preventDefault();
+        cancel();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [handleRunMigration, loading, cancel, ollamaStatus]);
+
+  const hasOutput = Boolean(result || streamBuffer || loading);
 
   // ── Render ─────────────────────────────────────────────────────────────────
   return (
-    <div style={styles.shell}>
+    <div className="shell">
       <Header
         ollamaStatus={ollamaStatus}
+        ollamaModel={ollamaModel}
         examples={Object.keys(EXAMPLES)}
         onLoadExample={loadExample}
       />
 
-      <div style={styles.body}>
-        {/* ── LEFT SIDEBAR ── */}
+      <div className="shell-body">
         <Sidebar
           srcLang={srcLang} setSrcLang={setSrcLang}
           srcVer={srcVer}   setSrcVer={setSrcVer}
@@ -222,49 +248,43 @@ export default function App() {
           result={result}
           agentProgress={agentProgress}
           onRun={handleRunMigration}
+          onCancel={cancel}
         />
 
-        {/* ── MAIN PANELS ── */}
-        <div style={styles.panels}>
-          {/* Tab bar */}
-          <div style={styles.tabBar}>
-            <button
-              style={{...styles.tab, ...(activePanel === "editor" ? styles.tabActive : {})}}
-              onClick={() => setActivePanel("editor")}
-            >
-              Source Code
-            </button>
-            <button
-              style={{
-                ...styles.tab,
-                ...(activePanel === "output" ? styles.tabActive : {}),
-                ...(result ? styles.tabHasResult : {}),
-                opacity: (!result && !loading) ? 0.35 : 1,
-              }}
-              onClick={() => setActivePanel("output")}
-              disabled={!result && !loading}
-            >
-              Migrated Code {result?.success && "✓"}
-            </button>
+        <main className="workspace">
+          <div className="viewbar">
+            <div className="segmented" role="tablist" aria-label="Workspace layout">
+              {VIEWS.map(v => (
+                <button
+                  key={v.id}
+                  role="tab"
+                  aria-selected={viewMode === v.id}
+                  className="seg"
+                  onClick={() => setViewMode(v.id)}
+                  disabled={v.id === "output" && !hasOutput}
+                >
+                  {v.label}
+                  {v.id === "output" && result?.success && (
+                    <span className="dot" style={{ background: "var(--success)" }} />
+                  )}
+                </button>
+              ))}
+            </div>
 
-            {/* Agent log inline tab */}
-            {(result || agentProgress.length > 0) && (
-              <div style={styles.agentTabArea}>
-                <AgentLog reports={result?.reports || []} compact />
-              </div>
-            )}
+            <div className="viewbar-spacer" />
+            <AgentLog reports={result?.reports || []} compact />
           </div>
 
-          {/* Panel content */}
-          <div style={styles.panelBody}>
-            {activePanel === "editor" ? (
+          <div className={`panes panes--${viewMode}`}>
+            {viewMode !== "output" && (
               <Editor
                 code={sourceCode}
                 onChange={setSourceCode}
                 language={srcLang}
                 version={srcVer}
               />
-            ) : (
+            )}
+            {viewMode !== "source" && (
               <Output
                 result={result}
                 streamBuffer={streamBuffer}
@@ -275,55 +295,8 @@ export default function App() {
               />
             )}
           </div>
-        </div>
+        </main>
       </div>
     </div>
   );
 }
-
-// ── Inline layout styles (no external CSS framework dependency) ────────────────
-const styles = {
-  shell: {
-    display: "flex", flexDirection: "column",
-    height: "100vh", overflow: "hidden",
-    background: "var(--bg-root)",
-  },
-  body: {
-    display: "flex", flex: 1, overflow: "hidden",
-  },
-  panels: {
-    display: "flex", flexDirection: "column",
-    flex: 1, overflow: "hidden",
-  },
-  tabBar: {
-    display: "flex", alignItems: "center",
-    background: "var(--bg-base)",
-    borderBottom: "1px solid var(--border)",
-    padding: "0 16px",
-    gap: 4,
-    minHeight: 44,
-    flexShrink: 0,
-  },
-  tab: {
-    padding: "0 18px", height: 44,
-    background: "none", border: "none",
-    borderBottom: "2px solid transparent",
-    color: "var(--text-muted)", fontSize: 13,
-    fontFamily: "var(--font-ui)", fontWeight: 500,
-    cursor: "pointer", transition: "all .15s",
-    marginBottom: -1,
-  },
-  tabActive: {
-    color: "var(--accent)",
-    borderBottomColor: "var(--accent)",
-  },
-  tabHasResult: {
-    color: "var(--text-normal)",
-  },
-  agentTabArea: {
-    marginLeft: "auto",
-  },
-  panelBody: {
-    flex: 1, display: "flex", overflow: "hidden",
-  },
-};

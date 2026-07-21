@@ -12,10 +12,14 @@ const LANGUAGES = [
   { id: "cpp",        name: "C++",        versions: ["14","17","20","23"] },
 ];
 
+const IS_MAC = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform || "");
+const RUN_KEY = IS_MAC ? "⌘ ↵" : "Ctrl ↵";
+
 export default function Sidebar({
   srcLang, setSrcLang, srcVer, setSrcVer,
   tgtLang, setTgtLang, tgtVer, setTgtVer,
-  loading, ollamaStatus, ollamaModel, apiError, result, agentProgress, onRun,
+  loading, ollamaStatus, ollamaModel, apiError, result, agentProgress,
+  onRun, onCancel,
 }) {
   const srcDef = LANGUAGES.find(l => l.id === srcLang) || LANGUAGES[0];
   const tgtDef = LANGUAGES.find(l => l.id === tgtLang) || LANGUAGES[0];
@@ -30,106 +34,136 @@ export default function Sidebar({
     setTgtVer(vs[vs.length - 1] || "");
   };
 
-  const isConversion  = srcLang !== tgtLang;
-  const canRun        = ollamaStatus === "ok" && !loading;
+  // Reversing the route is a one-click operation in a migration tool.
+  const swap = () => {
+    setSrcLang(tgtLang); setSrcVer(tgtVer);
+    setTgtLang(srcLang); setTgtVer(srcVer);
+  };
+
+  const isConversion = srcLang !== tgtLang;
+  const canRun       = ollamaStatus === "ok" && !loading;
 
   const srcVerIndex = srcDef.versions.indexOf(srcVer);
   const tgtVerIndex = tgtDef.versions.indexOf(tgtVer);
   const isDowngrade = !isConversion && srcVerIndex >= 0 && tgtVerIndex >= 0 && tgtVerIndex < srcVerIndex;
 
   return (
-    <aside style={st.aside}>
+    <aside className="sidebar">
+      <span className={"tag " + (isConversion ? "tag--violet" : "tag--info")} style={{ alignSelf: "flex-start" }}>
+        {isConversion ? "⇄ Language Conversion" : "↑ Version Upgrade"}
+      </span>
 
-      {/* ── Migration type badge ── */}
-      <div style={st.badgeWrap}>
-        <span style={{ ...st.badge, ...(isConversion ? st.badgeConvert : st.badgeUpgrade) }}>
-          {isConversion ? "⇄ Language Conversion" : "↑ Version Upgrade"}
-        </span>
+      {/* ── Route: source → target ── */}
+      <div className="route">
+        <div className="route-card">
+          <span className="label" id="src-label">From</span>
+          <div className="route-selects">
+            <select
+              className="select select--lang" value={srcLang}
+              onChange={e => handleSrcLang(e.target.value)}
+              aria-label="Source language"
+            >
+              {LANGUAGES.map(l => <option key={l.id} value={l.id}>{l.name}</option>)}
+            </select>
+            <select
+              className="select select--ver" value={srcVer}
+              onChange={e => setSrcVer(e.target.value)}
+              aria-label="Source version"
+            >
+              {srcDef.versions.map(v => <option key={v} value={v}>{v}</option>)}
+            </select>
+          </div>
+        </div>
+
+        <div className="route-link">
+          <button className="btn btn--icon" onClick={swap} title="Swap source and target" aria-label="Swap source and target">
+            ⇅
+          </button>
+        </div>
+
+        <div className="route-card">
+          <span className="label">To</span>
+          <div className="route-selects">
+            <select
+              className="select select--lang" value={tgtLang}
+              onChange={e => handleTgtLang(e.target.value)}
+              aria-label="Target language"
+            >
+              {LANGUAGES.map(l => <option key={l.id} value={l.id}>{l.name}</option>)}
+            </select>
+            <select
+              className="select select--ver" value={tgtVer}
+              onChange={e => setTgtVer(e.target.value)}
+              aria-label="Target version"
+            >
+              {tgtDef.versions.map(v => <option key={v} value={v}>{v}</option>)}
+            </select>
+          </div>
+        </div>
       </div>
 
-      {/* ── Source ── */}
-      <SectionLabel text="Source" />
-      <SelectRow
-        label="Language"
-        value={srcLang}
-        onChange={handleSrcLang}
-        options={LANGUAGES.map(l => ({ value: l.id, label: l.name }))}
-      />
-      <SelectRow
-        label="Version"
-        value={srcVer}
-        onChange={setSrcVer}
-        options={srcDef.versions.map(v => ({ value: v, label: v }))}
-      />
+      {/* ── Run / Cancel ── */}
+      <div className="stack">
+        {loading ? (
+          <>
+            <button className="btn btn--primary" disabled aria-busy="true">
+              <Spinner /> Migrating…
+            </button>
+            <button className="btn btn--stop" onClick={onCancel}>Cancel</button>
+            <p className="run-hint">or press <kbd>Esc</kbd></p>
+          </>
+        ) : (
+          <>
+            <button className="btn btn--primary" onClick={onRun} disabled={!canRun}>
+              Run Migration <kbd>{RUN_KEY}</kbd>
+            </button>
+            {!canRun && <p className="run-hint">Waiting for the LLM backend</p>}
+          </>
+        )}
+      </div>
 
-      <div style={st.arrow}>↓</div>
-
-      {/* ── Target ── */}
-      <SectionLabel text="Target" />
-      <SelectRow
-        label="Language"
-        value={tgtLang}
-        onChange={handleTgtLang}
-        options={LANGUAGES.map(l => ({ value: l.id, label: l.name }))}
-      />
-      <SelectRow
-        label="Version"
-        value={tgtVer}
-        onChange={setTgtVer}
-        options={tgtDef.versions.map(v => ({ value: v, label: v }))}
-      />
-
-      {/* ── Run button ── */}
-      <button
-        style={{ ...st.runBtn, ...(canRun ? {} : st.runBtnDisabled) }}
-        onClick={onRun}
-        disabled={!canRun}
-      >
-        {loading
-          ? <><Spinner /> Migrating…</>
-          : <>Run Migration</>
-        }
-      </button>
-
-      {/* ── Warnings / Errors ── */}
+      {/* ── Alerts ── */}
       {ollamaStatus === "down" && !loading && (
-        <div style={st.warnBox}>
-          ⚠ Backend or Ollama unreachable. Make sure Ollama is running:<br />
-          <code style={st.code}>ollama serve</code><br />
-          Model <code style={st.code}>{ollamaModel || "the configured LLM"}</code>{" "}
-          is pulled automatically when the backend starts.
-        </div>
-      )}
-      {apiError && (
-        <div style={st.errBox}>⚠ {apiError}</div>
-      )}
-      {isDowngrade && (
-        <div style={st.downgradeBox}>
-          ⚠ Downgrading from {srcLang} {srcVer} to {tgtLang} {tgtVer} may introduce
-          breaking changes. Ensure backward compatibility.
+        <div className="alert alert--warn" role="status">
+          Backend or Ollama unreachable. Start it with:<br />
+          <code>ollama serve</code><br />
+          <code>{ollamaModel || "the configured model"}</code> is pulled automatically
+          when the backend starts.
         </div>
       )}
 
-      {/* ── Agent pipeline log ── */}
+      {apiError && (
+        <div className="alert alert--danger" role="alert">{apiError}</div>
+      )}
+
+      {isDowngrade && (
+        <div className="alert alert--warn" role="status">
+          Downgrading {srcDef.name} {srcVer} → {tgtVer} may introduce breaking
+          changes. Check backward compatibility.
+        </div>
+      )}
+
+      {/* ── Agent pipeline ── */}
       {(result || agentProgress.length > 0) && (
-        <div style={st.logWrap}>
-          <SectionLabel text="Agent Pipeline" />
-          {agentProgress.length > 0 && !result ? (
-            <div style={st.streamingProgress}>
-              {agentProgress.map((a, i) => (
-                <div key={i} style={st.agentProgressItem}>
-                  <span style={{
-                    ...st.agentStatusDot,
-                    background: a.status === "complete" ? "var(--green)" : "var(--accent)",
-                  }} />
-                  <span style={{ fontSize: 11, color: "var(--text-normal)" }}>
-                    {a.agent} {a.status === "complete" ? "✓" : "⟳"}
-                  </span>
-                </div>
-              ))}
-            </div>
-          ) : (
+        <div className="pipeline">
+          <span className="label">Agent Pipeline</span>
+          {result ? (
             <AgentLog reports={result.reports} />
+          ) : (
+            <div className="live-list">
+              {agentProgress.map((a, i) => {
+                const done = a.status === "complete";
+                return (
+                  <div key={i} className={"live-item" + (done ? " live-item--done" : "")}>
+                    <span
+                      className={"dot" + (done ? "" : " dot--live")}
+                      style={{ background: done ? "var(--success)" : "var(--accent)" }}
+                    />
+                    {a.agent} {done ? "✓" : "⟳"}
+                  </div>
+                );
+              })}
+            </div>
           )}
         </div>
       )}
@@ -137,114 +171,15 @@ export default function Sidebar({
   );
 }
 
-/* ── Small reusable components ─────────────────────────────────── */
-
-function SectionLabel({ text }) {
-  return (
-    <div style={{
-      fontSize: 10, fontWeight: 700, textTransform: "uppercase",
-      letterSpacing: "1.2px", color: "var(--text-dim)", marginBottom: 6,
-    }}>
-      {text}
-    </div>
-  );
-}
-
-function SelectRow({ label, value, onChange, options }) {
-  return (
-    <div style={st.selectRow}>
-      <label style={st.selectLabel}>{label}</label>
-      <select
-        style={st.select}
-        value={value}
-        onChange={e => onChange(e.target.value)}
-      >
-        {options.map(o => (
-          <option key={o.value} value={o.value}>{o.label}</option>
-        ))}
-      </select>
-    </div>
-  );
-}
-
 function Spinner() {
   return (
-    <span style={{
-      display: "inline-block", width: 13, height: 13,
-      border: "2px solid rgba(0,0,0,.25)", borderTopColor: "#000",
-      borderRadius: "50%", animation: "spin .65s linear infinite",
-    }} />
+    <span
+      aria-hidden="true"
+      style={{
+        display: "inline-block", width: 13, height: 13,
+        border: "2px solid rgba(0,0,0,.3)", borderTopColor: "currentColor",
+        borderRadius: "50%", animation: "spin .65s linear infinite",
+      }}
+    />
   );
 }
-
-/* ── Styles ───────────────────────────────────────────────────── */
-const st = {
-  aside: {
-    width: "var(--sidebar)", minWidth: "var(--sidebar)",
-    background: "var(--bg-base)", borderRight: "1px solid var(--border)",
-    display: "flex", flexDirection: "column", gap: 8,
-    padding: "16px 14px", overflowY: "auto", overflowX: "hidden",
-  },
-  badgeWrap: { marginBottom: 4 },
-  badge: {
-    display: "inline-flex", alignItems: "center", gap: 5,
-    padding: "4px 11px", borderRadius: "var(--radius)",
-    fontSize: 11, fontWeight: 700, letterSpacing: ".5px",
-    border: "1px solid",
-  },
-  badgeUpgrade: {
-    background: "rgba(56,189,248,.1)", borderColor: "rgba(56,189,248,.35)",
-    color: "var(--blue)",
-  },
-  badgeConvert: {
-    background: "rgba(167,139,250,.1)", borderColor: "rgba(167,139,250,.35)",
-    color: "var(--purple)",
-  },
-  selectRow: { display: "flex", alignItems: "center", gap: 8, marginBottom: 2 },
-  selectLabel: { fontSize: 11, color: "var(--text-muted)", minWidth: 52 },
-  select: {
-    flex: 1, padding: "5px 24px 5px 8px",
-    background: "var(--bg-raised)", border: "1px solid var(--border-mid)",
-    borderRadius: "var(--radius)", color: "var(--text-bright)",
-    fontSize: 12, fontFamily: "var(--font-ui)", cursor: "pointer",
-    appearance: "none",
-    backgroundImage: "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'%3E%3Cpath fill='%23506070' d='M5 7L0 2h10z'/%3E%3C/svg%3E\")",
-    backgroundRepeat: "no-repeat", backgroundPosition: "right 7px center",
-  },
-  arrow: { textAlign: "center", color: "var(--accent)", fontSize: 18, margin: "2px 0" },
-  runBtn: {
-    padding: "11px 0", background: "var(--accent)", border: "none",
-    borderRadius: "var(--radius)", color: "#000",
-    fontSize: 13, fontWeight: 700, fontFamily: "var(--font-ui)",
-    cursor: "pointer", display: "flex", alignItems: "center",
-    justifyContent: "center", gap: 8, marginTop: 4,
-    transition: "all .2s",
-  },
-  runBtnDisabled: {
-    background: "var(--bg-overlay)", color: "var(--text-dim)", cursor: "not-allowed",
-  },
-  warnBox: {
-    padding: "10px 12px", background: "rgba(251,191,36,.07)",
-    border: "1px solid rgba(251,191,36,.25)", borderRadius: "var(--radius)",
-    fontSize: 11, color: "var(--amber)", lineHeight: 1.6,
-  },
-  errBox: {
-    padding: "10px 12px", background: "rgba(248,113,113,.07)",
-    border: "1px solid rgba(248,113,113,.25)", borderRadius: "var(--radius)",
-    fontSize: 11, color: "var(--red)", lineHeight: 1.5,
-  },
-  downgradeBox: {
-    padding: "10px 12px", background: "rgba(251,191,36,.07)",
-    border: "1px solid rgba(251,191,36,.25)", borderRadius: "var(--radius)",
-    fontSize: 11, color: "var(--amber)", lineHeight: 1.5,
-  },
-  code: {
-    display: "inline-block", marginTop: 3,
-    background: "rgba(251,191,36,.12)", padding: "1px 5px",
-    borderRadius: 3, fontFamily: "var(--font-code)", fontSize: 10,
-  },
-  logWrap: { display: "flex", flexDirection: "column", gap: 6, marginTop: 4 },
-  streamingProgress: { display: "flex", flexDirection: "column", gap: 4 },
-  agentProgressItem: { display: "flex", alignItems: "center", gap: 6, fontSize: 11 },
-  agentStatusDot: { width: 8, height: 8, borderRadius: "50%" },
-};
