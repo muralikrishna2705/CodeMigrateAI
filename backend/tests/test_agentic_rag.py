@@ -71,7 +71,10 @@ class TestReranking:
     def test_reorders_by_query_relevance(self, monkeypatch):
         fake = _FakeReranker()
         monkeypatch.setattr("rag.reranker.get_reranker", lambda: fake)
-        monkeypatch.setattr("rag.reranker.get_settings", lambda: Settings())
+        # Floor at 0 so this isolates *ordering*; the floor has its own tests.
+        monkeypatch.setattr(
+            "rag.reranker.get_settings", lambda: Settings(rag_rerank_min_score=0.0)
+        )
 
         # The irrelevant doc is *first* by incoming score: this is exactly the
         # case fusion gets wrong, since RRF combines positions and cannot tell
@@ -83,6 +86,45 @@ class TestReranking:
         out = asyncio.run(reranker.rerank(hits, "java executorservice"))
         assert "java" in out[0][0].page_content
         assert out[0][1] > out[1][1]
+
+    def test_hits_below_the_floor_are_dropped_not_just_demoted(self, monkeypatch):
+        """The cross-encoder's verdict must filter, not only reorder.
+
+        ``rag_min_score`` is a cosine floor applied inside the vector store,
+        before reranking. Without a floor here, a chunk clears that, gets
+        re-scored as irrelevant, and still reaches the prompt at the bottom of
+        the list — and because retrieval fetches 20 candidates to keep 4, that
+        tail is padding whenever the corpus holds fewer than 4 good answers.
+        """
+        monkeypatch.setattr("rag.reranker.get_reranker", lambda: _FakeReranker())
+        monkeypatch.setattr(
+            "rag.reranker.get_settings", lambda: Settings(rag_rerank_min_score=0.2)
+        )
+        hits = [
+            (_doc("java executorservice thread pool"), 0.9),
+            (_doc("unrelated css flexbox notes"), 0.8),
+        ]
+        out = asyncio.run(reranker.rerank(hits, "java executorservice"))
+        assert len(out) == 1
+        assert "java" in out[0][0].page_content
+
+    def test_an_entirely_irrelevant_query_retrieves_nothing(self, monkeypatch):
+        # Returning nothing is a real answer: the caller emits the ungrounded
+        # notice rather than inventing grounding from off-topic text.
+        monkeypatch.setattr("rag.reranker.get_reranker", lambda: _FakeReranker())
+        monkeypatch.setattr(
+            "rag.reranker.get_settings", lambda: Settings(rag_rerank_min_score=0.2)
+        )
+        hits = [(_doc("java executorservice"), 0.9), (_doc("java collections"), 0.8)]
+        assert asyncio.run(reranker.rerank(hits, "chocolate cake recipe")) == []
+
+    def test_a_zero_floor_keeps_every_reranked_hit(self, monkeypatch):
+        monkeypatch.setattr("rag.reranker.get_reranker", lambda: _FakeReranker())
+        monkeypatch.setattr(
+            "rag.reranker.get_settings", lambda: Settings(rag_rerank_min_score=0.0)
+        )
+        hits = [(_doc("alpha"), 0.9), (_doc("beta"), 0.8)]
+        assert len(asyncio.run(reranker.rerank(hits, "gamma"))) == 2
 
     def test_failure_degrades_to_the_incoming_order(self, monkeypatch):
         class _Boom:

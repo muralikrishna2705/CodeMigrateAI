@@ -253,6 +253,18 @@ class Settings(BaseSettings):
     # Retrieve this wide, then let the reranker cut to rag_top_k. Recall is cheap
     # (one vector query returns 20 as easily as 4); precision is the reranker's job.
     rag_rerank_candidates: int = 20
+    # Cross-encoder relevance floor, applied *after* reranking. Distinct from
+    # rag_min_score, which is a cosine floor applied inside the vector store
+    # before the reranker ever sees a chunk — without this the reranker could
+    # only demote an irrelevant chunk, never drop it, so fetching 20 to keep 4
+    # guaranteed padding whenever the corpus held fewer than 4 good answers.
+    #
+    # Low on purpose. Measured on this corpus, a well-matched chunk scores
+    # 0.23-0.91 and an off-topic query scores 0.000 throughout, so the useful
+    # cut sits far below the good scores: this drops the obviously-irrelevant
+    # without second-guessing the cross-encoder on anything marginal. Set to 0
+    # to keep every reranked hit.
+    rag_rerank_min_score: float = 0.02
     # Grounding: the retrieval query is built from the actual source code's
     # imports/APIs/type names (not just the language pair) so retrieved examples
     # are code-specific. Cap how many symbols and how much of a code excerpt feed

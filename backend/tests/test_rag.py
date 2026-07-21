@@ -197,6 +197,11 @@ def _patch_settings(monkeypatch, **overrides):
     base.update(overrides)
     settings = Settings(**base)
     monkeypatch.setattr("rag.retrieval_pipeline.get_settings", lambda: settings)
+    # The reranker reads settings from its own module. Patching only the
+    # pipeline's left `rag_rerank_enabled: False` a statement about a module
+    # that never saw it: these tests were loading the real cross-encoder and
+    # asserting against its scores while claiming not to.
+    monkeypatch.setattr("rag.reranker.get_settings", lambda: settings)
     return settings
 
 

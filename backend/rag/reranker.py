@@ -100,14 +100,45 @@ async def rerank(hits: list[tuple], query: str, top_n: int | None = None) -> lis
     if not reranked:
         return hits
 
-    out = [
+    scored = [
         (doc, float((doc.metadata or {}).get("relevance_score", 0.0)))
         for doc in reranked
     ]
-    log.info(
-        "Reranked %d -> %d (top score %.3f)", len(hits), len(out), out[0][1] if out else 0.0
-    )
-    return out
+
+    # Enforce the cross-encoder's verdict rather than only its ordering.
+    #
+    # ``rag_min_score`` is a *cosine* floor applied inside the vector store,
+    # before this runs. A chunk can clear it, be re-scored here as plainly
+    # irrelevant, and still reach the prompt — demoted to the bottom but
+    # present. Retrieving 20 candidates to keep 4 guarantees the tail is
+    # padding whenever the corpus has fewer than 20 good answers, which is
+    # always.
+    #
+    # Measured on the shipped corpus: an on-topic query tops out at 0.23-0.91
+    # and its tail falls to 0.01, while a query about nothing in the corpus
+    # scores 0.000 across the board. Dropping the tail costs prompt tokens and
+    # removes text the model could anchor on; returning nothing at all is a
+    # real answer, and the caller already handles it by emitting the
+    # ungrounded notice instead of inventing grounding.
+    floor = settings.rag_rerank_min_score
+    kept = [(doc, score) for doc, score in scored if score >= floor]
+    if len(kept) < len(scored):
+        log.info(
+            "Reranked %d -> %d (%d below floor %.3f, top %.3f)",
+            len(hits),
+            len(kept),
+            len(scored) - len(kept),
+            floor,
+            scored[0][1],
+        )
+    else:
+        log.info(
+            "Reranked %d -> %d (top score %.3f)",
+            len(hits),
+            len(kept),
+            kept[0][1] if kept else 0.0,
+        )
+    return kept
 
 
 def _compress(reranker, docs, query: str, limit: int):
