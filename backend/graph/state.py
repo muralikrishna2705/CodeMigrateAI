@@ -118,6 +118,11 @@ class GraphState(TypedDict, total=False):
     # reads. Both stay empty on the sequential path.
     parallel_tasks: list[str]
     subgraph_results: Annotated[list[dict], operator.add]
+    # Set on a Send payload, never returned by a node: it tells one fanned-out
+    # invocation of the `branch` node which sub-task it is. It is per-invocation
+    # input rather than shared state, which is why no reducer has to arbitrate
+    # between the concurrent branches that each carry a different value.
+    branch_task: str
 
     # --- Agent reflection (ReflectorAgent -> reflect_condition) ---
     reflection_score: float

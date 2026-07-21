@@ -11,9 +11,8 @@ import pytest
 
 from agents.orchestrator_agent import OrchestratorAgent
 from graph.conditions import orchestrate_condition
-from graph.merge import merge_results
-from graph.parallel import BranchResult, run_parallel
 from graph.subgraphs import SUBGRAPH_TASKS, resolve_tasks
+from langgraph.types import Send
 from models.state import MigrationState
 
 
@@ -46,7 +45,14 @@ def _graph_state(**overrides) -> dict:
 
 
 class _StubSubgraph:
-    """A compiled-graph stand-in: mutates the state it is handed and returns it."""
+    """A compiled-graph stand-in.
+
+    Returns a *new* accumulated state rather than mutating the one it was
+    handed, because that is what a real compiled subgraph does: its nodes
+    return deltas and LangGraph folds them into fresh channel values. A stub
+    that mutated in place would make the caller's before/after diff empty and
+    quietly assert nothing.
+    """
 
     def __init__(self, name, mutate=None, delay=0.0, raises=None):
         self.name = name
@@ -61,9 +67,10 @@ class _StubSubgraph:
             await asyncio.sleep(self.delay)
         if self.raises:
             raise self.raises
+        result = dict(state)
         if self.mutate:
-            self.mutate(state)
-        return state
+            self.mutate(result)
+        return result
 
 
 class TestOrchestratorAgent:
@@ -109,9 +116,46 @@ class TestOrchestratorAgent:
 
 
 class TestOrchestrateCondition:
-    def test_parallel_tasks_route_to_parallel(self):
-        state = {"parallel_enabled": True, "parallel_tasks": ["analysis", "retrieval"]}
-        assert orchestrate_condition(state) == "parallel"
+    def test_parallel_tasks_become_one_send_each(self):
+        state = _graph_state(
+            parallel_enabled=True, parallel_tasks=["analysis", "retrieval"]
+        )
+        sends = orchestrate_condition(state)
+
+        assert all(isinstance(s, Send) for s in sends)
+        assert [s.node for s in sends] == ["branch", "branch"]
+        # Same target node, different task: which sub-task a branch runs travels
+        # in its own Send payload, not in shared state.
+        assert [s.arg["branch_task"] for s in sends] == ["analysis", "retrieval"]
+
+    def test_each_branch_receives_the_inbound_state(self):
+        state = _graph_state(
+            parallel_enabled=True,
+            parallel_tasks=["analysis", "retrieval"],
+            code_metrics={"complexity": "high"},
+        )
+        for send in orchestrate_condition(state):
+            assert send.arg["source_code"] == "x = 1"
+            assert send.arg["code_metrics"] == {"complexity": "high"}
+
+    def test_max_parallel_tasks_caps_the_fan_out(self):
+        # Send has no concurrency ceiling of its own — every dispatched branch
+        # runs in the same superstep — so capping the number of Sends is what
+        # keeps this setting meaning what it always meant.
+        state = _graph_state(
+            parallel_enabled=True,
+            parallel_tasks=["analysis", "retrieval", "reflection"],
+            max_parallel_tasks=2,
+        )
+        assert len(orchestrate_condition(state)) == 2
+
+    def test_a_nonsense_ceiling_still_dispatches_something(self):
+        state = _graph_state(
+            parallel_enabled=True,
+            parallel_tasks=["analysis", "retrieval"],
+            max_parallel_tasks=0,
+        )
+        assert len(orchestrate_condition(state)) == 1
 
     def test_disabled_falls_back_to_sequential(self):
         state = {
@@ -135,215 +179,6 @@ class TestOrchestrateCondition:
         assert orchestrate_condition({"code_metrics": {"complexity": "high"}}) == (
             "deep_analyze"
         )
-
-
-class TestRunParallel:
-    @pytest.mark.asyncio
-    async def test_branches_run_concurrently(self):
-        # Two 50ms branches must overlap; serialized they would take ~100ms.
-        tasks = [
-            ("a", _StubSubgraph("a", delay=0.05)),
-            ("b", _StubSubgraph("b", delay=0.05)),
-        ]
-        started = asyncio.get_event_loop().time()
-        await run_parallel(tasks, _graph_state(), max_concurrency=2)
-        elapsed = asyncio.get_event_loop().time() - started
-
-        assert elapsed < 0.09
-
-    @pytest.mark.asyncio
-    async def test_semaphore_bounds_concurrency(self):
-        active = 0
-        peak = 0
-
-        class _Counting(_StubSubgraph):
-            async def ainvoke(self, state):
-                nonlocal active, peak
-                active += 1
-                peak = max(peak, active)
-                await asyncio.sleep(0.01)
-                active -= 1
-                return state
-
-        tasks = [(f"t{i}", _Counting(f"t{i}")) for i in range(6)]
-        await run_parallel(tasks, _graph_state(), max_concurrency=2)
-
-        assert peak <= 2
-
-    @pytest.mark.asyncio
-    async def test_branches_get_isolated_state_copies(self):
-        def mutate_a(state):
-            state["rag_context"] = "from-a"
-
-        def mutate_b(state):
-            state["inline_plan"] = "from-b"
-
-        sub_a = _StubSubgraph("a", mutate=mutate_a)
-        sub_b = _StubSubgraph("b", mutate=mutate_b)
-        base = _graph_state()
-        await run_parallel([("a", sub_a), ("b", sub_b)], base, max_concurrency=2)
-
-        # Neither branch saw the other's write, and the caller's state is intact.
-        assert "rag_context" not in base
-        assert "inline_plan" not in base
-        assert sub_a.seen_states[0] is not base
-
-    @pytest.mark.asyncio
-    async def test_failed_branch_does_not_abort_siblings(self):
-        sub_ok = _StubSubgraph("ok", mutate=lambda s: s.update(rag_context="ctx"))
-        sub_bad = _StubSubgraph("bad", raises=RuntimeError("boom"))
-        branches = await run_parallel(
-            [("bad", sub_bad), ("ok", sub_ok)], _graph_state(), max_concurrency=2
-        )
-
-        by_task = {b.task: b for b in branches}
-        assert by_task["bad"].ok is False
-        assert "boom" in by_task["bad"].error
-        assert by_task["ok"].ok is True
-
-    @pytest.mark.asyncio
-    async def test_results_keep_task_order_not_completion_order(self):
-        slow = _StubSubgraph("slow", delay=0.03)
-        fast = _StubSubgraph("fast")
-        branches = await run_parallel(
-            [("slow", slow), ("fast", fast)], _graph_state(), max_concurrency=2
-        )
-        assert [b.task for b in branches] == ["slow", "fast"]
-
-    @pytest.mark.asyncio
-    async def test_empty_task_list_is_a_noop(self):
-        assert await run_parallel([], _graph_state()) == []
-
-    @pytest.mark.asyncio
-    async def test_zero_concurrency_does_not_deadlock(self):
-        branches = await run_parallel(
-            [("a", _StubSubgraph("a"))], _graph_state(), max_concurrency=0
-        )
-        assert branches[0].ok
-
-
-class TestMergeResults:
-    def _branch(self, task, state):
-        return BranchResult(task, state=state)
-
-    def test_report_deltas_are_appended_without_duplicating_history(self):
-        base = _graph_state(reports=[{"agent": "AnalyzerAgent"}])
-        a = _graph_state(
-            reports=[{"agent": "AnalyzerAgent"}, {"agent": "DeepAnalyzerAgent"}]
-        )
-        b = _graph_state(
-            reports=[{"agent": "AnalyzerAgent"}, {"agent": "RetrieverAgent"}]
-        )
-        merged = merge_results(
-            base, [self._branch("analysis", a), self._branch("retrieval", b)]
-        )
-
-        assert [r["agent"] for r in merged["reports"]] == [
-            "AnalyzerAgent",
-            "DeepAnalyzerAgent",
-            "RetrieverAgent",
-        ]
-
-    def test_agents_completed_and_errors_merge_the_same_way(self):
-        base = _graph_state(agents_completed=["AnalyzerAgent"], errors=[])
-        a = _graph_state(
-            agents_completed=["AnalyzerAgent", "DeepAnalyzerAgent"], errors=["e1"]
-        )
-        b = _graph_state(
-            agents_completed=["AnalyzerAgent", "RetrieverAgent"], errors=[]
-        )
-        merged = merge_results(
-            base, [self._branch("analysis", a), self._branch("retrieval", b)]
-        )
-
-        assert merged["agents_completed"] == [
-            "AnalyzerAgent",
-            "DeepAnalyzerAgent",
-            "RetrieverAgent",
-        ]
-        assert merged["errors"] == ["e1"]
-
-    def test_code_metrics_merge_key_wise(self):
-        # The real conflict: both branches carry a copy of the base metrics and
-        # one enriches it. A whole-dict overwrite would drop deep_analysis.
-        base = _graph_state(code_metrics={"complexity": "high", "loc": 100})
-        a = _graph_state(
-            code_metrics={
-                "complexity": "high",
-                "loc": 100,
-                "deep_analysis": {"patterns": ["visitor"]},
-            }
-        )
-        b = _graph_state(code_metrics={"complexity": "high", "loc": 100})
-        merged = merge_results(
-            base, [self._branch("analysis", a), self._branch("retrieval", b)]
-        )
-
-        assert merged["code_metrics"]["deep_analysis"] == {"patterns": ["visitor"]}
-        assert merged["code_metrics"]["loc"] == 100
-
-    def test_scalar_from_one_branch_wins(self):
-        base = _graph_state(rag_context="")
-        a = _graph_state(rag_context="")
-        b = _graph_state(rag_context="retrieved docs")
-        merged = merge_results(
-            base, [self._branch("analysis", a), self._branch("retrieval", b)]
-        )
-        assert merged["rag_context"] == "retrieved docs"
-
-    def test_conflicting_scalar_resolves_by_task_order(self):
-        base = _graph_state(rag_context="")
-        a = _graph_state(rag_context="from-a")
-        b = _graph_state(rag_context="from-b")
-        merged = merge_results(
-            base, [self._branch("first", a), self._branch("second", b)]
-        )
-        # Deterministic regardless of completion order.
-        assert merged["rag_context"] == "from-a"
-
-    def test_counters_take_the_max(self):
-        base = _graph_state(reretrieval_count=0)
-        a = _graph_state(reretrieval_count=0)
-        b = _graph_state(reretrieval_count=1)
-        merged = merge_results(base, [self._branch("a", a), self._branch("b", b)])
-        assert merged["reretrieval_count"] == 1
-
-    def test_failed_branch_contributes_nothing_but_is_recorded(self):
-        base = _graph_state(reports=[{"agent": "AnalyzerAgent"}])
-        ok = _graph_state(
-            reports=[{"agent": "AnalyzerAgent"}, {"agent": "RetrieverAgent"}]
-        )
-        merged = merge_results(
-            base,
-            [
-                BranchResult("analysis", error="boom"),
-                self._branch("retrieval", ok),
-            ],
-        )
-
-        assert [r["agent"] for r in merged["reports"]] == [
-            "AnalyzerAgent",
-            "RetrieverAgent",
-        ]
-        results = {r["task"]: r for r in merged["subgraph_results"]}
-        assert results["analysis"]["ok"] is False
-        assert results["analysis"]["error"] == "boom"
-        assert results["retrieval"]["ok"] is True
-
-    def test_all_branches_failing_degrades_to_base_state(self):
-        base = _graph_state(reports=[{"agent": "AnalyzerAgent"}], rag_context="")
-        merged = merge_results(
-            base,
-            [BranchResult("analysis", error="a"), BranchResult("retrieval", error="b")],
-        )
-        assert merged["reports"] == [{"agent": "AnalyzerAgent"}]
-        assert len(merged["subgraph_results"]) == 2
-
-    def test_base_state_is_not_mutated(self):
-        base = _graph_state(reports=[])
-        branch = _graph_state(reports=[{"agent": "RetrieverAgent"}])
-        merge_results(base, [self._branch("retrieval", branch)])
-        assert base["reports"] == []
 
 
 class TestSubgraphs:
@@ -372,36 +207,100 @@ class TestSubgraphs:
         assert resolve_tasks(None) == []
 
 
-class TestParallelNode:
-    """A self-skip contributes an empty delta, not the state it was handed.
+class TestSubgraphBranchNode:
+    """One fanned-out invocation: what it contributes, and how it fails.
 
-    Nodes return only what they changed, so "I did nothing" is ``{}``. Handing
-    back the inbound state would feed the whole accumulated history to the
-    additive reducers on ``GraphState`` and duplicate every report in the run.
+    LangGraph aborts the whole superstep on an unhandled exception, so the
+    "a failed sub-task contributes nothing and the run continues" guarantee —
+    previously enforced by BranchResult swallowing branch errors — now has to
+    live inside this node.
     """
 
-    @pytest.mark.asyncio
-    async def test_self_skips_when_disabled(self):
-        from graph.nodes import parallel_node
-
-        state = _graph_state(
-            parallel_enabled=False, parallel_tasks=["analysis", "retrieval"]
+    def _patch(self, monkeypatch, **tasks):
+        monkeypatch.setattr(
+            "graph.subgraphs.SUBGRAPH_TASKS",
+            {name: (lambda s=sub: s) for name, sub in tasks.items()},
         )
-        assert await parallel_node(state) == {}
 
     @pytest.mark.asyncio
-    async def test_self_skips_without_concurrent_work(self):
-        from graph.nodes import parallel_node
+    async def test_contributes_its_subgraph_delta(self, monkeypatch):
+        def _mutate(state):
+            state["rag_context"] = "docs"
+            state["agents_completed"] = state["agents_completed"] + ["RetrieverAgent"]
 
-        state = _graph_state(parallel_enabled=True, parallel_tasks=["retrieval"])
-        assert await parallel_node(state) == {}
+        self._patch(monkeypatch, retrieval=_StubSubgraph("retrieval", mutate=_mutate))
+        from graph.nodes import subgraph_branch_node
+
+        delta = await subgraph_branch_node(
+            _graph_state(branch_task="retrieval", agents_completed=["AnalyzerAgent"])
+        )
+
+        assert delta["rag_context"] == "docs"
+        # Only this branch's agent, not the one that ran before the fan-out —
+        # the additive reducer would otherwise record AnalyzerAgent twice.
+        assert delta["agents_completed"] == ["RetrieverAgent"]
 
     @pytest.mark.asyncio
-    async def test_self_skips_on_unseeded_state(self):
-        from graph.nodes import parallel_node
+    async def test_records_what_it_ran(self, monkeypatch):
+        self._patch(monkeypatch, analysis=_StubSubgraph("analysis"))
+        from graph.nodes import subgraph_branch_node
 
-        state = _graph_state()
-        assert await parallel_node(state) == {}
+        delta = await subgraph_branch_node(_graph_state(branch_task="analysis"))
+        record = delta["subgraph_results"][0]
+        assert record["task"] == "analysis"
+        assert record["ok"] is True
+        assert "duration_ms" in record
+
+    @pytest.mark.asyncio
+    async def test_a_failing_branch_degrades_instead_of_raising(self, monkeypatch):
+        self._patch(
+            monkeypatch,
+            analysis=_StubSubgraph("analysis", raises=RuntimeError("boom")),
+        )
+        from graph.nodes import subgraph_branch_node
+
+        delta = await subgraph_branch_node(_graph_state(branch_task="analysis"))
+
+        record = delta["subgraph_results"][0]
+        assert record["ok"] is False
+        assert "boom" in record["error"]
+        # The failure is visible in the report but contributes no state, so the
+        # sibling branch's work and the migration both survive.
+        assert "rag_context" not in delta
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_task_is_recorded_not_raised(self, monkeypatch):
+        self._patch(monkeypatch, analysis=_StubSubgraph("analysis"))
+        from graph.nodes import subgraph_branch_node
+
+        delta = await subgraph_branch_node(_graph_state(branch_task="hallucinated"))
+        assert delta["subgraph_results"][0]["ok"] is False
+        assert delta["subgraph_results"][0]["error"] == "unknown task"
+
+    @pytest.mark.asyncio
+    async def test_the_inbound_state_is_left_untouched(self, monkeypatch):
+        """What makes it safe for concurrent branches to share one state dict.
+
+        The Sends hand every branch the same object without copying. That is
+        sound only while a branch reads it and returns a delta; a branch that
+        wrote through would be visible to its siblings mid-flight, which is the
+        non-determinism the old implementation spent a deep copy per branch to
+        avoid.
+        """
+        self._patch(
+            monkeypatch,
+            analysis=_StubSubgraph(
+                "analysis", mutate=lambda s: s.update(code_metrics={"deep": True})
+            ),
+        )
+        from graph.nodes import subgraph_branch_node
+
+        state = _graph_state(branch_task="analysis", code_metrics={"complexity": "high"})
+        delta = await subgraph_branch_node(state)
+
+        assert delta["code_metrics"] == {"deep": True}
+        assert state["code_metrics"] == {"complexity": "high"}
+        assert state["agents_completed"] == []
 
 
 # --- End-to-end through the real compiled graph ---------------------------
@@ -562,7 +461,9 @@ class TestGraphWiring:
 
         nodes = build_migration_graph().get_graph().nodes
         assert "orchestrate" in nodes
-        assert "parallel" in nodes
+        # One node serving every fanned-out sub-task; orchestrate_condition
+        # names it in each Send.
+        assert "branch" in nodes
 
     def test_sequential_path_is_preserved(self):
         # Orchestration reshapes only the pre-planning phase; the nodes carrying

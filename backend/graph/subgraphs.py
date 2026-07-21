@@ -2,17 +2,17 @@
 
 Each builder returns an independently compiled ``StateGraph`` covering one phase
 of the work. They exist so the orchestrator can treat a phase as a single unit —
-invoking it inline, or handing several of them to :func:`graph.parallel.run_parallel`
-to run concurrently — instead of the top-level graph hardcoding one fixed edge
-order through the individual nodes.
+invoked inline, or dispatched concurrently by ``graph.nodes.subgraph_branch_node``
+— instead of the top-level graph hardcoding one fixed edge order through the
+individual nodes.
 
 **On the shared state schema.** Every subgraph is compiled against ``GraphState``
 rather than a narrower per-subgraph TypedDict. The node functions all hydrate a
 full :class:`~models.state.MigrationState` (they need ``source_code``, the
 language pair, the accumulated ``reports``), so a reduced schema would have to
 re-declare nearly every field and then be translated back at each boundary. What
-actually isolates a parallel branch is that it runs against its own deep copy of
-the state (see :mod:`graph.parallel`), not a narrower type.
+keeps concurrent branches from interfering is the delta contract — nodes read
+the inbound state and return only what they changed — not a narrower type.
 
 Compiled graphs are cached per builder: compilation walks and validates the whole
 graph, and these are rebuilt on every orchestrated migration otherwise.
@@ -120,8 +120,8 @@ def build_reflection_subgraph():
 # --- Task catalog ---------------------------------------------------------
 #
 # Maps the sub-task names the OrchestratorAgent emits onto subgraph builders.
-# The orchestrator plans against these names and `parallel_node` resolves them
-# here, so adding a composable phase is a builder plus an entry — the graph
+# The orchestrator plans against these names and `subgraph_branch_node` resolves
+# them here, so adding a composable phase is a builder plus an entry — the graph
 # wiring does not change.
 
 SUBGRAPH_TASKS: dict[str, callable] = {

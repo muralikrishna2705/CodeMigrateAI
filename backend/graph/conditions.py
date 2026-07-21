@@ -1,10 +1,14 @@
 """Edge routing logic for the migration graph.
 
 These functions are used as LangGraph conditional-edge selectors: they inspect
-the current state and return the name of the branch to take.
+the current state and return the name of the branch to take — or, for the
+fan-out, a list of :class:`~langgraph.types.Send` objects naming one target
+invocation each.
 """
 
 import logging
+
+from langgraph.types import Send
 
 log = logging.getLogger("CodeMigrateAI.GraphConditions")
 
@@ -34,13 +38,22 @@ def dispatch_condition(state: dict) -> str:
 complexity_condition = dispatch_condition
 
 
-def orchestrate_condition(state: dict) -> str:
-    """Route after orchestrate: parallel fan-out, or the sequential flow.
+def orchestrate_condition(state: dict) -> str | list[Send]:
+    """Route after orchestrate: fan out with ``Send``, or take the sequential flow.
 
     The ``orchestrate`` node (OrchestratorAgent) writes ``parallel_tasks`` with
     the sub-tasks it found safe to run concurrently. Two or more of them — with
-    the fan-out enabled — takes the ``parallel`` branch, where one node runs the
-    corresponding subgraphs and merges them.
+    the fan-out enabled — returns one :class:`~langgraph.types.Send` per task,
+    which LangGraph runs concurrently in a single superstep and folds back
+    through ``GraphState``'s reducers.
+
+    ``max_parallel_tasks`` caps how many are dispatched. It used to bound an
+    ``asyncio.Semaphore`` inside the fan-out node; ``Send`` has no equivalent,
+    since every dispatched branch runs in the same superstep. Capping the number
+    of Sends preserves the setting's meaning exactly — it is still the ceiling
+    on simultaneous branches — rather than leaving a knob that no longer does
+    anything. Note that the real throughput limit on a hosted provider is the
+    shared rate limiter in ``llm.providers``, not this.
 
     Everything else falls through to the original sequential path, and reuses
     ``dispatch_condition`` to pick between deep analysis and straight retrieval,
@@ -49,8 +62,19 @@ def orchestrate_condition(state: dict) -> str:
     """
     tasks = state.get("parallel_tasks") or []
     if state.get("parallel_enabled") and len(tasks) > 1:
-        log.info("Orchestrator planned %d parallel task(s) -> parallel", len(tasks))
-        return "parallel"
+        ceiling = max(1, state.get("max_parallel_tasks", 4))
+        dispatched = tasks[:ceiling]
+        if len(dispatched) < len(tasks):
+            log.warning(
+                "Orchestrator planned %d task(s); dispatching %d (max_parallel_tasks)",
+                len(tasks),
+                len(dispatched),
+            )
+        log.info("Fanning out %d task(s): %s", len(dispatched), ", ".join(dispatched))
+        # Each branch receives the same inbound state plus its own task name.
+        # Not copied: nodes return deltas rather than mutating, so concurrent
+        # branches cannot observe each other's partial writes.
+        return [Send("branch", {**state, "branch_task": task}) for task in dispatched]
 
     route = dispatch_condition(state)
     log.info("No parallel work planned -> sequential (%s)", route)

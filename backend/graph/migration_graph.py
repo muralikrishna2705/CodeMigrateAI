@@ -2,24 +2,26 @@
 
 Flow::
 
-    analyze ─▶ dispatch ─▶ orchestrate ─(parallel)─▶ parallel ─▶ plan ─▶ migrate ─▶ reflect ─▶ validate
-                              │                    [analysis ‖         ▲            │            │
-                              │                     retrieval]         │            │            │
-                              ├──(deep)──▶ deep_analyze ─▶ retrieve ───┤            │            │
-                              └──(no)─────────────────────▶ retrieve ──┘            │            │
-                                     fix ◀───────────────────────────(fail)─────────┼────────────┘
-                                      └──▶ migrate                                  │
-                                            ▲──────(re-generate, low confidence)────┘
+    analyze ─▶ dispatch ─▶ orchestrate ═(Send × n)═▶ branch ═▶ plan ─▶ migrate ─▶ reflect ─▶ validate
+                              │                   [analysis ‖        ▲            │            │
+                              │                    retrieval]        │            │            │
+                              ├──(deep)──▶ deep_analyze ─▶ retrieve ─┤            │            │
+                              └──(no)────────────────────▶ retrieve ─┘            │            │
+                                     fix ◀───────────────────────────(fail)───────┼────────────┘
+                                      └──▶ migrate                                │
+                                            ▲──────(re-generate, low confidence)──┘
                                                                                           (pass/done)
                                                                                                ▼
                                      END ◀── observe ◀── service_validate ◀────────────────────┘
 
 ``dispatch`` (DispatcherAgent) writes a route plan; ``orchestrate``
 (OrchestratorAgent) decomposes the migration into sub-tasks and marks the
-independent ones. When it finds concurrent work, ``parallel`` runs those as
-compiled subgraphs over isolated state copies and merges the branches (fan-out /
-fan-in); otherwise the run takes the original sequential path, routed by the same
-``dispatch_condition`` as before. Both paths converge on ``plan``.
+independent ones. When it finds concurrent work, ``orchestrate_condition``
+returns one ``Send`` per sub-task; LangGraph runs those invocations of ``branch``
+concurrently in a single superstep and folds their returns back through
+``GraphState``'s reducers (fan-out / fan-in). Otherwise the run takes the
+original sequential path, routed by the same ``dispatch_condition`` as before.
+Both paths converge on ``plan``.
 
 ``reflect`` (ReflectorAgent) self-critiques the migrated code and routes
 low-confidence output back to ``migrate`` with feedback (bounded by
@@ -47,11 +49,11 @@ from .nodes import (
     migrate_node,
     observe_node,
     orchestrate_node,
-    parallel_node,
     plan_node,
     reflect_node,
     retrieve_node,
     service_validate_node,
+    subgraph_branch_node,
     validate_node,
 )
 from .state import GraphState
@@ -86,7 +88,10 @@ def build_migration_graph(checkpointer=None, settings=None):
     workflow.add_node("analyze", analyze_node)
     workflow.add_node("dispatch", dispatch_node)
     workflow.add_node("orchestrate", orchestrate_node)
-    workflow.add_node("parallel", parallel_node)
+    # One node, many concurrent invocations: orchestrate_condition emits a Send
+    # per independent sub-task and each carries its own `branch_task`. A node
+    # per task would be five near-identical wrappers around one dispatch.
+    workflow.add_node("branch", subgraph_branch_node)
     workflow.add_node("deep_analyze", deep_analyze_node)
     workflow.add_node("retrieve", retrieve_node)
     workflow.add_node("plan", plan_node)
@@ -112,16 +117,20 @@ def build_migration_graph(checkpointer=None, settings=None):
     # directly rather than re-running a whole fan-out for one targeted query.
     workflow.add_edge("analyze", "dispatch")
     workflow.add_edge("dispatch", "orchestrate")
+    # The path map covers the sequential returns only. When the decomposition
+    # found concurrent work this condition returns Send objects instead, which
+    # name their target directly and bypass the map.
     workflow.add_conditional_edges(
         "orchestrate",
         orchestrate_condition,
         {
-            "parallel": "parallel",
             "deep_analyze": "deep_analyze",
             "retrieve": "retrieve",
         },
     )
-    workflow.add_edge("parallel", "plan")
+    # Every fanned-out branch converges here. LangGraph waits for all Sends in
+    # the superstep to settle before advancing, so this is the fan-in.
+    workflow.add_edge("branch", "plan")
     workflow.add_edge("deep_analyze", "retrieve")
     workflow.add_edge("retrieve", "plan")
     workflow.add_edge("plan", "migrate")

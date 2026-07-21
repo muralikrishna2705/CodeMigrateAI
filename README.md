@@ -34,9 +34,9 @@ Request → Cache → LangGraph workflow → Optional validator service → Resp
 A compiled `StateGraph` with 13 nodes and three budget-bounded cycles:
 
 ```text
-analyze → dispatch → orchestrate ─┬─(parallel)─→ parallel ──┐
-                                  ├─(deep)─→ deep_analyze ──┤
-                                  └─────────→ retrieve ─────┴→ plan → migrate
+analyze → dispatch → orchestrate ═(Send × n)═→ branch ═══════╗
+                                  ├─(deep)─→ deep_analyze ──╮║
+                                  └─────────→ retrieve ─────┴╩→ plan → migrate
                                                                         │
      ┌──────────────────────────────────────────────────────────────────┘
      ▼
@@ -49,6 +49,13 @@ analyze → dispatch → orchestrate ─┬─(parallel)─→ parallel ──�
 
   migrate ──(ungrounded imports)──→ retrieve       [bounded by max_reretrievals]
 ```
+
+The double lines are the fan-out. When the `OrchestratorAgent` finds sub-tasks
+with no data dependency on each other, `orchestrate_condition` returns one
+`Send` per task instead of a branch name; LangGraph runs those invocations of
+`branch` concurrently in a single superstep and folds their results back
+through the reducers on `GraphState`. Today that overlaps deep analysis with
+RAG retrieval — both read only the base metrics `AnalyzerAgent` wrote.
 
 ### What the model actually decides
 

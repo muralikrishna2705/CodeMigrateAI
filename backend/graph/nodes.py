@@ -12,6 +12,7 @@ can substitute a stub via :func:`set_llm_client`.
 
 import contextvars
 import logging
+import time
 
 # Importing the agent modules triggers AgentMeta auto-registration so that
 # BaseAgent.get_registry() can resolve them by name below.
@@ -437,44 +438,67 @@ async def retrieve_node(state: dict) -> dict:
     return delta
 
 
-async def parallel_node(state: dict) -> dict:
-    """Execute the orchestrator's independent sub-tasks concurrently, then merge.
+async def subgraph_branch_node(state: dict) -> dict:
+    """Run one fanned-out sub-task as a compiled subgraph.
 
-    This is the "execute" half of Plan-and-Execute: it resolves the task names
-    ``OrchestratorAgent`` planned into compiled subgraphs, fans them out over
-    isolated copies of the state (bounded by ``max_parallel_tasks``), and folds
-    the branches back into one state.
+    The "execute" half of Plan-and-Execute. ``orchestrate_condition`` emits one
+    ``Send`` per independent sub-task the OrchestratorAgent planned, each
+    carrying the task name in ``branch_task``; LangGraph runs them concurrently
+    in a single superstep and folds their returns through ``GraphState``'s
+    reducers. That fan-in is what replaced the hand-rolled merge — the conflict
+    policies it applied by hand are now the channel annotations.
 
-    Self-skips unless the orchestrator seeded ``parallel_enabled`` and planned at
-    least two tasks — so a direct-graph run that never seeds it, or a run whose
-    decomposition found no concurrent work, takes the sequential path. It also
-    degrades rather than fails: if every branch errors, ``merge_results`` returns
-    the base state plus the failure records, and the graph continues to planning
-    with whatever context it already had.
+    The branches share one inbound state without copying it. That is safe only
+    because of the delta contract: nodes read the dict and return what changed
+    rather than mutating in place, so there are no partial writes for a sibling
+    to observe. The previous implementation deep-copied precisely because that
+    was not yet true.
+
+    A branch degrades rather than fails. LangGraph aborts the whole superstep on
+    an unhandled exception, so a branch that blows up would take its siblings
+    and the migration with it — where the contract is that a failed sub-task
+    contributes nothing and the run continues with whatever context it has.
 
     ``subgraphs`` is imported here rather than at module scope because that
     module imports these node functions — a top-level import would be circular.
     """
-    from .merge import merge_results
-    from .parallel import run_parallel
-    from .subgraphs import resolve_tasks
+    from .subgraphs import SUBGRAPH_TASKS
 
-    task_names = state.get("parallel_tasks") or []
-    if not state.get("parallel_enabled") or len(task_names) < 2:
-        return {}
+    task = state.get("branch_task") or ""
+    started = time.perf_counter()
 
-    tasks = resolve_tasks(task_names)
-    if len(tasks) < 2:
-        log.info("Fewer than 2 resolvable subgraph tasks; staying sequential")
-        return {}
+    def _record(ok: bool, agents: list, error: str | None = None) -> dict:
+        record = {
+            "task": task,
+            "ok": ok,
+            "duration_ms": int((time.perf_counter() - started) * 1000),
+            "agents": list(agents),
+        }
+        if error:
+            record["error"] = error
+        return record
 
-    branches = await run_parallel(
-        tasks, state, max_concurrency=state.get("max_parallel_tasks", 4)
+    builder = SUBGRAPH_TASKS.get(task)
+    if builder is None:
+        # The task names can come from an LLM decomposition, so one hallucinated
+        # entry must not abort a migration the other branches can still finish.
+        log.warning("Unknown subgraph task %r; contributing nothing", task)
+        return {"subgraph_results": [_record(False, [], "unknown task")]}
+
+    try:
+        result = await builder().ainvoke(state)
+    except Exception as exc:  # noqa: BLE001 — a branch must never abort the run
+        log.exception("Parallel branch %r failed", task)
+        return {"subgraph_results": [_record(False, [], str(exc))]}
+
+    # ainvoke returns the subgraph's whole accumulated state; reduce it to this
+    # branch's contribution before handing it to the parent's channels.
+    delta = state_delta(state, result)
+    delta["subgraph_results"] = [_record(True, delta.get("agents_completed", []))]
+    log.info(
+        "Parallel branch %r finished in %dms", task, delta["subgraph_results"][0]["duration_ms"]
     )
-    # merge_results yields a full state (it predates the delta contract), so
-    # reduce it back down to what actually changed before handing it to the
-    # channels — otherwise the additive reducers re-append the whole history.
-    return state_delta(state, merge_results(state, branches))
+    return delta
 
 
 async def fix_node(state: dict) -> dict:

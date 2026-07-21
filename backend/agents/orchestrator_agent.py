@@ -4,14 +4,15 @@ Runs as the ``orchestrate`` graph node right after ``dispatch``. Where the
 :class:`~runtime.agent_dispatcher.DispatcherAgent` answers *"which route"*, this
 agent answers *"which sub-tasks, and which of them are independent"*: it writes
 ``parallel_tasks`` onto the state, and ``graph.conditions.orchestrate_condition``
-sends the run down the parallel path only when the decomposition actually found
-concurrent work. The graph's ``parallel`` node then resolves those names to
-compiled subgraphs (``graph.subgraphs.SUBGRAPH_TASKS``) and fans them out.
+fans the run out only when the decomposition actually found concurrent work,
+emitting one ``Send`` per sub-task to the graph's ``branch`` node, which resolves
+the name to a compiled subgraph (``graph.subgraphs.SUBGRAPH_TASKS``).
 
-This is the *plan* half of Plan-and-Execute; the execute half is the fan-out plus
-:mod:`graph.merge`. Splitting them keeps the planning swappable — the rule body
-below and the optional LLM decomposition produce the same artifact, so neither
-the graph wiring nor the executor knows which one ran.
+This is the *plan* half of Plan-and-Execute; the execute half is that fan-out and
+the reducers on ``GraphState`` that fold the branches back together. Splitting
+them keeps the planning swappable — the rule body below and the optional LLM
+decomposition produce the same artifact, so neither the graph wiring nor the
+executor knows which one ran.
 
 Decomposition is rule-based by default (deterministic, offline-friendly),
 mirroring the DispatcherAgent. The rules encode one real data dependency:
