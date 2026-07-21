@@ -1,11 +1,13 @@
 """
 CodeMigrateAI backend.
 
-Two-agent LLM-first pipeline:
-  AnalyzerAgent -> MigratorAgent
+A compiled LangGraph workflow (see graph/migration_graph.py) runs analysis,
+dynamic dispatch, orchestration, agentic RAG retrieval, planning, migration,
+reflection, validation, and the fix retry loop.
 
-Ollama runs on the Windows host and is reached from Docker through
-host.docker.internal by default.
+The chat model is provider-agnostic (llm/providers.py). Gemini is the default;
+Ollama is selectable via LLM_PROVIDER for local inference, in which case it runs
+on the host and is reached from Docker through host.docker.internal.
 """
 
 from __future__ import annotations

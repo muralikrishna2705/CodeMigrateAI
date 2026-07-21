@@ -2,16 +2,74 @@
 
 CodeMigrateAI is an AI-driven code migration platform — an MTech Final Year Project — built around a multi-agent LLM pipeline. It converts source code between languages (e.g. Java 8 → Python 3.12) or upgrades versions within the same language (e.g. Python 2.7 → Python 3.12).
 
-## Pipeline Architecture
+## Quick start
 
-```text
-Request → Cache → [Runtime Agents] → RetrieverAgent (RAG) → LangGraph Workflow → Optional Validator → Response
-
-LangGraph Workflow:
-  analyze → (if high complexity) deep_analyze → plan → migrate → validate → (on failure) fix → migrate (retry loop, max 2 retries)
+```bash
+cp backend/.env.example backend/.env    # then set GOOGLE_API_KEY
+pip install -r backend/requirements.txt
+python backend/scripts/build_index.py   # build the RAG index once
+cd backend && uvicorn main:app --reload
 ```
 
-The pipeline uses **LangGraph** (`StateGraph`) to orchestrate the migration workflow with retry logic, and **LangChain / ChromaDB** for Retrieval-Augmented Generation.
+The default model provider is **Gemini**, because native tool calling is what
+the agentic paths require. `LLM_PROVIDER=ollama` switches to local inference,
+but Ollama's `/api/generate` has no `tools` parameter, so the tool loop and
+structured routing fall back to their deterministic paths there.
+
+> **Rate limits are the latency ceiling, not compute.** One migration makes
+> 8–15 model calls. On a free tier (~10 RPM) leave `LLM_REQUESTS_PER_SECOND` at
+> its default and expect roughly one migration per minute.
+
+## Pipeline architecture
+
+```text
+Request → Cache → LangGraph workflow → Optional validator service → Response
+```
+
+A compiled `StateGraph` with 13 nodes and three budget-bounded cycles:
+
+```text
+analyze → dispatch → orchestrate ─┬─(parallel)─→ parallel ──┐
+                                  ├─(deep)─→ deep_analyze ──┤
+                                  └─────────→ retrieve ─────┴→ plan → migrate
+                                                                        │
+     ┌──────────────────────────────────────────────────────────────────┘
+     ▼
+  reflect ──(low confidence)──→ migrate            [bounded by max_reflections]
+     │
+     ▼
+  validate ──(fail)──→ fix ──→ migrate             [bounded by max_retries]
+     │
+     └──(pass)──→ service_validate → observe → END
+
+  migrate ──(ungrounded imports)──→ retrieve       [bounded by max_reretrievals]
+```
+
+### What the model actually decides
+
+The distinction that matters for an agentic system is whether the LLM controls
+*flow*, not just content:
+
+| Decision | Mechanism |
+| --- | --- |
+| Which route (deep analysis or not) | `RouteDecision` structured output |
+| Which sub-tasks can run concurrently | `SubTaskPlan`, `Literal`-constrained |
+| Which retrieval tools to call, and with what query | Native tool calling (`bind_tools`) |
+| Which retrieval strategy — or none at all | `RetrievalRouteDecision`, `rag_strategy="auto"` |
+| Whether its own output is good enough | `Critique` → re-migrate loop |
+
+### Noise defenses
+
+| Noise | Defense |
+| --- | --- |
+| Malformed model output | `with_structured_output` against Pydantic schemas |
+| Hallucinated tool names / arguments | Native tool calling with typed `args_schema` |
+| Irrelevant retrieved chunks | FlashRank cross-encoder rerank (fetch 20 → keep 4) |
+| Chunks stripped of context | Contextual chunk headers at ingestion |
+| Invented APIs | Grounding check + web verification + re-retrieval loop |
+| Comments diluting the retrieval query | Comment stripping before symbol extraction |
+
+Built on **LangGraph** for orchestration and **LangChain / ChromaDB** for retrieval.
 
 ## Supported Languages
 
@@ -45,10 +103,14 @@ Server-Sent Events deliver token-by-token code output to the frontend. The `Migr
 ### Anti-Hallucination Measures
 - `UngroundedNotice` prepended when RAG finds no reference examples.
 - Version constraints in prompts fence off APIs newer than the target version.
-- LLM output parsing with multiple fallback strategies (JSON extraction, preamble stripping, markdown fence extraction, truncated JSON repair).
+- Structured output means malformed responses are not a reachable state; the salvage path in `llm/structured.py` exists for the streaming path and test doubles only.
 
-### Fast Model Routing
-Analysis and planning tasks use a lighter model (e.g. `llama3.2:1b`) while code generation uses the main model (`deepseek-coder:1.3b`). Missing models are auto-pulled on startup.
+### Model role routing
+Two roles, resolved by `llm/providers.py`. `main` generates code; `fast` handles
+routing, grading, decomposition, and query reformulation on the cheaper model
+with the reasoning budget disabled — a thinking budget spent on a yes/no routing
+answer is pure latency. Model ids default per provider, so switching
+`LLM_PROVIDER` carries the whole set with it.
 
 ### Caching
 Two-tier cache: **Redis** (primary, with TTL) and **local LRU cache** (fallback). Cache keys use SHA-256 hashes of source code, language/version IDs, migration type, and analyzer context.
@@ -64,26 +126,30 @@ A separate FastAPI microservice (`validator_service/`) with per-language syntax 
 
 Key modules:
 
-- `backend/agents/analyzer_agent.py` — static code metrics and LLM-based semantic analysis.
-- `backend/agents/migrator_agent.py` — single LLM call with strict JSON parsing.
+- `backend/llm/providers.py` — provider-agnostic chat model + embeddings, rate limiter.
+- `backend/llm/structured.py` — structured-output coercion and JSON salvage.
+- `backend/models/schemas.py` — every structured LLM response shape.
 - `backend/graph/migration_graph.py` — LangGraph workflow definition.
-- `backend/rag/retriever_agent.py` — RAG retrieval and grounding checks.
+- `backend/graph/nodes.py` — agent-to-node adapters, DI provider wiring.
+- `backend/agents/base.py` — `BaseAgent`, `_call_structured`, `bind_tools`, reflection hook.
+- `backend/agents/tools/base.py` — `AgentTool` and its `StructuredTool` adapter.
+- `backend/agents/retriever_agent.py` — the ReAct retrieval loop.
+- `backend/rag/retrieval_pipeline.py` — hybrid retrieval, filter ladder, strategy routing.
+- `backend/rag/reranker.py` — FlashRank cross-encoder reranking.
 - `backend/rag/ingestion.py` — ChromaDB ingestion pipeline.
 - `backend/llm/prompt_composer.py` — cached migration prompt builder.
-- `backend/llm/language_profiles/` — shared language guidance and few-shot examples.
-- `backend/clients/llm_client.py` — Ollama HTTP client (sync and streaming).
-- `backend/clients/validator_client.py` — optional validator service caller.
-- `backend/streaming.py` — SSE streaming and `MigratedCodeStreamer`.
+- `backend/scripts/build_index.py` — offline index build (`--stats` to check).
 
-## Environment Variables
+## Environment variables
+
+See `backend/.env.example` for the annotated set. The essentials:
 
 ```text
-OLLAMA_URL=http://host.docker.internal:11434
-LLM_MODEL=deepseek-coder:1.3b
-FAST_LLM_MODEL=llama3.2:1b
-EMBEDDING_MODEL=nomic-embed-text
+LLM_PROVIDER=google_genai        # or "ollama"
+GOOGLE_API_KEY=                  # required for google_genai
+LLM_REQUESTS_PER_SECOND=0.16     # ~10 RPM free tier; raise on a paid plan
+EMBEDDING_PROVIDER=google_genai
 REDIS_URL=redis://redis:6379/0
-CHROMA_URL=http://chromadb:8000
 VALIDATOR_URL=http://validator:8000
 ENABLE_VALIDATION=false
 ENABLE_RAG=false
