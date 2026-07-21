@@ -7,23 +7,27 @@ for imports/calls/types, builds a query, retrieves, and injects whatever comes
 back. Deterministic, offline-safe, one embedding call — but the query is a bag of
 symbols, and if it retrieves nothing useful the agent has no recourse.
 
-**Tool loop** (``settings.retriever_tool_loop``). The agent asks the LLM which
-retrieval tool to call and what to ask it, inspects what comes back, and — if the
-answer is thin — asks again with a different query. That is the actual value of
-tool use here: a second attempt informed by the first, which the single-pass
-design cannot express.
+**Tool loop** (``settings.retriever_tool_loop``, on by default). The model sees
+the retrieval tools, emits native tool calls against their schemas, reads the
+results, and searches again with a better query when the first answer is thin.
+That second attempt informed by the first is the actual value of tool use here,
+and the single-pass design cannot express it.
 
-The loop is off by default and deliberately so. Selection is prompt-driven
-because Ollama's ``/api/generate`` has no native tool calling, and
-``deepseek-coder:1.3b`` is not tool-call trained, so a failed or nonsense
-selection is routine. Every exit from the loop — no selection, no tools, empty
-results, an exception — falls back to the heuristic pass, so the worst case is
-the old behaviour plus one wasted LLM call.
+This used to be off by default, because selection was prompt-driven — Ollama's
+``/api/generate`` has no ``tools`` parameter, so the catalog went into a prompt
+and a 1.3b model was asked to reply with JSON naming its choice. Nonsense
+selections were routine. With a tool-calling model the model emits a real,
+schema-validated call, so the loop is now the default path.
+
+Every exit still falls back to the heuristic pass — no tools registered, a model
+that cannot bind them, an exception, or empty results — so the worst case
+remains the old behaviour.
 """
 
 import logging
 
 from config import get_settings
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from models.state import MigrationState
 
 from agents.base import AgentResult, BaseAgent
@@ -145,55 +149,71 @@ class RetrieverAgent(BaseAgent):
     # --- Tool loop mode ---------------------------------------------------
 
     async def _tool_loop(self, state: MigrationState) -> str:
-        """Iteratively pick a retrieval tool, call it, and refine. Returns context."""
-        tools = self.tools.subset(_RETRIEVAL_TOOLS)
-        if not tools:
-            log.debug("No retrieval tools registered; using heuristic pass")
+        """Let the model drive retrieval through native tool calls.
+
+        A genuine ReAct loop: the model sees the retrieval tools, emits real tool
+        calls against their schemas, reads the results back as ``ToolMessage``s,
+        and decides whether to search again with a better query. The loop ends
+        when it stops asking for tools, when material has been found, or when the
+        call budget runs out.
+
+        Every call still goes through ``_call_tool`` rather than a ``ToolNode``,
+        for two reasons: it records the call in ``tool_call_log`` — the report is
+        the evidence that the model, not a rule, chose this — and it lets the
+        results be rendered into reference blocks as they arrive.
+        """
+        bound = self.bind_tools(_RETRIEVAL_TOOLS)
+        if bound is None:
+            # No retrieval tools registered, or a client that cannot bind them
+            # (unit stubs). The heuristic pass is the fallback, as before.
+            log.debug("Retrieval tools unavailable; using heuristic pass")
             return ""
 
         settings = get_settings()
+        messages: list = [
+            SystemMessage(
+                content=(
+                    "You ground code migrations in reference material. Search for "
+                    "the specific APIs and constructs in the code — not the "
+                    "languages in general. If a search returns nothing, try a "
+                    "broader query or a different tool. Stop once you have useful "
+                    "material."
+                )
+            ),
+            HumanMessage(content=self._initial_goal(state)),
+        ]
         blocks: list[str] = []
-        tried: set[tuple[str, str]] = set()
-        goal = self._initial_goal(state)
 
         for attempt in range(settings.retriever_max_tool_calls):
-            selection = await self._select_tool(goal, tools=tools)
-            if not selection:
-                log.info("No tool selected on attempt %d; stopping loop", attempt + 1)
+            try:
+                reply = await bound.ainvoke(messages)
+            except Exception as exc:  # noqa: BLE001 — fall back to the heuristic pass
+                log.warning("Retrieval tool call failed: %s", exc)
+                break
+            messages.append(reply)
+
+            tool_calls = getattr(reply, "tool_calls", None) or []
+            if not tool_calls:
+                log.info("Model requested no tools on attempt %d", attempt + 1)
                 break
 
-            name, arguments = selection
-            arguments = self._normalize_arguments(name, arguments, state)
-            signature = (name, str(arguments.get("query", "")).strip().lower())
-            if signature in tried:
-                # The model re-proposed a query we already ran. Without this the
-                # loop would burn its whole budget re-asking the same question.
-                log.info("Tool loop repeated %s(%r); stopping", *signature)
-                break
-            tried.add(signature)
-
-            result = await self._call_tool(name, **arguments)
-            if not result.success:
-                goal = (
-                    f"{self._initial_goal(state)}\nThe {name} tool failed "
-                    f"({result.error}). Try a different tool."
+            for call in tool_calls:
+                name = call.get("name", "")
+                args = self._normalize_arguments(name, call.get("args") or {}, state)
+                result = await self._call_tool(name, **args)
+                blocks.extend(self._blocks_from(name, result))
+                # The result goes back as a ToolMessage whether it succeeded or
+                # not — a failure the model can read is a failure it can route
+                # around, which is the whole point of tools never raising.
+                messages.append(
+                    ToolMessage(
+                        content=result.for_model(), tool_call_id=call.get("id", "")
+                    )
                 )
-                continue
 
-            new_blocks = self._blocks_from(name, result)
-            blocks.extend(new_blocks)
-            if new_blocks:
-                # Retrieval found material; one good grounding pass is the goal,
-                # not exhausting the call budget.
+            if blocks:
+                # One good grounding pass is the goal, not exhausting the budget.
                 break
-
-            # Retrieved nothing: the query was wrong, so say so explicitly rather
-            # than re-issuing the same goal and inviting the same query back.
-            goal = (
-                f"{self._initial_goal(state)}\nA {name} search for "
-                f"{arguments.get('query')!r} returned no results. Formulate a "
-                "different, broader query, or choose another tool."
-            )
 
         if not blocks:
             return ""
@@ -223,21 +243,21 @@ class RetrieverAgent(BaseAgent):
 
     @staticmethod
     def _normalize_arguments(name: str, arguments: dict, state: MigrationState) -> dict:
-        """Fill in the arguments the model reliably omits.
+        """Keep the model's arguments, but own the ones that are facts.
 
-        A small model typically returns just ``{"query": "..."}``. Rather than
-        rejecting the selection, supply the target language/version from state —
-        they are facts the agent already holds and the model has no business
-        guessing. Filters get dropped if the model invents a different language,
-        since an off-target filter retrieves nothing.
+        The model chooses the query and the intent — that is the judgement we
+        want from it. The target language and version are not judgement calls:
+        the agent already holds them, and a model that guesses a different one
+        produces a filter that matches nothing. So those are overwritten rather
+        than merged, and everything else the model supplied is passed through.
         """
-        normalized = {"query": str(arguments.get("query") or "").strip()}
+        normalized = dict(arguments)
+        normalized["query"] = str(arguments.get("query") or "").strip()
         if name in ("vector_db", "semantic_search"):
             normalized["target_language"] = state.target_language
             normalized["target_version"] = state.target_version
         elif name == "web_search":
             normalized["language"] = state.target_language
-            normalized["fetch_content"] = False
         return normalized
 
     @staticmethod

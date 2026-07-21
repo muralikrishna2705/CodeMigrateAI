@@ -279,76 +279,31 @@ class BaseAgent(ABC, metaclass=AgentMeta):
         """Tool calls made during this run, for AgentResult.details."""
         return list(self._tool_calls)
 
-    async def _select_tool(
-        self, goal: str, tools: "ToolRegistry | None" = None
-    ) -> tuple[str, dict] | None:
-        """Ask the LLM which tool to call for ``goal``. Returns ``(name, args)``.
+    def bind_tools(self, names=None, *, role: str = "fast"):
+        """A chat model with this agent's tools bound, or None.
 
-        This is prompt-driven, not native tool calling: the configured Ollama
-        endpoint (``/api/generate``) has no ``tools`` parameter, so the catalog
-        goes into the prompt and the model replies with JSON. ``fmt="json"``
-        engages Ollama's grammar-constrained decoding, which is what makes a
-        small model emit parseable output at all.
+        Replaces the old ``_select_tool``, which rendered the tool catalog into a
+        prompt and asked the model to reply with JSON naming its choice — the
+        only mechanism available before the model could accept a ``tools``
+        parameter. The model now emits a schema-validated tool call directly, so
+        a hallucinated tool name or malformed arguments are no longer reachable.
 
-        Returns ``None`` on anything unexpected — no LLM, malformed JSON, or a
-        hallucinated tool name — so every caller must have a non-LLM fallback.
-        With a 1.3b model that path is taken often; it is the normal case, not
-        an error.
+        Returns None when there is nothing to bind or the client cannot bind
+        (unit stubs), so callers keep their non-LLM fallback.
         """
-        registry = tools if tools is not None else self.tools
+        registry = self.tools.subset(names) if names else self.tools
         if not registry:
             return None
-        call_llm = getattr(self.llm, "call_llm", None)
-        if call_llm is None:
+        chat_model = getattr(self.llm, "chat_model", None)
+        if chat_model is None:
             return None
-
-        prompt = (
-            "You have these tools:\n"
-            f"{registry.describe()}\n\n"
-            f"GOAL: {goal}\n\n"
-            "Choose the single most useful tool and its arguments. Respond with "
-            'only JSON: {"tool": "<name>", "arguments": {"<arg>": "<value>"}}. '
-            'If no tool helps, respond {"tool": null}.'
-        )
+        bindable = registry.as_langchain_tools()
+        if not bindable:
+            return None
         try:
-            raw = await call_llm(
-                prompt,
-                system_prompt="Respond ONLY with the JSON object.",
-                fmt="json",
-                **self._fast_model_kwargs(),
-            )
-        except Exception as exc:  # noqa: BLE001 — selection is strictly optional
-            log.warning("[%s] tool selection call failed: %s", self.name, exc)
-            return None
-
-        try:
-            data = self._parse_tool_choice(raw)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("[%s] tool selection unparseable: %s", self.name, exc)
-            return None
-        if not data:
-            return None
-
-        name = data.get("tool")
-        if not name or name not in registry:
-            # A name outside the catalog is the classic small-model failure:
-            # inventing a plausible tool. Treat it as "no selection".
-            if name:
-                log.info("[%s] LLM chose unknown tool %r; ignoring", self.name, name)
-            return None
-
-        arguments = data.get("arguments")
-        if not isinstance(arguments, dict):
-            arguments = {}
-        return name, arguments
-
-    def _parse_tool_choice(self, raw: str) -> dict | None:
-        """Parse the selection response, tolerating fenced/prefixed JSON."""
-        from llm.structured import salvage_json
-
-        try:
-            return salvage_json(raw)
-        except ValueError:
+            return chat_model(role).bind_tools(bindable)
+        except Exception as exc:  # noqa: BLE001 — binding is best-effort
+            log.warning("[%s] could not bind tools: %s", self.name, exc)
             return None
 
     def _fast_model_kwargs(self) -> dict:

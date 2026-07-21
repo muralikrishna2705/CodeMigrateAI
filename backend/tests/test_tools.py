@@ -16,6 +16,7 @@ from agents.tools.syntax_checker import SyntaxCheckTool
 from agents.tools.vector_db import VectorDBTool
 from agents.tools.web_search import WebSearchTool, official_domains
 from config import Settings
+from langchain_core.messages import AIMessage
 from models.state import MigrationState
 
 
@@ -100,10 +101,13 @@ class TestToolRegistry:
         subset = registry.subset(["echo", "never_registered"])
         assert subset.names() == ["echo"]
 
-    def test_describe_renders_catalog_for_the_prompt(self):
-        described = ToolRegistry([_EchoTool()]).describe()
-        assert "echo(value: anything)" in described
-        assert "Echo the value back" in described
+    def test_bindable_tools_expose_their_schema_to_the_model(self):
+        # The field descriptions are what the model reads when choosing
+        # arguments, so they are prompt surface and must survive the conversion.
+        [tool] = ToolRegistry([CodeMetricsTool()]).as_langchain_tools()
+        schema = tool.args_schema.model_json_schema()
+        assert schema["required"] == ["code"]
+        assert "source code to measure" in schema["properties"]["code"]["description"]
 
 
 class TestBuildRegistry:
@@ -337,8 +341,8 @@ class TestBaseAgentToolCalls:
         assert "a-very-long-source-file" not in json.dumps(log)
 
 
-class _SelectingLLM:
-    """LLM stub that returns a scripted tool-selection JSON."""
+class _JsonLLM:
+    """LLM stub returning scripted JSON, for the structured-output salvage path."""
 
     def __init__(self, *responses):
         self.responses = list(responses)
@@ -348,60 +352,93 @@ class _SelectingLLM:
         self.prompts.append(prompt)
         return self.responses.pop(0) if self.responses else "{}"
 
-    def extract_json(self, raw_text):
-        return json.loads(raw_text)
+
+class _BoundModel:
+    """Stands in for a chat model with tools bound to it."""
+
+    def __init__(self, owner):
+        self.owner = owner
+
+    def bind_tools(self, tools):
+        self.owner.bound_tools = [t.name for t in tools]
+        return self
+
+    async def ainvoke(self, messages):
+        self.owner.conversations.append(list(messages))
+        turn = self.owner.turns.pop(0) if self.owner.turns else []
+        return AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": call["name"],
+                    "args": call.get("args", {}),
+                    "id": f"call-{i}",
+                    "type": "tool_call",
+                }
+                for i, call in enumerate(turn)
+            ],
+        )
 
 
-class TestToolSelection:
-    class _Selector(BaseAgent):
-        name = "_Selector"
+class _ToolCallingLLM:
+    """LLM stub whose model emits scripted *native* tool calls.
+
+    Each constructor argument is one turn: a list of ``{"name", "args"}`` dicts,
+    or an empty list for a turn where the model asks for no tools.
+    """
+
+    def __init__(self, *turns):
+        self.turns = [list(t) for t in turns]
+        self.conversations: list[list] = []
+        self.bound_tools: list[str] = []
+
+    def chat_model(self, role="main", *, json_mode=False):
+        return _BoundModel(self)
+
+
+class TestToolBinding:
+    """`BaseAgent.bind_tools` — the replacement for prompt-driven selection.
+
+    A hallucinated tool name and malformed arguments used to be the two routine
+    failure modes, each needing its own rejection path. Neither is reachable
+    now: the model emits a schema-validated call or nothing.
+    """
+
+    class _Binder(BaseAgent):
+        name = "_Binder"
         requires_llm = False
 
         async def run(self, state):  # pragma: no cover
             raise NotImplementedError
 
-    @pytest.mark.asyncio
-    async def test_valid_selection_is_parsed(self):
-        llm = _SelectingLLM(json.dumps({"tool": "echo", "arguments": {"value": "x"}}))
-        agent = self._Selector(llm, {"tools": ToolRegistry([_EchoTool()])})
-        assert await agent._select_tool("goal") == ("echo", {"value": "x"})
+    def test_binds_the_registered_tools(self):
+        llm = _ToolCallingLLM()
+        agent = self._Binder(llm, {"tools": ToolRegistry([VectorDBTool(None)])})
+        assert agent.bind_tools() is not None
+        assert llm.bound_tools == ["vector_db"]
 
-    @pytest.mark.asyncio
-    async def test_hallucinated_tool_name_is_rejected(self):
-        # The classic small-model failure: inventing a plausible tool.
-        llm = _SelectingLLM(json.dumps({"tool": "grep_the_internet"}))
-        agent = self._Selector(llm, {"tools": ToolRegistry([_EchoTool()])})
-        assert await agent._select_tool("goal") is None
+    def test_subset_limits_what_the_model_sees(self):
+        # A short catalog is a requirement, not a limitation: selection accuracy
+        # degrades as the option list grows.
+        llm = _ToolCallingLLM()
+        registry = ToolRegistry([VectorDBTool(None), CodeMetricsTool()])
+        agent = self._Binder(llm, {"tools": registry})
+        agent.bind_tools(("vector_db",))
+        assert llm.bound_tools == ["vector_db"]
 
-    @pytest.mark.asyncio
-    async def test_null_choice_returns_none(self):
-        llm = _SelectingLLM(json.dumps({"tool": None}))
-        agent = self._Selector(llm, {"tools": ToolRegistry([_EchoTool()])})
-        assert await agent._select_tool("goal") is None
+    def test_empty_registry_returns_none(self):
+        agent = self._Binder(_ToolCallingLLM(), {"tools": ToolRegistry()})
+        assert agent.bind_tools() is None
 
-    @pytest.mark.asyncio
-    async def test_unparseable_response_returns_none(self):
-        llm = _SelectingLLM("I would suggest using the echo tool!")
-        agent = self._Selector(llm, {"tools": ToolRegistry([_EchoTool()])})
-        assert await agent._select_tool("goal") is None
+    def test_client_without_a_chat_model_returns_none(self):
+        # Unit stubs. Callers keep their non-LLM fallback.
+        agent = self._Binder(object(), {"tools": ToolRegistry([VectorDBTool(None)])})
+        assert agent.bind_tools() is None
 
-    @pytest.mark.asyncio
-    async def test_non_dict_arguments_are_coerced_to_empty(self):
-        llm = _SelectingLLM(json.dumps({"tool": "echo", "arguments": "value=x"}))
-        agent = self._Selector(llm, {"tools": ToolRegistry([_EchoTool()])})
-        assert await agent._select_tool("goal") == ("echo", {})
-
-    @pytest.mark.asyncio
-    async def test_no_tools_short_circuits_without_an_llm_call(self):
-        llm = _SelectingLLM(json.dumps({"tool": "echo"}))
-        agent = self._Selector(llm, {"tools": ToolRegistry()})
-        assert await agent._select_tool("goal") is None
-        assert llm.prompts == []
-
-    @pytest.mark.asyncio
-    async def test_llm_without_call_llm_returns_none(self):
-        agent = self._Selector(object(), {"tools": ToolRegistry([_EchoTool()])})
-        assert await agent._select_tool("goal") is None
+    def test_tools_without_an_args_schema_are_not_bindable(self):
+        # _EchoTool declares no args_schema, so it is usable directly but not
+        # exposed to the model — and that must not make the registry unbindable.
+        assert ToolRegistry([_EchoTool()]).as_langchain_tools() == []
 
 
 class TestAnalyzerToolUse:
@@ -444,7 +481,7 @@ class TestAnalyzerToolUse:
     @pytest.mark.asyncio
     async def test_partial_semantic_json_keeps_the_full_metric_shape(self):
         # RAGPipeline._metric_terms and PromptComposer read these keys directly.
-        llm = _SelectingLLM(json.dumps({"key_constructs": ["classes"]}))
+        llm = _JsonLLM(json.dumps({"key_constructs": ["classes"]}))
         agent = AnalyzerAgent(llm, {"enable_semantic_analysis": True})
         result = await agent.run(_state())
         assert result.details["key_constructs"] == ["classes"]
@@ -461,13 +498,9 @@ class _HeuristicRAG(_FakeRAG):
 
 class TestRetrieverToolLoop:
     @pytest.mark.asyncio
-    async def test_loop_builds_context_from_the_chosen_tool(self, settings_override):
-        settings_override(retriever_tool_loop=True)
-
+    async def test_loop_builds_context_from_the_chosen_tool(self):
         rag = _FakeRAG(hits=[(_FakeDoc("System.out", {"language": "java"}), 0.91)])
-        llm = _SelectingLLM(
-            json.dumps({"tool": "vector_db", "arguments": {"query": "println"}})
-        )
+        llm = _ToolCallingLLM([{"name": "vector_db", "args": {"query": "println"}}])
         agent = RetrieverAgent(
             llm,
             {"rag_pipeline": rag, "tools": ToolRegistry([VectorDBTool(rag)])},
@@ -478,20 +511,37 @@ class TestRetrieverToolLoop:
         assert result.details["mode"] == "tool-loop"
         assert "Reference Examples" in state.rag_context
         assert "System.out" in state.rag_context
-        # The agent's own query reached the pipeline, not a code-signal query.
+        # The model's own query reached the pipeline, not a code-signal query.
         assert rag.queries == ["println"]
 
     @pytest.mark.asyncio
-    async def test_context_ends_with_the_separator_migrator_expects(
-        self, settings_override
-    ):
+    async def test_tool_results_are_fed_back_as_tool_messages(self):
+        # This is what makes it a loop rather than a single dispatch: the model
+        # sees what a search returned and can search again knowing that.
+        rag = _FakeRAG(hits=[(_FakeDoc("x", {"language": "java"}), 0.9)])
+        llm = _ToolCallingLLM([{"name": "vector_db", "args": {"query": "q"}}])
+        agent = RetrieverAgent(
+            llm, {"rag_pipeline": rag, "tools": ToolRegistry([VectorDBTool(rag)])}
+        )
+        await agent.run(_state())
+
+        # One turn happened; the tool result was appended for a would-be next one.
+        assert len(llm.conversations) == 1
+        assert llm.bound_tools == ["vector_db"]
+
+    @pytest.mark.asyncio
+    async def test_a_failing_tool_is_reported_to_the_model_not_raised(self):
+        # A failure the model can read is a failure it can route around.
+        result = await _BoomTool()(x=1)
+        assert result.success is False
+        assert result.for_model().startswith("ERROR:")
+
+    @pytest.mark.asyncio
+    async def test_context_ends_with_the_separator_migrator_expects(self):
         # MigratorAgent concatenates rag_context straight onto its prompt, so a
         # missing separator would run the reference block into the instructions.
-        settings_override(retriever_tool_loop=True)
         rag = _FakeRAG(hits=[(_FakeDoc("code", {"language": "java"}), 0.9)])
-        llm = _SelectingLLM(
-            json.dumps({"tool": "vector_db", "arguments": {"query": "q"}})
-        )
+        llm = _ToolCallingLLM([{"name": "vector_db", "args": {"query": "q"}}])
         agent = RetrieverAgent(
             llm, {"rag_pipeline": rag, "tools": ToolRegistry([VectorDBTool(rag)])}
         )
@@ -500,31 +550,24 @@ class TestRetrieverToolLoop:
         assert state.rag_context.endswith("\n\n---\n\n")
 
     @pytest.mark.asyncio
-    async def test_loop_falls_back_to_heuristic_when_selection_fails(
-        self, settings_override
-    ):
-        settings_override(retriever_tool_loop=True)
-
+    async def test_falls_back_to_heuristic_when_the_model_asks_for_no_tools(self):
         rag = _HeuristicRAG()
-        llm = _SelectingLLM("not json at all")
+        llm = _ToolCallingLLM([])  # a turn with no tool calls
         agent = RetrieverAgent(
             llm, {"rag_pipeline": rag, "tools": ToolRegistry([VectorDBTool(rag)])}
         )
         state = _state()
         result = await agent.run(state)
 
-        # A failed selection must land on the pre-tool behaviour, not on nothing.
         assert result.details["mode"] == "heuristic"
         assert "heuristic-context" in state.rag_context
 
     @pytest.mark.asyncio
     async def test_loop_falls_back_when_the_tool_finds_nothing(self, settings_override):
-        settings_override(retriever_tool_loop=True, retriever_max_tool_calls=1)
+        settings_override(retriever_max_tool_calls=1)
 
         rag = _HeuristicRAG()  # search() returns no hits
-        llm = _SelectingLLM(
-            json.dumps({"tool": "vector_db", "arguments": {"query": "q"}})
-        )
+        llm = _ToolCallingLLM([{"name": "vector_db", "args": {"query": "q"}}])
         agent = RetrieverAgent(
             llm, {"rag_pipeline": rag, "tools": ToolRegistry([VectorDBTool(rag)])}
         )
@@ -535,42 +578,40 @@ class TestRetrieverToolLoop:
         assert "heuristic-context" in state.rag_context
 
     @pytest.mark.asyncio
-    async def test_loop_stops_when_the_model_repeats_a_query(self, settings_override):
-        # Without dedupe the loop would spend its whole budget re-asking the same
-        # question, since the goal text barely changes between attempts.
-        settings_override(retriever_tool_loop=True, retriever_max_tool_calls=3)
-
+    async def test_budget_bounds_the_loop(self, settings_override):
+        # An empty-result turn used to need explicit query-repeat detection to
+        # avoid burning the budget. The bound is now simply the budget.
+        settings_override(retriever_max_tool_calls=2)
         rag = _HeuristicRAG()
-        choice = json.dumps({"tool": "vector_db", "arguments": {"query": "same"}})
-        llm = _SelectingLLM(choice, choice, choice)
+        call = {"name": "vector_db", "args": {"query": "same"}}
+        llm = _ToolCallingLLM([call], [call], [call])
         agent = RetrieverAgent(
             llm, {"rag_pipeline": rag, "tools": ToolRegistry([VectorDBTool(rag)])}
         )
         await agent.run(_state())
 
-        # Two selections (the second is the repeat that breaks the loop), one call.
-        assert len(llm.prompts) == 2
-        assert len(agent.tool_call_log()) == 1
+        assert len(llm.conversations) == 2
+        assert len(agent.tool_call_log()) == 2
 
     @pytest.mark.asyncio
-    async def test_loop_without_retrieval_tools_uses_heuristic(self, settings_override):
-        settings_override(retriever_tool_loop=True)
-        llm = _SelectingLLM(json.dumps({"tool": "echo"}))
+    async def test_loop_without_retrieval_tools_uses_heuristic(self):
+        llm = _ToolCallingLLM([{"name": "echo", "args": {}}])
         agent = RetrieverAgent(
             llm,
             {"rag_pipeline": _HeuristicRAG(), "tools": ToolRegistry([_EchoTool()])},
         )
         result = await agent.run(_state())
         assert result.details["mode"] == "heuristic"
-        assert llm.prompts == []  # no retrieval tools -> no selection call
+        assert llm.conversations == []  # nothing bindable -> no model call
 
     @pytest.mark.asyncio
-    async def test_loop_is_off_by_default(self):
-        llm = _SelectingLLM(json.dumps({"tool": "vector_db"}))
+    async def test_loop_can_be_switched_off(self, settings_override):
+        settings_override(retriever_tool_loop=False)
+        llm = _ToolCallingLLM([{"name": "vector_db", "args": {"query": "q"}}])
         agent = RetrieverAgent(llm, {"rag_pipeline": _HeuristicRAG()})
         result = await agent.run(_state())
         assert result.details["mode"] == "heuristic"
-        assert llm.prompts == []  # no selection call was made
+        assert llm.conversations == []
 
     def test_arguments_are_filled_from_state_not_left_to_the_model(self):
         state = _state(target_language="java", target_version="21")
@@ -586,7 +627,15 @@ class TestRetrieverToolLoop:
     def test_web_search_arguments_use_the_language_key(self):
         args = RetrieverAgent._normalize_arguments("web_search", {"query": "q"}, _state())
         assert args["language"] == "python"
-        assert args["fetch_content"] is False
+
+    def test_the_models_own_arguments_are_passed_through(self):
+        # Only the facts the agent holds get overwritten. Whether to fetch a
+        # page's full text is a judgement call, so it stays the model's.
+        args = RetrieverAgent._normalize_arguments(
+            "web_search", {"query": "q", "fetch_content": True}, _state()
+        )
+        assert args["fetch_content"] is True
+        assert args["language"] == "python"  # still not the model's to guess
 
     def test_blocks_render_vector_hits_as_fenced_code(self):
         result = ToolResult(

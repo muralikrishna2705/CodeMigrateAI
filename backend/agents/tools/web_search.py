@@ -25,7 +25,21 @@ import httpx
 from bs4 import BeautifulSoup
 from rag.url_index import OFFICIAL_DOC_URLS, VERSIONED_DOC_URLS
 
+from pydantic import BaseModel, Field
+
 from agents.tools.base import AgentTool, ToolResult
+
+
+class WebSearchArgs(BaseModel):
+    query: str = Field(description="What to search official documentation for.")
+    language: str = Field(
+        default="", description="Language whose official docs to search."
+    )
+    fetch_content: bool = Field(
+        default=False,
+        description="Also fetch the top result's page text. Slower; use when a "
+        "snippet is not enough to answer.",
+    )
 
 log = logging.getLogger("CodeMigrateAI.Tools.WebSearch")
 
@@ -68,6 +82,7 @@ class WebSearchTool(AgentTool):
         "or migration question. Use to check whether an API actually exists, or "
         "to find current guidance the local corpus lacks."
     )
+    args_schema = WebSearchArgs
     parameters = {
         "query": "what to search for",
         "language": "language whose official docs to search (optional)",

@@ -14,8 +14,22 @@ until migrations have run, and searching an empty store just burns an embedding
 call per query.
 """
 
+from pydantic import BaseModel, Field
+
 from agents.tools.base import AgentTool, ToolResult
 from config import get_settings
+
+
+class SemanticSearchArgs(BaseModel):
+    query: str = Field(
+        description="Code or a description of the construct to find precedents for."
+    )
+    target_language: str = Field(
+        default="", description="Restrict to migrations into this language."
+    )
+    target_version: str = Field(
+        default="", description="Restrict to migrations into this version."
+    )
 
 
 class SemanticSearchTool(AgentTool):
@@ -24,6 +38,7 @@ class SemanticSearchTool(AgentTool):
         "Search previously completed migrations for precedents similar to the "
         "current code. Use to reuse an approach that already validated cleanly."
     )
+    args_schema = SemanticSearchArgs
     parameters = {
         "query": "code or description of the construct to find precedents for",
         "target_language": "restrict to migrations into this language (optional)",

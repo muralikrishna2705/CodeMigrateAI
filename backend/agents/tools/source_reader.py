@@ -16,8 +16,28 @@ instance serves every concurrent migration.
 """
 
 import re
+from typing import Literal
+
+from pydantic import BaseModel, Field
 
 from agents.tools.base import AgentTool, ToolResult
+
+
+class SourceReaderArgs(BaseModel):
+    source_code: str = Field(description="The full source text to read from.")
+    mode: Literal["outline", "read", "find"] = Field(
+        default="outline",
+        description=(
+            "'outline' lists every class/function; 'read' returns a line range; "
+            "'find' locates a symbol and its surrounding lines."
+        ),
+    )
+    start_line: int = Field(default=1, description="First line, 1-indexed. mode=read.")
+    end_line: int = Field(default=0, description="Last line, inclusive. mode=read.")
+    pattern: str = Field(default="", description="Symbol or text to locate. mode=find.")
+    context_lines: int = Field(
+        default=3, description="Lines of context around each match. mode=find."
+    )
 
 # Definition sites across the nine supported languages. Deliberately loose — an
 # outline that over-reports a few lines is far cheaper than one that misses the
@@ -44,6 +64,7 @@ class SourceReaderTool(AgentTool):
         "around a symbol. Use when the code is long and you need to see a part "
         "that was cut off."
     )
+    args_schema = SourceReaderArgs
     parameters = {
         "source_code": "the full source text to read from",
         "mode": "one of: outline, read, find",

@@ -12,7 +12,15 @@ without a full graph loop.
 whole fix loop, so it must never depend on a model choosing to call it.
 """
 
+from pydantic import BaseModel, Field
+
 from agents.tools.base import AgentTool, ToolResult
+
+
+class SyntaxCheckArgs(BaseModel):
+    code: str = Field(description="The code to validate.")
+    language: str = Field(description="Target language, e.g. python, java, go.")
+    version: str = Field(default="", description="Target language version.")
 
 
 class SyntaxCheckTool(AgentTool):
@@ -21,6 +29,7 @@ class SyntaxCheckTool(AgentTool):
         "Validate that code is syntactically correct for a target language and "
         "version. Returns validity plus any error diagnostics with line numbers."
     )
+    args_schema = SyntaxCheckArgs
     parameters = {
         "code": "the code to validate",
         "language": "target language (e.g. python, java, go)",

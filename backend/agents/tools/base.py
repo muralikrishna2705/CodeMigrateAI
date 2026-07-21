@@ -4,25 +4,38 @@ Agents call tools *actively* — they decide when a tool runs and with what
 arguments — rather than receiving pre-computed state from an upstream pass. This
 module is the contract that makes that possible.
 
-Why a plain ABC and not ``langchain_core.tools.BaseTool``: wrapping BaseTool only
-pays off when something calls ``bind_tools`` on the model so the LLM can emit
-native tool calls. This project talks to Ollama's ``/api/generate``, which has no
-``tools`` parameter, so nothing can bind them. The BaseTool wrapper would be
-inert ceremony. ``ToolRegistry.describe`` instead renders a prompt-facing catalog
-for the prompt-driven selection path (see ``BaseAgent._select_tool``), which is
-the only tool-selection mechanism this LLM stack can actually support.
+Tools are usable two ways, from one definition:
+
+**Directly**, by an agent that knows what it wants — ``self._call_tool("vector_db",
+query=...)``. This is the deterministic path and it stays exactly as it was.
+
+**Natively**, by the model itself. :meth:`AgentTool.as_langchain_tool` adapts a
+tool into a ``langchain_core.tools.StructuredTool`` so it can be bound with
+``bind_tools`` and executed by ``langgraph.prebuilt.ToolNode``. The model emits a
+real tool call against the declared ``args_schema`` instead of being asked to
+describe one in prose.
+
+The adapter approach is deliberate: it keeps the timeout, the error capture, and
+the ``ToolResult`` contract in one place, so the native path inherits all three
+rather than reimplementing them per ``@tool`` function.
 
 Tools never raise. Every call returns a :class:`ToolResult`, with failures
 carried in ``error``, because tool calls are best-effort enrichment: a tool that
-is down must degrade the result, never fail the migration.
+is down must degrade the result, never fail the migration. On the native path
+that failure is handed back to the model as text, so it can react — retry with a
+different query, or choose another tool — rather than aborting the run.
 """
 
 import asyncio
+import json
 import logging
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
+
+from langchain_core.tools import BaseTool, StructuredTool
+from pydantic import BaseModel
 
 log = logging.getLogger("CodeMigrateAI.Tools")
 
@@ -52,6 +65,28 @@ class ToolResult:
             "duration_ms": self.duration_ms,
         }
 
+    def for_model(self) -> str:
+        """What the model reads back after calling this tool.
+
+        A failure is reported as text rather than raised, so the model can react
+        to it — pick a different tool, broaden a query — instead of the run
+        aborting. That is the whole reason tools never raise.
+        """
+        if not self.success:
+            return f"ERROR: {self.error or 'tool failed'}"
+        parts = [self.summary] if self.summary else []
+        payload = self.data
+        if isinstance(payload, dict):
+            # `context` is pre-rendered prose meant for a prompt; anything else
+            # is structured and reads better as compact JSON than as a repr.
+            if payload.get("context"):
+                parts.append(str(payload["context"]))
+            else:
+                parts.append(json.dumps(payload, default=str)[:4000])
+        elif payload is not None:
+            parts.append(str(payload)[:4000])
+        return "\n".join(p for p in parts if p) or "(no result)"
+
 
 @dataclass
 class ToolCall:
@@ -72,10 +107,14 @@ class AgentTool(ABC):
 
     name: str = "tool"
     description: str = ""
-    # JSON-schema-shaped argument spec. Not fed to a native tool-calling API
-    # (Ollama's generate endpoint has none) — it renders into the selection
-    # prompt and documents the call signature for humans.
+    # Human-readable argument summary, used by ``ToolRegistry.describe`` and in
+    # reports. The authoritative machine-readable spec is ``args_schema``.
     parameters: dict[str, str] = {}
+    #: Pydantic model describing this tool's arguments. Required for the native
+    #: tool-calling path — it becomes the JSON schema the model fills in — and
+    #: its field descriptions are what the model actually reads, so write them
+    #: as instructions rather than labels.
+    args_schema: "type[BaseModel] | None" = None
 
     #: Per-call ceiling. A hung tool must not hang the migration.
     timeout_sec: float = 20.0
@@ -133,6 +172,32 @@ class AgentTool(ABC):
             "parameters": dict(self.parameters),
         }
 
+    def as_langchain_tool(self) -> BaseTool:
+        """Adapt this tool for ``bind_tools`` / ``ToolNode``.
+
+        The returned tool is coroutine-only: every ``AgentTool`` is async, and
+        offering a sync entry point would mean either blocking an event loop or
+        quietly spawning one. Callers on the native path are async already.
+        """
+        if self.args_schema is None:
+            raise ValueError(
+                f"Tool {self.name!r} declares no args_schema and cannot be bound "
+                "for native tool calling."
+            )
+
+        async def _run(**kwargs) -> str:
+            return (await self(**kwargs)).for_model()
+
+        return StructuredTool(
+            name=self.name,
+            description=self.description,
+            args_schema=self.args_schema,
+            coroutine=_run,
+            # Errors already come back inside ToolResult.for_model as text, so
+            # LangChain's own exception handling has nothing left to catch.
+            handle_tool_error=False,
+        )
+
 
 class ToolRegistry:
     """Name -> tool lookup, O(1) via a plain dict.
@@ -171,18 +236,24 @@ class ToolRegistry:
         """
         return ToolRegistry([self._tools[n] for n in names if n in self._tools])
 
-    def describe(self) -> str:
-        """Render the catalog for a tool-selection prompt."""
-        lines = []
-        for tool in self._tools.values():
-            args = ", ".join(
-                f"{key}: {desc}" for key, desc in (tool.parameters or {}).items()
-            )
-            lines.append(f"- {tool.name}({args}) — {tool.description}")
-        return "\n".join(lines)
-
     def specs(self) -> list[dict]:
         return [tool.spec() for tool in self._tools.values()]
+
+    def as_langchain_tools(self) -> list[BaseTool]:
+        """Every bindable tool in this registry, for ``bind_tools``/``ToolNode``.
+
+        Tools without an ``args_schema`` are skipped rather than raising: a tool
+        can be perfectly usable on the direct path while not yet being worth
+        exposing to the model, and one such tool must not make the whole
+        registry unbindable.
+        """
+        bindable = []
+        for tool in self._tools.values():
+            if tool.args_schema is None:
+                log.debug("Tool %s has no args_schema; not bindable", tool.name)
+                continue
+            bindable.append(tool.as_langchain_tool())
+        return bindable
 
     def __getitem__(self, name: str) -> AgentTool:
         return self._tools[name]

@@ -18,9 +18,23 @@ import logging
 
 from llm.structured import coerce_or_none
 from models.schemas import Critique
+from pydantic import BaseModel, Field
 
 from agents.base import ReflectionResult
 from agents.tools.base import AgentTool, ToolResult
+
+
+class ReflectArgs(BaseModel):
+    output: str = Field(description="The text or code to critique.")
+    criteria: str = Field(
+        default="", description="What to judge it against, comma-separated."
+    )
+    stage: str = Field(
+        default="output", description="What kind of output it is, e.g. 'migrated code'."
+    )
+    context: str = Field(
+        default="", description="Extra context such as prior errors."
+    )
 
 log = logging.getLogger("CodeMigrateAI.Reflection")
 
@@ -158,6 +172,7 @@ class ReflectionTool(AgentTool):
         "Returns a 0.0-1.0 confidence, a recommendation (pass / re-generate / "
         "gather-more-info), and actionable feedback."
     )
+    args_schema = ReflectArgs
     parameters = {
         "output": "the text/code to critique",
         "criteria": "what to judge it against (optional)",

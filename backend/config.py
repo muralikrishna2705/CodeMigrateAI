@@ -156,11 +156,15 @@ class Settings(BaseSettings):
     tool_code_metrics_enabled: bool = True
     tool_syntax_check_enabled: bool = True
     tool_source_reader_enabled: bool = True
-    # Off by default: the only tool that reaches the public internet, and the
-    # DuckDuckGo HTML endpoint it uses rate-limits datacenter IPs.
-    tool_web_search_enabled: bool = False
-    # Off by default: the memory collection is empty until migrations have run.
-    tool_semantic_search_enabled: bool = False
+    # Reaches the public internet (official documentation domains only). On by
+    # default now that it backs hallucinated-import verification, which is the
+    # one check the local corpus structurally cannot perform — it can only ever
+    # confirm what it already contains.
+    tool_web_search_enabled: bool = True
+    # The memory collection is empty until migrations have run, so early runs get
+    # nothing from this. That is a miss, not a failure, and it becomes useful on
+    # its own as migrations accumulate.
+    tool_semantic_search_enabled: bool = True
 
     # Persistent memory (Dimension 5)
     #
@@ -203,12 +207,13 @@ class Settings(BaseSettings):
     # none, since it grounds new code in a precedent that doesn't really apply.
     memory_min_score: float = 0.8
 
-    # Retriever tool loop: when on, the RetrieverAgent asks the LLM which tool to
-    # call and with what query, instead of running one heuristic retrieval pass.
-    # Off by default — deepseek-coder:1.3b is not tool-call trained, so selection
-    # is prompt-driven and unreliable; any failure falls back to the heuristic
-    # pass, which is exactly the pre-tool behaviour.
-    retriever_tool_loop: bool = False
+    # Retriever tool loop: the model sees the retrieval tools, emits native tool
+    # calls, reads the results, and searches again with a better query when the
+    # first answer is thin. On by default — this was off while selection was
+    # prompt-driven and a nonsense choice was routine; a tool-calling model emits
+    # a schema-validated call instead. Any failure still falls back to the
+    # heuristic single pass, so the worst case is the pre-tool behaviour.
+    retriever_tool_loop: bool = True
     retriever_max_tool_calls: int = 3
 
     # RAG Pipeline (Phase 2)

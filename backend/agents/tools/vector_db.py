@@ -12,8 +12,32 @@ Both paths share ``RAGPipeline``'s filter ladder, ranking, and cache, so
 on-demand queries are grounded exactly the way the passive ones are.
 """
 
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
 from agents.tools.base import AgentTool, ToolResult
 from rag.retrieval_pipeline import RAGPipeline, RetrievalRequest
+
+
+class VectorDBArgs(BaseModel):
+    query: str = Field(
+        description=(
+            "A specific question or API/symbol name. Prefer 'Java 21 replacement "
+            "for ExecutorService' over 'concurrency'."
+        )
+    )
+    target_language: str = Field(
+        default="", description="Restrict results to this language."
+    )
+    target_version: str = Field(default="", description="Prefer this version's docs.")
+    intent: Literal["", "precise", "exploratory", "verify"] = Field(
+        default="",
+        description=(
+            "'precise' when you want one exact answer, 'exploratory' when casting "
+            "wide for options, 'verify' for a plain existence check."
+        ),
+    )
 
 
 class VectorDBTool(AgentTool):
@@ -23,6 +47,7 @@ class VectorDBTool(AgentTool):
         "guides. Use to find how a specific API, library, or construct is "
         "written in the target language."
     )
+    args_schema = VectorDBArgs
     parameters = {
         "query": "what to search for, as a specific question or API/symbol name",
         "target_language": "language to restrict results to (optional)",
