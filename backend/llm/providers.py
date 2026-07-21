@@ -42,10 +42,14 @@ Role = Literal["main", "fast"]
 #: empty. Keeping them here (rather than as literal defaults in Settings) is what
 #: lets one `llm_provider` switch carry the whole model triple with it — an
 #: Ollama run must not inherit `gemini-2.5-flash` as its model name.
+# Verified against the live generateContent endpoint, not the /models listing:
+# that listing still advertises the 2.5 flash models, which 404 for accounts
+# created after their retirement ("no longer available to new users"). A model
+# id is only real if a call to it succeeds.
 DEFAULT_MODELS: dict[str, dict[str, str]] = {
     "google_genai": {
-        "main": "gemini-2.5-flash",
-        "fast": "gemini-2.5-flash-lite",
+        "main": "gemini-3.5-flash",
+        "fast": "gemini-3.1-flash-lite",
         "embed": "gemini-embedding-001",
     },
     "ollama": {

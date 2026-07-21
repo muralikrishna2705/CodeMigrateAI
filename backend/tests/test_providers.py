@@ -21,13 +21,22 @@ def _settings(**overrides) -> Settings:
 
 class TestModelResolution:
     def test_roles_resolve_to_distinct_provider_defaults(self):
+        # Asserted against DEFAULT_MODELS rather than against literal model ids.
+        # Pinning the strings here bought nothing and aged badly: when Google
+        # retired the 2.5 flash models for new accounts this test kept passing
+        # while every real call 404'd, which is the exact inversion of what a
+        # test is for.
         s = _settings(llm_provider="google_genai")
-        assert providers.resolve_model_name("main", s) == "gemini-2.5-flash"
-        assert providers.resolve_model_name("fast", s) == "gemini-2.5-flash-lite"
+        defaults = providers.DEFAULT_MODELS["google_genai"]
+        assert providers.resolve_model_name("main", s) == defaults["main"]
+        assert providers.resolve_model_name("fast", s) == defaults["fast"]
+        assert defaults["main"] != defaults["fast"], (
+            "the fast role exists to be cheaper than the main one"
+        )
 
     def test_explicit_setting_beats_the_provider_default(self):
-        s = _settings(llm_provider="google_genai", llm_model="gemini-2.5-pro")
-        assert providers.resolve_model_name("main", s) == "gemini-2.5-pro"
+        s = _settings(llm_provider="google_genai", llm_model="some-pinned-model")
+        assert providers.resolve_model_name("main", s) == "some-pinned-model"
 
     def test_switching_provider_carries_the_whole_model_set(self):
         # The failure this guards: an Ollama run inheriting a Gemini model id,

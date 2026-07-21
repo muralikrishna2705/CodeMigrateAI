@@ -9,6 +9,34 @@ KEY_NAMESPACE = "migrate"
 _UNSAFE = re.compile(r"[^A-Za-z0-9_.+-]")
 
 
+def normalize_source(source: str) -> str:
+    """Fold away source edits that cannot change the migration.
+
+    Hashing raw bytes makes the cache miss on differences no migration would
+    ever reflect. The common one is not a code change at all: the same file
+    checked out on Windows and on Linux differs in every line ending, so a
+    CRLF/LF flip misses the entire cache.
+
+    Deliberately conservative. It normalizes line endings, strips trailing
+    whitespace, and trims leading/trailing blank lines — edits that are
+    invisible to a parser *and* to the model reading the file.
+
+    It specifically does **not** strip comments, which was the obvious next
+    step and is wrong: the migrator carries comments through to the output, so
+    two sources differing only in their comments have genuinely different
+    correct migrations. Treating them as one cache entry would hand the second
+    caller the first caller's comments — a wrong answer, silently, with no
+    error anywhere. Nor does it touch indentation, which is syntax in Python.
+    """
+    text = source.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.rstrip() for line in text.split("\n")]
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+    return "\n".join(lines)
+
+
 def _segment(value: str) -> str:
     """Normalize one key component into a single, separator-safe level."""
     return _UNSAFE.sub("_", (value or "any").strip().lower()) or "any"
@@ -46,11 +74,11 @@ def generate_key(state: MigrationState) -> str:
     ``migrate:<hash>`` forces the alternative — drop the whole cache, including
     the unaffected majority.
 
-    Uniqueness is unchanged: the full SHA-256 of the same content still
-    terminates the key.
+    The digest is taken over :func:`normalize_source` rather than the raw text,
+    so formatting-only differences (line endings above all) hit the same entry.
     """
     content = (
-        f"{state.source_code}|"
+        f"{normalize_source(state.source_code)}|"
         f"{state.source_language}|{state.source_version}|"
         f"{state.target_language}|{state.target_version}"
     )

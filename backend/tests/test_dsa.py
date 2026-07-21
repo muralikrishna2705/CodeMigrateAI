@@ -195,6 +195,33 @@ class TestCacheKeys:
         b = _State("python", "3.8", "java", "21", "x = 2")
         assert generate_key(a) != generate_key(b)
 
+    def test_line_endings_do_not_split_the_cache(self):
+        # The same file checked out on Windows and on Linux differs in every
+        # line ending. Hashing raw bytes made that a total cache miss.
+        unix = _State("python", "3.8", "java", "21", "a = 1\nb = 2\n")
+        windows = _State("python", "3.8", "java", "21", "a = 1\r\nb = 2\r\n")
+        assert generate_key(unix) == generate_key(windows)
+
+    def test_trailing_whitespace_does_not_split_the_cache(self):
+        a = _State("python", "3.8", "java", "21", "x = 1")
+        b = _State("python", "3.8", "java", "21", "x = 1   \n\n")
+        assert generate_key(a) == generate_key(b)
+
+    def test_comments_still_split_the_cache(self):
+        # Not an oversight. The migrator carries comments through to its
+        # output, so two sources differing only in comments have different
+        # correct migrations — folding them together would serve one caller
+        # the other's comments with nothing to signal the substitution.
+        a = _State("python", "3.8", "java", "21", "x = 1  # keep\n")
+        b = _State("python", "3.8", "java", "21", "x = 1  # drop\n")
+        assert generate_key(a) != generate_key(b)
+
+    def test_indentation_still_splits_the_cache(self):
+        # Whitespace is syntax in Python; these are different programs.
+        a = _State("python", "3.8", "java", "21", "if x:\n    y = 1\n")
+        b = _State("python", "3.8", "java", "21", "if x:\n        y = 1\n")
+        assert generate_key(a) != generate_key(b)
+
     def test_missing_version_still_fills_its_level(self):
         key = generate_key(_State("python", "", "java", "", "x = 1"))
         assert key.startswith(f"{KEY_NAMESPACE}:python:any:java:any:")

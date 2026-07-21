@@ -21,9 +21,27 @@ the agentic paths require. `LLM_PROVIDER=ollama` switches to local inference,
 but Ollama's `/api/generate` has no `tools` parameter, so the tool loop and
 structured routing fall back to their deterministic paths there.
 
-> **Rate limits are the latency ceiling, not compute.** One migration makes
-> 8–15 model calls. On a free tier (~10 RPM) leave `LLM_REQUESTS_PER_SECOND` at
-> its default and expect roughly one migration per minute.
+### Measured latency
+
+One real Java 8 → Python 3.12 migration, `gemini-3.5-flash` + `gemini-3.1-flash-lite`,
+shipped defaults, RAG off:
+
+| | |
+| --- | --- |
+| Wall clock | **38.3 s** |
+| Model calls | **5** (4 fast, 1 main) |
+| Time inside the model | 37.1 s |
+| Time waiting on the rate limiter | 1.2 s |
+
+**The model is the ceiling, not the rate limiter** — which corrects the
+assumption this project was tuned around. Individual calls take 5–10 s because
+the prompts are large, so at `LLM_REQUESTS_PER_SECOND=0.16` the limiter almost
+never makes anything wait. Raising it does not speed up a single migration; it
+matters for concurrent branches and concurrent users. The levers that do move
+this number are fewer calls and shorter prompts.
+
+`thinking_budget=0` on the fast role is real but modest — about 15% on a short
+routing call, less on a long one.
 
 ## Pipeline architecture
 
