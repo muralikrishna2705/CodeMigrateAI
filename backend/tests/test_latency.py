@@ -219,18 +219,19 @@ class TestGraphWork:
     ):
         """Total bytes each node hands back to LangGraph.
 
-        Every node currently returns the *whole* accumulated state, so this grows
-        quadratically with the number of nodes: superstep N re-serializes
-        everything the first N-1 produced. Phase 3's delta writeback is what
-        collapses it. Recorded here so the improvement is measurable rather than
-        asserted, with a ceiling that catches it getting worse.
+        Nodes returning the whole accumulated state made this grow
+        quadratically: superstep N re-serialized everything the first N-1 had
+        produced. Under the delta contract each node claims only what it
+        changed, which took an 8-node run from 24.6 KB to 4.2 KB and flattened
+        the growth curve — the per-node size now tracks what the node produced,
+        not how late in the run it happens to sit.
         """
         real_writeback = graph_nodes.writeback
-        sizes: list[int] = []
+        payloads: list[dict] = []
 
         def _measured(state, mig_state):
             result = real_writeback(state, mig_state)
-            sizes.append(len(json.dumps(result, default=str)))
+            payloads.append(result)
             return result
 
         monkeypatch.setattr(graph_nodes, "writeback", _measured)
@@ -238,13 +239,26 @@ class TestGraphWork:
         settings = settings_override(**_config())
         _, result = asyncio.run(_migrate(settings))
 
-        assert sizes, "no node wrote back; the probe missed"
+        assert payloads, "no node wrote back; the probe missed"
         assert result.migrated_code
-        total_kb = sum(sizes) / 1024
-        # Measured at ~20 KB for an 8-node run over a 5-line source file. The
-        # ceiling is generous because the payload scales with source size; what
-        # it catches is the growth *rate* changing.
-        assert total_kb < 200, f"{total_kb:.1f} KB written back across {len(sizes)} nodes"
+
+        total_kb = sum(len(json.dumps(p, default=str)) for p in payloads) / 1024
+        # Measured at 4.2 KB across 8 nodes. The ceiling scales with source size,
+        # so it is loose enough for a larger fixture and far below the 24.6 KB
+        # the full-state contract cost.
+        assert total_kb < 12, f"{total_kb:.1f} KB across {len(payloads)} nodes"
+
+        # The sharpest statement of the contract: migration inputs are written
+        # once when the graph is invoked and never again, so a node echoing one
+        # back is returning state it did not produce.
+        for payload in payloads:
+            for field in ("source_code", "source_language", "target_version"):
+                assert field not in payload, f"{field} echoed back in a node delta"
+
+        widest = max(len(p) for p in payloads)
+        # Measured at 5 keys (the migrate node). 35 was the old figure — every
+        # node returned every field in the schema.
+        assert widest <= 10, f"a node returned {widest} keys"
 
 
 class TestWallClock:

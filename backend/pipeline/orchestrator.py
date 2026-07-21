@@ -167,21 +167,36 @@ class Pipeline:
         # whenever a checkpointer is attached, so it is always supplied.
         run_config = {"configurable": {"thread_id": state.session_id or uuid.uuid4().hex}}
 
+        # Two stream modes, because each answers a question the other cannot.
+        #
+        # "updates" carries the node name, which the SSE events are keyed on,
+        # but its payload is now only that node's delta — so it can no longer
+        # stand in for the final state. "values" carries the full accumulated
+        # state after each superstep but says nothing about who produced it.
+        #
+        # Taking only "updates" and treating the last payload as the result is
+        # precisely the latent bug this replaces: it was correct only while
+        # every node happened to return the whole state.
         final_graph_state = graph_state
         try:
-            async for chunk in self._graph.astream(
-                graph_state, config=run_config, stream_mode="updates"
+            async for mode, chunk in self._graph.astream(
+                graph_state, config=run_config, stream_mode=["updates", "values"]
             ):
-                for _node_name, node_state in chunk.items():
-                    final_graph_state = node_state
-                    reports = node_state.get("reports") or []
+                if mode == "values":
+                    final_graph_state = chunk
+                    continue
+                for node_name, node_delta in chunk.items():
+                    # A node that changed nothing (a self-skipping gate, an open
+                    # circuit) now returns {} rather than the state, so there is
+                    # nothing to announce.
+                    reports = (node_delta or {}).get("reports") or []
                     if not reports or not stream_handler:
                         continue
-                    # astream("updates") only yields once a node has finished,
-                    # so start/complete fire back-to-back rather than framing
-                    # the node's actual runtime.
+                    # astream only yields once a node has finished, so
+                    # start/complete fire back-to-back rather than framing the
+                    # node's actual runtime.
                     report = reports[-1]
-                    agent_name = report.get("agent", _node_name)
+                    agent_name = report.get("agent", node_name)
                     await stream_handler.send_agent_start(
                         agent_name, f"Starting {agent_name}..."
                     )

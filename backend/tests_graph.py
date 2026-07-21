@@ -301,7 +301,12 @@ async def test_migrator_failure_ends_without_validate_or_fix():
     finally:
         nodes.set_llm_client(None)
 
-    assert result["migrated_code"] == ""
+    # Absent, not empty. Nodes return only what they changed, so a channel no
+    # node ever wrote holds no value at all — and the migrator failed before it
+    # produced any code. The app seeds every key up front (see
+    # Pipeline._run_graph), so this shape is specific to invoking the compiled
+    # graph directly with a minimal state.
+    assert result.get("migrated_code", "") == ""
     assert "ValidatorAgent" not in result["agents_completed"]
     assert "FixerAgent" not in result["agents_completed"]
     assert any("MigratorAgent" in e for e in result["errors"])

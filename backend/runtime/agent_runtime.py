@@ -40,17 +40,19 @@ class Runtime:
             writeback,
         )
 
+        # Both guards return a *delta*, like every other path out of this
+        # method. Returning ``state`` here would hand the accumulated history
+        # back to additive reducers, duplicating every report the run had
+        # produced so far — and a skipped agent would be the most expensive
+        # node in the graph.
         if agent_recovery.is_circuit_open(agent_name):
             log.warning("Circuit open for %s; skipping node", agent_name)
-            return state
+            return {}
 
         agent_cls = BaseAgent.get_registry().get(agent_name)
         if not agent_cls:
             log.error("Agent %s not found in registry", agent_name)
-            state["errors"] = state.get("errors", []) + [
-                f"Agent {agent_name} not found"
-            ]
-            return state
+            return {"errors": [f"Agent {agent_name} not found"]}
 
         mig_state = hydrate_state(state)
         # Data-driven DI: resolve exactly the dependencies the agent declares it

@@ -373,6 +373,13 @@ class TestSubgraphs:
 
 
 class TestParallelNode:
+    """A self-skip contributes an empty delta, not the state it was handed.
+
+    Nodes return only what they changed, so "I did nothing" is ``{}``. Handing
+    back the inbound state would feed the whole accumulated history to the
+    additive reducers on ``GraphState`` and duplicate every report in the run.
+    """
+
     @pytest.mark.asyncio
     async def test_self_skips_when_disabled(self):
         from graph.nodes import parallel_node
@@ -380,21 +387,21 @@ class TestParallelNode:
         state = _graph_state(
             parallel_enabled=False, parallel_tasks=["analysis", "retrieval"]
         )
-        assert await parallel_node(state) is state
+        assert await parallel_node(state) == {}
 
     @pytest.mark.asyncio
     async def test_self_skips_without_concurrent_work(self):
         from graph.nodes import parallel_node
 
         state = _graph_state(parallel_enabled=True, parallel_tasks=["retrieval"])
-        assert await parallel_node(state) is state
+        assert await parallel_node(state) == {}
 
     @pytest.mark.asyncio
     async def test_self_skips_on_unseeded_state(self):
         from graph.nodes import parallel_node
 
         state = _graph_state()
-        assert await parallel_node(state) is state
+        assert await parallel_node(state) == {}
 
 
 # --- End-to-end through the real compiled graph ---------------------------
