@@ -28,6 +28,8 @@ import re
 from collections import Counter
 from typing import Iterable, Optional
 
+from dsa import Trie
+
 from .memory_store import MemoryStore, hash_code, make_entry_id, pair_key
 
 log = logging.getLogger("CodeMigrateAI.MigrationMemory")
@@ -39,56 +41,37 @@ _MAX_EXCERPT_CHARS = 1500
 _TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]+")
 
 
-class _TrieNode:
-    __slots__ = ("children", "entry_ids")
-
-    def __init__(self) -> None:
-        self.children: dict[str, "_TrieNode"] = {}
-        self.entry_ids: list[str] = []
-
-
 class LanguagePairTrie:
     """Prefix index over ``"<source>><target>"`` keys.
 
-    ``insert``/``search`` are O(k) in the key length — independent of how many
-    migrations are stored, which is the point: the candidate filter must not get
-    slower as memory grows.
+    A thin multimap over the shared :class:`dsa.trie.Trie` — one language pair
+    maps to many entry ids. ``insert``/``search`` are O(k) in the key length,
+    independent of how many migrations are stored, which is the point: the
+    candidate filter must not get slower as memory grows.
     """
 
     def __init__(self) -> None:
-        self._root = _TrieNode()
+        self._trie = Trie()
         self._size = 0
 
     def insert(self, key: str, entry_id: str) -> None:
-        node = self._root
-        for char in key:
-            node = node.children.setdefault(char, _TrieNode())
-        if entry_id not in node.entry_ids:
-            node.entry_ids.append(entry_id)
+        entry_ids = self._trie.get(key)
+        if entry_ids is None:
+            entry_ids = []
+            self._trie.insert(key, entry_ids)
+        if entry_id not in entry_ids:
+            entry_ids.append(entry_id)
             self._size += 1
 
     def search(self, key: str) -> list[str]:
         """Exact-key lookup: entry ids for precisely this language pair."""
-        node = self._root
-        for char in key:
-            node = node.children.get(char)
-            if node is None:
-                return []
-        return list(node.entry_ids)
+        return list(self._trie.get(key) or ())
 
     def search_prefix(self, prefix: str) -> list[str]:
         """All entry ids under ``prefix`` (e.g. ``"java>"`` -> every java source)."""
-        node = self._root
-        for char in prefix:
-            node = node.children.get(char)
-            if node is None:
-                return []
         found: list[str] = []
-        stack = [node]
-        while stack:
-            current = stack.pop()
-            found.extend(current.entry_ids)
-            stack.extend(current.children.values())
+        for _, entry_ids in self._trie.items_with_prefix(prefix):
+            found.extend(entry_ids)
         return found
 
     def __len__(self) -> int:

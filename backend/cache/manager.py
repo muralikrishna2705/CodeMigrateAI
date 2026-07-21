@@ -1,41 +1,23 @@
 import logging
-from collections import OrderedDict
 from typing import Optional
 
 import redis
+from cache.keys import KEY_NAMESPACE, key_prefix
 from config import get_settings
+from dsa import PrefixLRU
 from models.state import MigrationState
 
 log = logging.getLogger("CodeMigrateAI.Cache")
 
 
-class LRUCache:
-    def __init__(self, maxsize: int = 500):
-        self._cache = OrderedDict()
-        self._maxsize = maxsize
+class LRUCache(PrefixLRU[MigrationState]):
+    """Local migration-state cache.
 
-    def get(self, key: str) -> Optional[MigrationState]:
-        if key not in self._cache:
-            return None
-        value = self._cache.pop(key)
-        self._cache[key] = value
-        return value
-
-    def set(self, key: str, value: MigrationState):
-        if key in self._cache:
-            self._cache.pop(key)
-        elif len(self._cache) >= self._maxsize:
-            self._cache.popitem(last=False)
-        self._cache[key] = value
-
-    def clear(self):
-        self._cache.clear()
-
-    def __len__(self):
-        return len(self._cache)
-
-    def __contains__(self, key: str):
-        return key in self._cache
+    Recency comes from the ``OrderedDict`` in :class:`~dsa.lru.PrefixLRU`; the
+    trie beside it is what lets :meth:`CacheManager.invalidate` drop one
+    migration family — every entry into Java 21, say — without touching the rest
+    of the cache or walking every key to find them.
+    """
 
 
 class CacheManager:
@@ -99,15 +81,53 @@ class CacheManager:
 
     def clear(self):
         self.local.clear()
-        r = self.redis
-        if r:
-            try:
-                keys = r.keys("migrate:*")
-                if keys:
-                    r.delete(*keys)
-            except Exception:
-                pass
+        self._redis_delete(f"{KEY_NAMESPACE}:*")
         log.info("Cache cleared")
+
+    def invalidate(
+        self,
+        source_language: str = "",
+        source_version: str = "",
+        target_language: str = "",
+        target_version: str = "",
+    ) -> int:
+        """Evict one migration family — e.g. every migration into Java 21.
+
+        The narrow alternative to ``clear``: when a language profile changes or
+        a target's RAG corpus is re-indexed, only migrations touching it are
+        stale. Returns the number of local entries dropped; Redis deletes by the
+        same prefix but does not report a count.
+        """
+        prefix = key_prefix(
+            source_language, source_version, target_language, target_version
+        )
+        removed = self.local.invalidate_prefix(prefix)
+        self._redis_delete(f"{prefix}*")
+        log.info("Invalidated %d local entries under %s", removed, prefix)
+        return removed
+
+    def _redis_delete(self, pattern: str) -> None:
+        """Delete keys matching ``pattern`` without blocking the server.
+
+        ``KEYS`` scans the entire keyspace in one uninterruptible pass, which
+        stalls every other client on a shared Redis. ``scan_iter`` walks it in
+        cursor-sized batches instead, and deleting in batches keeps the argument
+        list bounded on a large keyspace.
+        """
+        r = self.redis
+        if not r:
+            return
+        try:
+            batch: list[str] = []
+            for key in r.scan_iter(match=pattern, count=500):
+                batch.append(key)
+                if len(batch) >= 500:
+                    r.delete(*batch)
+                    batch.clear()
+            if batch:
+                r.delete(*batch)
+        except Exception as e:
+            log.warning("Redis delete for %s failed: %s", pattern, e)
 
     def stats(self) -> dict:
         return {

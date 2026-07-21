@@ -214,6 +214,68 @@ def test_prompt_composer_composes_and_caches():
     assert composer.cache_size() == 1
 
 
+def _compose(composer, code, *, source_version="8", target_version="3.12"):
+    return composer.compose(
+        source_profile=get_profile("java"),
+        target_profile=get_profile("python"),
+        source_version=source_version,
+        target_version=target_version,
+        source_code=code,
+        analyzer_context={"total_lines": 1},
+        migration_type="convert_language",
+    )
+
+
+def test_prompt_composer_reuses_sections_across_different_files():
+    # The four code-independent sections are the bulk of the prompt; migrating a
+    # second file of the same language pair must not rebuild them.
+    composer = PromptComposer()
+    first = _compose(composer, "int a = 1;")
+    second = _compose(composer, "int b = 2;")
+
+    assert first != second  # different source sections
+    assert composer.cache_size() == 2  # two distinct full prompts
+    assert composer.section_cache_size() == 1  # one shared family
+
+
+def test_prompt_composer_separates_families():
+    composer = PromptComposer()
+    _compose(composer, "int a = 1;", target_version="3.12")
+    _compose(composer, "int a = 1;", target_version="3.9")
+    # A different target version is a different family: the version constraints
+    # and guidance sections genuinely differ.
+    assert composer.section_cache_size() == 2
+
+
+def test_prompt_composer_section_order_is_unchanged():
+    composer = PromptComposer()
+    prompt = _compose(composer, "int a = 1;")
+    order = [
+        "migration engineer",
+        "LANGUAGE GUIDANCE",
+        "VERSION CONSTRAINTS",
+        "ANALYZER CONTEXT",
+        "FEW-SHOT EXAMPLES",
+        "SOURCE CODE",
+        "OUTPUT FORMAT",
+    ]
+    positions = [prompt.index(marker) for marker in order]
+    assert positions == sorted(positions)
+
+
+def test_prompt_composer_invalidates_by_source_language():
+    composer = PromptComposer()
+    _compose(composer, "int a = 1;")
+    assert composer.cache_size() == 1
+
+    assert composer.invalidate("python") == 0  # different source language
+    assert composer.cache_size() == 1
+
+    assert composer.invalidate("java") == 1
+    assert composer.cache_size() == 0
+    assert composer.section_cache_size() == 0
+
+
 @pytest.mark.asyncio
 async def test_migrator_single_call_sets_plan_and_code():
     response = json.dumps(

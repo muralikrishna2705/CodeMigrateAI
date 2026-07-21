@@ -8,6 +8,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 
 from config import get_settings
+from dsa import top_k
 
 log = logging.getLogger("CodeMigrateAI.RAGPipeline")
 
@@ -89,17 +90,20 @@ def merge_hits(hitlists: list[list[tuple]], k: int) -> list[tuple]:
 
     Used by the multi-pass strategies (multi-query, multi-hop, CRAG) to combine
     the results of several retrievals into one ranked, deduplicated list. Dedup
-    is by page-content hash — the same identity ``RAGPipeline._rrf_merge`` uses —
-    so a document that surfaces for several sub-queries is counted once, at its
+    is by page content — the same identity ``RAGPipeline._rrf_merge`` uses — so a
+    document that surfaces for several sub-queries is counted once, at its
     highest observed score.
+
+    Selection is a bounded heap: only ``k`` of the fused candidates are ever
+    wanted, so ordering all of them costs O(N log N) to throw most of it away.
     """
     best: dict[str, tuple] = {}
     for hits in hitlists:
         for doc, score in hits:
-            key = hashlib.sha256(doc.page_content.encode()).hexdigest()
-            if key not in best or score > best[key][1]:
-                best[key] = (doc, score)
-    return sorted(best.values(), key=lambda pair: pair[1], reverse=True)[:k]
+            current = best.get(doc.page_content)
+            if current is None or score > current[1]:
+                best[doc.page_content] = (doc, score)
+    return top_k(best.values(), k)
 
 
 class RetrievalStrategy(ABC):
@@ -343,20 +347,22 @@ class RAGPipeline:
         fused: dict[str, float] = {}
         best: dict[str, tuple] = {}
 
-        def _key(doc):
-            return hashlib.sha256(doc.page_content.encode()).hexdigest()
-
+        # Page content is the document identity, used directly as the dict key.
+        # Digesting it first bought nothing: dict lookup already hashes the
+        # string (once, cached on the object) and then confirms by equality, so
+        # the extra pass was pure work that also introduced a collision surface.
         for rank, (doc, score) in enumerate(vector_hits):
-            key = _key(doc)
+            key = doc.page_content
             fused[key] = fused.get(key, 0.0) + 1.0 / (rrf_k + rank + 1)
             best[key] = (doc, score)
         for rank, (doc, ratio) in enumerate(keyword_hits):
-            key = _key(doc)
+            key = doc.page_content
             fused[key] = fused.get(key, 0.0) + 1.0 / (rrf_k + rank + 1)
             best.setdefault(key, (doc, ratio))  # keep vector score if already seen
 
-        ordered = sorted(fused, key=lambda key: fused[key], reverse=True)[:k]
-        return [best[key] for key in ordered]
+        # Ties are routine in RRF, so the tie-break must not shift: nlargest
+        # breaks toward the earlier element, matching the stable sort it replaces.
+        return [best[key] for key in top_k(fused, k, key=fused.__getitem__)]
 
     async def _retrieve(self, query: str, symbols: list[str], where: dict | None):
         """One retrieval pass: vector leg, optionally fused with the keyword leg."""
@@ -423,12 +429,15 @@ class RAGPipeline:
         return []
 
     @staticmethod
-    def _rank(results, target_version, settings):
+    def _rank(results, target_version, settings, limit: int | None = None):
         """Re-order hits by base relevance plus small authority boosts.
 
         The displayed score stays the raw relevance; only the ordering shifts so
         exact-version, official, and migration docs win ties without masking a
         genuinely more relevant (higher-cosine) example.
+
+        ``limit`` selects the top hits through a bounded heap instead of ordering
+        the whole ladder result; omit it to rank everything.
         """
         migration_types = set(settings.rag_migration_doc_types)
 
@@ -443,9 +452,12 @@ class RAGPipeline:
                 boost += settings.rag_rank_weight_migration
             return boost
 
-        return sorted(
-            results, key=lambda pair: pair[1] + _boost(pair[0]), reverse=True
-        )
+        def _ranked(pair):
+            return pair[1] + _boost(pair[0])
+
+        if limit is None:
+            return sorted(results, key=_ranked, reverse=True)
+        return top_k(results, limit, key=_ranked)
 
     async def run_query(
         self,
@@ -475,7 +487,7 @@ class RAGPipeline:
             else [None]
         )
         results = await self._retrieve_ladder(query, symbols, phases)
-        return self._rank(results, target_version, settings)[: settings.rag_top_k]
+        return self._rank(results, target_version, settings, settings.rag_top_k)
 
     async def retrieve(
         self, request: RetrievalRequest, strategy: str | None = None

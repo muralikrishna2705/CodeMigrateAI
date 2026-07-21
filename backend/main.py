@@ -15,6 +15,7 @@ import logging
 import sys
 from contextlib import asynccontextmanager
 
+from cache.keys import key_prefix
 from cache.manager import CacheManager
 from config import get_settings
 from fastapi import FastAPI, HTTPException
@@ -318,6 +319,31 @@ async def cache_stats():
 
 
 @app.post("/cache/clear")
-async def clear_cache():
-    cache_manager.clear()
-    return {"status": "cleared"}
+async def clear_cache(
+    source_language: str = "",
+    source_version: str = "",
+    target_language: str = "",
+    target_version: str = "",
+):
+    """Clear the migration cache, optionally scoped to one migration family.
+
+    Re-indexing the RAG corpus for a single target, or fixing one language
+    profile, only invalidates the migrations that touch it — dropping the whole
+    cache would force every unrelated migration to be recomputed too. The
+    filters are hierarchical: a source language alone covers every target under
+    it, and omitting all of them clears everything.
+    """
+    if not source_language:
+        cache_manager.clear()
+        return {"status": "cleared", "scope": "all"}
+
+    removed = cache_manager.invalidate(
+        source_language, source_version, target_language, target_version
+    )
+    return {
+        "status": "cleared",
+        "scope": key_prefix(
+            source_language, source_version, target_language, target_version
+        ),
+        "local_entries_removed": removed,
+    }

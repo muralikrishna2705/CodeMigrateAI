@@ -1,38 +1,37 @@
 import hashlib
 import json
-from collections import OrderedDict
 from typing import Any
 
 from config import get_settings
+from dsa import PrefixLRU
 from llm.language_profiles import LanguageProfile
 
 
-class PromptCache:
-    def __init__(self, maxsize: int = 100):
-        self._items: OrderedDict[str, str] = OrderedDict()
-        self.maxsize = maxsize
-
-    def get(self, key: str) -> str | None:
-        if key not in self._items:
-            return None
-        value = self._items.pop(key)
-        self._items[key] = value
-        return value
-
-    def set(self, key: str, value: str):
-        if key in self._items:
-            self._items.pop(key)
-        elif len(self._items) >= self.maxsize:
-            self._items.popitem(last=False)
-        self._items[key] = value
-
-    def __len__(self) -> int:
-        return len(self._items)
-
-
 class PromptComposer:
+    """Assembles the migration prompt, cached at two granularities.
+
+    The whole-prompt cache only ever hits on a *byte-identical* repeat of the
+    same file, which almost never happens inside a run. But four of the seven
+    sections — the role, the language guidance, the version constraints, and the
+    few-shot examples — depend solely on the language pair, the versions, and
+    the migration type. They contain no source code at all, yet the old
+    single-cache design rebuilt every one of them for every file, because the
+    key mixed the code hash into the same lookup.
+
+    Caching those separately turns a batch migration of N files sharing a
+    language pair from N full assemblies into one, plus N cheap per-file
+    sections. Both caches are keyed by a ``<src>:<srcver>:<tgt>:<tgtver>:<type>``
+    path, so :meth:`invalidate` can drop everything derived from one language
+    profile through a trie prefix walk when that profile is reloaded.
+    """
+
     def __init__(self, max_cache_entries: int = 100):
-        self._cache = PromptCache(maxsize=max_cache_entries)
+        self._cache: PrefixLRU[str] = PrefixLRU(maxsize=max_cache_entries)
+        # Far fewer distinct language-pair families than files, so this stays
+        # small and hot even when the prompt cache is churning.
+        self._sections: PrefixLRU[tuple[str, str]] = PrefixLRU(
+            maxsize=max_cache_entries
+        )
 
     def compose(
         self,
@@ -47,20 +46,58 @@ class PromptComposer:
     ) -> str:
         analyzer_context = analyzer_context or {}
         source_code = source_code[:get_settings().max_llm_code_chars]
-        cache_key = self._cache_key(
+        family = self._family_key(
             source_profile,
             target_profile,
             source_version,
             target_version,
-            source_code,
-            analyzer_context,
             migration_type,
         )
+        cache_key = self._cache_key(family, source_code, analyzer_context)
         cached = self._cache.get(cache_key)
         if cached is not None:
             return cached
 
+        preamble, few_shots = self._static_sections(
+            family,
+            source_profile,
+            target_profile,
+            source_version,
+            target_version,
+            migration_type,
+        )
         prompt = "\n\n".join(
+            [
+                preamble,
+                self._build_analyzer_section(analyzer_context),
+                few_shots,
+                self._build_source_section(source_profile, source_version, source_code),
+                self._build_output_format(),
+            ]
+        )
+        self._cache.set(cache_key, prompt)
+        return prompt
+
+    def _static_sections(
+        self,
+        family: str,
+        source_profile: LanguageProfile,
+        target_profile: LanguageProfile,
+        source_version: str,
+        target_version: str,
+        migration_type: str,
+    ) -> tuple[str, str]:
+        """The code-independent sections, built once per language-pair family.
+
+        Returned as ``(preamble, few_shots)`` because the analyzer section sits
+        between them in the final prompt — the ordering is unchanged, only the
+        rebuilding is skipped.
+        """
+        cached = self._sections.get(family)
+        if cached is not None:
+            return cached
+
+        preamble = "\n\n".join(
             [
                 self._build_system_role(source_profile, target_profile, migration_type),
                 self._build_language_guidance(
@@ -73,41 +110,65 @@ class PromptComposer:
                 self._build_version_constraints(
                     target_profile, target_version, migration_type
                 ),
-                self._build_analyzer_section(analyzer_context),
-                self._build_few_shots(source_profile, target_profile, migration_type),
-                self._build_source_section(source_profile, source_version, source_code),
-                self._build_output_format(),
             ]
         )
-        self._cache.set(cache_key, prompt)
-        return prompt
+        few_shots = self._build_few_shots(
+            source_profile, target_profile, migration_type
+        )
+        sections = (preamble, few_shots)
+        self._sections.set(family, sections)
+        return sections
 
     def cache_size(self) -> int:
         return len(self._cache)
 
-    def _cache_key(
-        self,
+    def section_cache_size(self) -> int:
+        return len(self._sections)
+
+    def invalidate(self, source_language: str = "") -> int:
+        """Drop cached prompts and sections built from a source language.
+
+        Both caches key on the same path, so a reloaded language profile evicts
+        exactly what was built from it instead of clearing everything. An empty
+        argument walks from the root and drops all of it. Returns the number of
+        full prompts dropped.
+        """
+        prefix = f"{source_language}:" if source_language else ""
+        dropped = self._cache.invalidate_prefix(prefix)
+        self._sections.invalidate_prefix(prefix)
+        return dropped
+
+    @staticmethod
+    def _family_key(
         source_profile: LanguageProfile,
         target_profile: LanguageProfile,
         source_version: str,
         target_version: str,
-        source_code: str,
-        analyzer_context: dict[str, Any],
         migration_type: str,
     ) -> str:
-        context_json = json.dumps(analyzer_context, sort_keys=True, default=str)
-        content = "|".join(
+        """Path identifying everything that does not depend on the source code."""
+        return ":".join(
             [
                 source_profile.language_id,
-                source_version,
+                source_version or "any",
                 target_profile.language_id,
-                target_version,
+                target_version or "any",
                 migration_type,
-                hashlib.sha256(source_code.encode()).hexdigest(),
-                hashlib.sha256(context_json.encode()).hexdigest(),
             ]
-        )
-        return hashlib.sha256(content.encode()).hexdigest()
+        ) + ":"
+
+    @staticmethod
+    def _cache_key(
+        family: str, source_code: str, analyzer_context: dict[str, Any]
+    ) -> str:
+        """Full-prompt key: the family path plus a digest of the per-file inputs.
+
+        The code length prefixes the payload so no pair of (code, context) values
+        can concatenate into the same string and collide.
+        """
+        context_json = json.dumps(analyzer_context, sort_keys=True, default=str)
+        payload = f"{len(source_code)}|{source_code}|{context_json}"
+        return family + hashlib.sha256(payload.encode()).hexdigest()
 
     def _build_system_role(
         self,

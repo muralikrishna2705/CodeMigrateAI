@@ -72,3 +72,62 @@ class TestImportGrounding:
         report = check_import_grounding("import notarealpkg", "py")
         assert report["checked"] is True
         assert "notarealpkg" in report["unverified_imports"]
+
+
+class TestGroundingMatchesWholeNamespaces:
+    """Evidence must name the namespace, not merely contain its letters."""
+
+    def test_substring_of_a_longer_identifier_does_not_ground(self):
+        # The substring scan this replaces grounded "requests" on any text
+        # containing "requestshandler" — a false negative in a check whose whole
+        # job is catching invented imports.
+        report = check_import_grounding(
+            "import requests",
+            "python",
+            source_code="def requestshandler(): pass",
+        )
+        assert "requests" in report["unverified_imports"]
+
+    def test_nested_usage_still_grounds_the_package(self):
+        report = check_import_grounding(
+            "import requests",
+            "python",
+            rag_context="resp = requests.get(url)",
+        )
+        assert report["unverified_imports"] == []
+
+    def test_sibling_namespace_is_not_grounded_by_a_stdlib_root(self):
+        # "javafx" starts with "java" but is not part of the Java stdlib.
+        report = check_import_grounding(
+            "import javafx.scene.Node;\nimport java.util.List;", "java"
+        )
+        assert report["unverified_imports"] == ["javafx.scene.Node"]
+
+    def test_go_module_host_never_resolves_to_a_stdlib_root(self):
+        # "image.example.com/x" shares its first letters with stdlib "image",
+        # but "." does not close a segment in Go.
+        code = 'import (\n  "image/png"\n  "image.example.com/x"\n)'
+        report = check_import_grounding(code, "go")
+        assert report["unverified_imports"] == ["image.example.com/x"]
+
+    def test_source_carryover_of_a_dotted_namespace(self):
+        report = check_import_grounding(
+            "import com.mycorp.util.Helper;",
+            "java",
+            source_code="import com.mycorp.util.Helper;",
+        )
+        assert report["unverified_imports"] == []
+
+    def test_parent_package_in_context_grounds_a_child_import(self):
+        report = check_import_grounding(
+            "import com.mycorp.util.Helper;",
+            "java",
+            rag_context="see com.mycorp.util for helpers",
+        )
+        assert report["unverified_imports"] == []
+
+    def test_no_imports_reports_checked_with_zero(self):
+        report = check_import_grounding("x = 1", "python")
+        assert report["checked"] is True
+        assert report["total_imports"] == 0
+        assert report["unverified_imports"] == []

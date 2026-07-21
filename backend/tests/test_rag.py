@@ -58,9 +58,8 @@ class TestCachedEmbeddings:
         emb = CachedEmbeddings(
             model="nomic-embed-text", base_url="http://localhost:11434"
         )
-        key = hashlib.sha256("cache me".encode()).hexdigest()
         sentinel = [0.5] * 768
-        emb._cache[key] = sentinel
+        emb._cache["cache me"] = sentinel
 
         class _Boom:
             def embed_query(self, text):
@@ -68,6 +67,42 @@ class TestCachedEmbeddings:
 
         emb._inner = _Boom()
         assert emb.embed_query("cache me") == sentinel
+
+    def test_embed_documents_populates_cache_and_reuses_it(self):
+        emb = CachedEmbeddings(
+            model="nomic-embed-text", base_url="http://localhost:11434"
+        )
+        calls: list[list[str]] = []
+
+        class _Counting:
+            def embed_documents(self, texts):
+                calls.append(list(texts))
+                return [[float(len(t))] * 768 for t in texts]
+
+        emb._inner = _Counting()
+        first = emb.embed_documents(["alpha", "beta"])
+        # "alpha" is already cached, so only the new text reaches the model.
+        second = emb.embed_documents(["alpha", "gamma"])
+
+        assert calls == [["alpha", "beta"], ["gamma"]]
+        assert second[0] == first[0]
+
+    def test_embed_documents_pads_a_short_backend_response(self):
+        # A backend returning fewer vectors than texts must not silently shift
+        # every embedding onto the wrong document.
+        emb = CachedEmbeddings(
+            model="nomic-embed-text", base_url="http://localhost:11434"
+        )
+
+        class _Short:
+            def embed_documents(self, texts):
+                return [[0.5] * 768]  # one vector for however many texts
+
+        emb._inner = _Short()
+        result = emb.embed_documents(["one", "two", "three"])
+        assert len(result) == 3
+        assert result[0] == [0.5] * 768
+        assert result[1] == [0.0] * 768  # fallback padding
 
 
 class _FakeDoc:
