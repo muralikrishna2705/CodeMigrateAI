@@ -45,8 +45,41 @@ class DocSplitter:
                 chunk.metadata["chunk_size"] = len(chunk.page_content)
                 chunk.metadata["parent_id"] = parent_id
                 chunk.metadata["chunk_index"] = index
+                if index > 0:
+                    # Only chunks after the first need a header: the first
+                    # already begins with the document's own title.
+                    chunk.page_content = self._with_context(chunk, language)
             chunks.extend(doc_chunks)
         return chunks
+
+    @staticmethod
+    def _with_context(chunk: Document, language: str) -> str:
+        """Prefix a chunk with what it is, so it can stand alone.
+
+        A chunk taken from the middle of a document arrives with no idea what it
+        is about: a fragment reading "use ``Executors.newVirtualThreadPerTask``"
+        never says which language or version it belongs to. That hurts twice —
+        the embedding is computed from text missing its own subject, and the
+        model reads the fragment out of context.
+
+        The header is cheap (a line or two) and made of metadata the ingestion
+        pipeline already attached, so it costs no extra call.
+        """
+        md = chunk.metadata or {}
+        bits = [str(md.get("language", language) or language)]
+        version = md.get("version")
+        if version and version != "any":
+            bits.append(str(version))
+        doc_type = md.get("doc_type")
+        if doc_type:
+            bits.append(str(doc_type).replace("-", " "))
+
+        header = f"[{' · '.join(bits)}]"
+        title = md.get("title") or md.get("source", "")
+        if title:
+            # Just the filename: a full path is noise in an embedding.
+            header += f" {str(title).replace(chr(92), '/').rsplit('/', 1)[-1]}"
+        return f"{header}\n{chunk.page_content}"
 
     @staticmethod
     def _parent_id(document: Document) -> str:

@@ -226,6 +226,49 @@ class TestStrategyRouting:
         assert result == "BASE"
 
 
+class TestContextualChunkHeaders:
+    """A chunk from the middle of a document must be able to stand alone."""
+
+    def _split(self, text, **metadata):
+        from rag.splitter import DocSplitter
+
+        doc = Document(page_content=text, metadata=metadata)
+        return DocSplitter(chunk_size=120, chunk_overlap=0).split([doc], "python")
+
+    def test_later_chunks_carry_language_version_and_type(self):
+        chunks = self._split(
+            "alpha " * 60,
+            language="python",
+            version="3.12",
+            doc_type="migration-guide",
+            source="/corpus/python/java-to-python.md",
+        )
+        assert len(chunks) > 1
+        header = chunks[1].page_content.splitlines()[0]
+        # Without this the embedding is computed from text missing its own
+        # subject, and the model reads a fragment with no idea what it is about.
+        assert "python" in header and "3.12" in header
+        assert "migration guide" in header
+        assert "java-to-python.md" in header
+
+    def test_first_chunk_is_not_prefixed(self):
+        # It already opens with the document's own title.
+        chunks = self._split("beta " * 60, language="python", version="3.12")
+        assert not chunks[0].page_content.startswith("[")
+
+    def test_wildcard_version_is_omitted_from_the_header(self):
+        # "any" is the absence of a version, not a version worth stating.
+        chunks = self._split("gamma " * 60, language="python", version="any")
+        assert "any" not in chunks[1].page_content.splitlines()[0]
+
+    def test_only_the_filename_appears_not_the_full_path(self):
+        chunks = self._split(
+            "delta " * 60, language="go", source="/very/long/corpus/path/guide.md"
+        )
+        header = chunks[1].page_content.splitlines()[0]
+        assert "guide.md" in header and "/very/long" not in header
+
+
 class TestQueryHygiene:
     def test_comments_are_stripped_before_symbol_extraction(self):
         code = (
