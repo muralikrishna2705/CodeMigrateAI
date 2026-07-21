@@ -219,7 +219,28 @@ class Settings(BaseSettings):
     # RAG Pipeline (Phase 2)
     enable_rag: bool = True
     rag_top_k: int = 4
-    rag_min_score: float = 0.7
+    # Cosine floor on the vector leg. Deliberately low: with a cross-encoder
+    # downstream, this is no longer what protects the prompt from junk — it is
+    # only there to drop documents that are outright unrelated. It was 0.7,
+    # which against a sparse corpus discarded almost everything before the
+    # reranker ever got a chance to judge it.
+    rag_min_score: float = 0.3
+
+    # Cross-encoder reranking (rag/reranker.py).
+    #
+    # Everything upstream ranks documents without comparing them to the query
+    # directly — the dense leg scores embedding proximity, and RRF fuses
+    # *positions*, so a keyword hit on one incidental symbol fuses as strongly
+    # as a genuinely relevant document. A cross-encoder reads query and document
+    # together, and is the largest precision lever short of a better corpus.
+    #
+    # Runs locally on CPU (~150-200ms for 20 docs) and costs no API call. The
+    # model is downloaded once on first use.
+    rag_rerank_enabled: bool = True
+    rag_rerank_model: str = "ms-marco-MiniLM-L-12-v2"
+    # Retrieve this wide, then let the reranker cut to rag_top_k. Recall is cheap
+    # (one vector query returns 20 as easily as 4); precision is the reranker's job.
+    rag_rerank_candidates: int = 20
     # Grounding: the retrieval query is built from the actual source code's
     # imports/APIs/type names (not just the language pair) so retrieved examples
     # are code-specific. Cap how many symbols and how much of a code excerpt feed
@@ -274,14 +295,16 @@ class Settings(BaseSettings):
 
     # Agentic RAG strategies (Dimension 2)
     #
-    # Which retrieval strategy enrich_prompt / the VectorDBTool use. Options:
-    #   single_hop (default) · hyde · multi_query · multi_hop ·
+    # Which retrieval strategy enrich_prompt / the VectorDBTool use.
+    #   auto (default) · single_hop · hyde · multi_query · multi_hop ·
     #   contextual_compression · parent_document · corrective · self_rag
-    # Default is single_hop = the original one-shot behaviour: offline-safe and
-    # free of per-retrieval LLM calls. The LLM-driven strategies activate only
-    # when a client is wired, and every one degrades to single_hop on any failure,
-    # so switching this can improve grounding but never break a migration.
-    rag_strategy: str = "single_hop"
+    #
+    # "auto" is what makes this agentic RAG rather than configured RAG: the model
+    # picks a strategy per query, and can decide no retrieval is needed at all —
+    # the only choice that removes latency instead of adding it. Any other value
+    # pins that strategy for every query. Every strategy degrades to single_hop
+    # on failure, so this can improve grounding but never break a migration.
+    rag_strategy: str = "auto"
     # HyDE: retrieve against an LLM-written hypothetical target-language answer.
     rag_hyde_enabled: bool = True
     # Multi-Query: how many LLM-generated query paraphrases to fan out over.

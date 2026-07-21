@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from config import get_settings
 from dsa import top_k
+from rag.reranker import rerank
 
 log = logging.getLogger("CodeMigrateAI.RAGPipeline")
 
@@ -82,6 +83,31 @@ class RetrievalRequest:
     source_code: str = ""
     code_metrics: dict | None = None
     extra_terms: list[str] | None = None
+
+
+# Comment syntaxes across the nine supported languages. Deliberately regex rather
+# than per-language parsing: this only has to be good enough to stop prose from
+# reaching the symbol extractor, and a mis-stripped line costs one lost symbol
+# out of a dozen — whereas parsing nine grammars would be a real dependency.
+_COMMENT_PATTERNS = (
+    re.compile(r"/\*[\s\S]*?\*/"),          # C-family block, javadoc, jsdoc
+    re.compile(r'"""[\s\S]*?"""'),          # python docstring (double)
+    re.compile(r"'''[\s\S]*?'''"),          # python docstring (single)
+    re.compile(r"^\s*//.*$", re.MULTILINE),  # C-family line
+    re.compile(r"^\s*#(?!include|import).*$", re.MULTILINE),  # python/ruby/shell
+    re.compile(r"^\s*--.*$", re.MULTILINE),  # sql/haskell/lua
+)
+
+
+def _strip_comments(source_code: str) -> str:
+    """Remove comment bodies so prose cannot pollute symbol extraction.
+
+    ``#include``/``#import`` are preserved explicitly: they start with ``#`` but
+    are the single highest-signal line in a C++ file.
+    """
+    for pattern in _COMMENT_PATTERNS:
+        source_code = pattern.sub(" ", source_code)
+    return source_code
 
 
 def merge_hits(hitlists: list[list[tuple]], k: int) -> list[tuple]:
@@ -184,6 +210,24 @@ class SingleHopStrategy(RetrievalStrategy):
         return await self._run_query(request.query, request)
 
 
+class NoRetrievalStrategy(RetrievalStrategy):
+    """Retrieve nothing, deliberately.
+
+    Selected when the router judges the migration needs no external grounding —
+    a pure syntax translation with no unfamiliar APIs. Skipping is the cheapest
+    path available and the only one that removes latency rather than adding it.
+
+    The MigratorAgent already handles empty context: with no reference examples
+    it injects its ungrounded notice, which tells the model to stay conservative.
+    So a wrong skip degrades to caution, not to invention.
+    """
+
+    name = "skip"
+
+    async def retrieve(self, request: RetrievalRequest) -> list[tuple]:
+        return []
+
+
 class RAGPipeline:
     def __init__(self, vector_store, embedding_service, llm_client=None):
         self._vector_store = vector_store
@@ -212,7 +256,15 @@ class RAGPipeline:
         distinctive call and type identifiers in source order. Stopwords and
         duplicates are dropped, and the result is capped at ``max_symbols`` so a
         few high-signal terms dominate the query embedding.
+
+        Comments are stripped first. Prose is exactly what the Pascal/CamelCase
+        type pattern misfires on — a licence header contributes "Copyright",
+        "Apache", "Licensed"; a docstring contributes whatever nouns it contains
+        — and because the cap keeps only the first ``max_symbols`` in source
+        order, a header at the top of the file could consume the entire budget
+        before a single real symbol was seen.
         """
+        source_code = _strip_comments(source_code)
         signals: list[str] = []
         seen: set[str] = set()
 
@@ -309,12 +361,26 @@ class RAGPipeline:
             parts.append(excerpt)
         return "\n".join(parts)
 
+    @staticmethod
+    def _candidate_k(settings) -> int:
+        """How many documents to pull from the store before reranking.
+
+        With a reranker downstream the right move is to fetch wide and let it
+        cut: recall is cheap (one vector query returns 20 as easily as 4) and
+        precision is what the cross-encoder is for. Without one, the store's
+        own ordering *is* the final ordering, so fetching extra would only pad
+        the prompt with worse matches.
+        """
+        if settings.rag_rerank_enabled:
+            return max(settings.rag_top_k, settings.rag_rerank_candidates)
+        return settings.rag_top_k
+
     async def _search(self, query: str, where: dict | None):
         settings = get_settings()
         return await asyncio.to_thread(
             self._vector_store.similarity_search,
             query,
-            k=settings.rag_top_k,
+            k=self._candidate_k(settings),
             score_threshold=settings.rag_min_score,
             where=where,
         )
@@ -328,7 +394,7 @@ class RAGPipeline:
             return await asyncio.to_thread(
                 self._vector_store.keyword_search,
                 symbols,
-                settings.rag_top_k,
+                self._candidate_k(settings),
                 where,
             )
         except Exception as e:
@@ -374,7 +440,7 @@ class RAGPipeline:
         if not keyword_hits:
             return vector_hits
         return self._rrf_merge(
-            vector_hits, keyword_hits, settings.rag_top_k, settings.rag_rrf_k
+            vector_hits, keyword_hits, self._candidate_k(settings), settings.rag_rrf_k
         )
 
     @staticmethod
@@ -487,19 +553,73 @@ class RAGPipeline:
             else [None]
         )
         results = await self._retrieve_ladder(query, symbols, phases)
+
+        # Rerank before ranking, not after. The cross-encoder produces the
+        # relevance signal; `_rank` then nudges that with authority boosts. Doing
+        # it the other way would let a metadata boost promote a document the
+        # reranker had already judged irrelevant.
+        results = await rerank(results, query, top_n=settings.rag_top_k)
         return self._rank(results, target_version, settings, settings.rag_top_k)
 
     async def retrieve(
         self, request: RetrievalRequest, strategy: str | None = None
     ) -> list[tuple]:
-        """Retrieve for ``request`` using a named strategy (default from settings).
+        """Retrieve for ``request``, choosing the strategy when not told one.
 
-        The single entry point for agentic retrieval: the VectorDBTool routes
-        here by intent, and ``enrich_prompt`` routes here when a non-default
-        ``rag_strategy`` is configured.
+        The single entry point for agentic retrieval. With no explicit strategy
+        and ``rag_strategy="auto"``, the model picks one per query — that choice
+        is what separates agentic RAG from configured RAG. An explicit argument
+        (the VectorDBTool routing by intent) always wins, and a pinned
+        ``rag_strategy`` disables the routing entirely.
         """
-        name = strategy or getattr(get_settings(), "rag_strategy", "single_hop")
+        name = strategy
+        if name is None:
+            configured = getattr(get_settings(), "rag_strategy", "single_hop")
+            name = (
+                await self._route_strategy(request)
+                if configured == "auto"
+                else configured
+            )
         return await self._build_strategy(name).retrieve(request)
+
+    async def _route_strategy(self, request: RetrievalRequest) -> str:
+        """Ask the fast model which retrieval strategy fits this query.
+
+        Returns ``"skip"`` when the model judges retrieval unnecessary — the
+        cheapest possible path, and a real latency win on migrations that are
+        pure syntax translation with no unfamiliar APIs involved.
+
+        Falls back to single-hop on any failure, so a routing outage costs one
+        wasted call rather than the retrieval itself.
+        """
+        from models.schemas import RetrievalRouteDecision
+
+        chat_model = getattr(self._llm, "chat_model", None)
+        if chat_model is None:
+            return "single_hop"
+
+        prompt = (
+            f"A developer is migrating {request.source_language} code to "
+            f"{request.target_language} {request.target_version}.\n\n"
+            f"Retrieval query:\n{request.query[:1500]}\n\n"
+            "Choose how to search the reference corpus for this query."
+        )
+        try:
+            model = chat_model("fast").with_structured_output(RetrievalRouteDecision)
+            decision = await model.ainvoke(prompt)
+        except Exception as exc:  # noqa: BLE001 — routing is optional
+            log.warning("Strategy routing failed, using single_hop: %s", exc)
+            return "single_hop"
+
+        if decision is None:
+            return "single_hop"
+        if not decision.needs_retrieval:
+            log.info("Model judged retrieval unnecessary: %s", decision.reasoning)
+            return "skip"
+        log.info(
+            "Retrieval strategy: %s (%s)", decision.strategy, decision.reasoning
+        )
+        return decision.strategy
 
     def _build_strategy(self, name: str) -> RetrievalStrategy:
         """Resolve a strategy name to an instance (lazy imports avoid cycles).
@@ -508,6 +628,8 @@ class RAGPipeline:
         config value degrades to the safe default instead of breaking retrieval.
         """
         key = (name or "single_hop").lower()
+        if key == "skip":
+            return NoRetrievalStrategy(self, self._llm)
         if key in ("single_hop", "single", "none", ""):
             return SingleHopStrategy(self, self._llm)
         if key == "hyde":
@@ -645,10 +767,10 @@ class RAGPipeline:
         )
 
         hits: list[tuple] | None = None
-        # Agentic strategies are opt-in and LLM-driven: take that path only when a
-        # non-default strategy is configured AND a client is wired. Any failure or
-        # empty result falls through to the single-hop path below, so enrichment
-        # is never worse than the default one-shot retrieval.
+        # Agentic strategies need an LLM. With `rag_strategy="auto"` the model
+        # picks per query; with an explicit name that name is pinned. Any failure
+        # or empty result falls through to the single-hop path below, so
+        # enrichment is never worse than the default one-shot retrieval.
         strategy_name = getattr(settings, "rag_strategy", "single_hop")
         if strategy_name and strategy_name != "single_hop" and self._llm is not None:
             request = RetrievalRequest(
@@ -661,12 +783,20 @@ class RAGPipeline:
                 code_metrics=code_metrics,
                 extra_terms=extra_terms,
             )
+            # Resolved here rather than inside `retrieve` so a deliberate "skip"
+            # is distinguishable from "searched and found nothing". Without that
+            # distinction the fallback below would helpfully undo every skip.
+            resolved = (
+                await self._route_strategy(request)
+                if strategy_name == "auto"
+                else strategy_name
+            )
+            if resolved == "skip":
+                return base_prompt
             try:
-                hits = await self.retrieve(request, strategy=strategy_name)
+                hits = await self.retrieve(request, strategy=resolved)
             except Exception as e:  # noqa: BLE001
-                log.warning(
-                    "RAG strategy %r failed, using single-hop: %s", strategy_name, e
-                )
+                log.warning("RAG strategy %r failed, using single-hop: %s", resolved, e)
                 hits = None
 
         if not hits:

@@ -177,27 +177,25 @@ class _HybridStore:
         return list(self._keyword)
 
 
-class _MockSettings:
-    enable_rag = True
-    rag_top_k = 4
-    rag_min_score = 0.7
-    rag_query_max_symbols = 12
-    rag_query_code_chars = 600
-    rag_filter_by_target_language = True
-    rag_filter_by_target_version = True
-    rag_version_wildcard = "any"
-    rag_rank_weight_version = 0.15
-    rag_rank_weight_official = 0.10
-    rag_rank_weight_migration = 0.10
-    rag_migration_doc_types = ["migration-guide", "release-notes", "deprecation"]
-    rag_hybrid_enabled = True
-    rag_rrf_k = 60
-
-
 def _patch_settings(monkeypatch, **overrides):
-    settings = _MockSettings()
-    for key, value in overrides.items():
-        setattr(settings, key, value)
+    """Point the pipeline at a real Settings built from ``overrides``.
+
+    Deliberately the real class rather than a hand-written stub. A stub has to
+    mirror every field the code under test reads, so adding a setting broke
+    these tests somewhere unrelated to the change — which is a test-design bug,
+    not a signal.
+
+    Two values are pinned unless overridden. ``rag_min_score`` keeps its old 0.7
+    because these tests assert on threshold filtering; the shipped default
+    dropped to 0.3 once the reranker took over that job. Reranking itself is off
+    so unit tests neither download a model nor depend on cross-encoder scores —
+    it has its own tests.
+    """
+    from config import Settings
+
+    base = {"rag_min_score": 0.7, "rag_rerank_enabled": False}
+    base.update(overrides)
+    settings = Settings(**base)
     monkeypatch.setattr("rag.retrieval_pipeline.get_settings", lambda: settings)
     return settings
 
