@@ -10,23 +10,57 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Ollama
-    ollama_url: str = "http://host.docker.internal:11434"
-    llm_model: str = "deepseek-coder:1.3b"
-    # Optional lighter/faster model for analysis + planning (not code generation).
-    # Empty -> reuse llm_model, so routing is a no-op until an operator sets and
-    # pulls a distinct model (e.g. "llama3.2:1b"), keeping default startup safe.
+    # --- Model provider -----------------------------------------------------
+    #
+    # Which backend serves chat completions. Anything init_chat_model speaks
+    # works; "google_genai" (Gemini / AI Studio) and "ollama" are the two paths
+    # this project exercises. The provider is always passed explicitly to
+    # init_chat_model — see llm/providers.py for why inference is unsafe here.
+    #
+    # Native tool calling is the reason the default is hosted: Ollama's
+    # /api/generate has no `tools` parameter and deepseek-coder:1.3b reports
+    # capabilities ["completion"], so the agentic paths cannot run locally.
+    llm_provider: str = "google_genai"
+    google_api_key: str = ""
+
+    # Model ids. Empty means "use the provider's default" (see
+    # providers.DEFAULT_MODELS), so switching llm_provider carries the whole
+    # model set with it instead of leaving a Gemini id pointed at Ollama.
+    llm_model: str = ""
     fast_llm_model: str = ""
-    embedding_model: str = "nomic-embed-text"
-    ollama_auto_pull: bool = True  # pull missing models on startup
+    # Embeddings are chosen independently of chat: embedding a corpus locally
+    # while generating with a hosted model is a reasonable split.
+    embedding_provider: str = "google_genai"
+    embedding_model: str = ""
+
     llm_timeout_sec: float = 120.0
-    # num_ctx must comfortably exceed the composed prompt (~1500+ tokens with
-    # RAG/planner context) plus num_predict, otherwise Ollama silently truncates
-    # the prompt/response and JSON output comes back malformed.
-    llm_num_predict: int = 2048
-    llm_num_ctx: int = 8192
+    llm_max_tokens: int = 4096
     llm_temperature: float = 0.0
-    llm_num_threads: int = 8
+    # Provider-side retry on transient 5xx / rate-limit responses, before our
+    # own error handling ever sees it.
+    llm_max_retries: int = 2
+
+    # Rate limiting is a real design constraint, not a nicety: hosted free tiers
+    # are quoted in requests per MINUTE and one migration makes 8-15 model calls,
+    # so an unthrottled parallel fan-out 429s immediately. 0 disables throttling
+    # (correct for Ollama, where the only limit is local CPU).
+    #   free tier  ~10 RPM -> 0.16
+    #   paid tier  ~1000 RPM -> 16.0
+    llm_requests_per_second: float = 0.16
+    llm_max_burst: int = 4
+
+    # Gemini 2.5+ reasons before answering by default. Worth it for code
+    # generation, pure latency for a yes/no routing call, so the fast role
+    # disables it. Negative leaves the provider default in place.
+    llm_fast_thinking_budget: int = 0
+
+    # --- Ollama-specific ----------------------------------------------------
+    ollama_url: str = "http://host.docker.internal:11434"
+    ollama_auto_pull: bool = True  # pull missing models on startup
+    # num_ctx must comfortably exceed the composed prompt (~1500+ tokens with
+    # RAG/planner context) plus the response, otherwise Ollama silently
+    # truncates and JSON output comes back malformed.
+    llm_num_ctx: int = 8192
     llm_top_p: float = 0.9
 
     # Shared truncation limit for LLM input

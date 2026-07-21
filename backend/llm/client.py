@@ -1,3 +1,17 @@
+"""Adapter presenting a LangChain chat model through this project's LLM API.
+
+Every agent already talks to ``call_llm`` / ``stream_llm``, so this keeps those
+signatures byte-for-byte while the implementation underneath becomes a
+:class:`~langchain_core.language_models.BaseChatModel` built by
+:mod:`llm.providers`. That is what lets the provider swap land without touching
+a single agent — call sites migrate to native tool calling and structured output
+one at a time, in later phases, rather than all at once.
+
+New code that needs tool binding or structured output should reach for
+:meth:`LLMClient.chat_model` and use the model directly; ``call_llm`` is the
+compatibility surface, not the target API.
+"""
+
 import json
 import logging
 import re
@@ -5,6 +19,8 @@ from typing import Any, AsyncIterator
 
 import httpx
 from config import get_settings
+from langchain_core.messages import HumanMessage, SystemMessage
+from llm import providers
 
 log = logging.getLogger("CodeMigrateAI.LLM")
 
@@ -12,30 +28,51 @@ log = logging.getLogger("CodeMigrateAI.LLM")
 class LLMClient:
     def __init__(self, settings=None):
         self.settings = settings or get_settings()
-        self._client: httpx.AsyncClient | None = None
+        self._http: httpx.AsyncClient | None = None
 
-    @property
-    def client(self) -> httpx.AsyncClient:
-        if self._client is None:
-            self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(
-                    connect=10.0,
-                    read=self.settings.llm_timeout_sec,
-                    write=30.0,
-                    pool=5.0,
-                )
-            )
-        return self._client
+    # --- Model access ------------------------------------------------------
 
     @property
     def fast_model(self) -> str:
-        """Model for lightweight tasks (analysis/planning).
+        """Model id for lightweight tasks (routing, grading, planning).
 
-        Falls back to the main model when ``fast_llm_model`` is unset, so routing
-        is an opt-in optimization that never introduces a second model unless the
-        operator configures (and pulls) one.
+        Resolved through the provider defaults, so it is a real model name even
+        when ``fast_llm_model`` is unset — which is what agents' ``model=``
+        routing argument expects to receive.
         """
-        return self.settings.fast_llm_model or self.settings.llm_model
+        return providers.resolve_model_name("fast", self.settings)
+
+    @property
+    def main_model(self) -> str:
+        return providers.resolve_model_name("main", self.settings)
+
+    def chat_model(self, role: str = "main", *, json_mode: bool = False):
+        """The underlying chat model, for ``bind_tools`` / ``with_structured_output``."""
+        return providers.get_chat_model(
+            role, json_mode=json_mode, settings=self.settings
+        )
+
+    def _role_for(self, model: str | None) -> str:
+        """Map an explicit model name back to a role.
+
+        Agents route to the cheap model by passing ``model=<fast id>`` rather
+        than a role name. Recovering the role matters because role carries more
+        than the id — the fast role also disables the provider's reasoning
+        budget, which is the bulk of the latency saving on short calls.
+        """
+        if model and model == self.fast_model:
+            return "fast"
+        return "main"
+
+    @staticmethod
+    def _messages(prompt: str, system_prompt: str) -> list:
+        messages: list = []
+        if system_prompt:
+            messages.append(SystemMessage(content=system_prompt))
+        messages.append(HumanMessage(content=prompt))
+        return messages
+
+    # --- Completion --------------------------------------------------------
 
     async def call_llm(
         self,
@@ -44,22 +81,22 @@ class LLMClient:
         fmt: str | None = None,
         model: str | None = None,
     ) -> str:
-        payload = self._build_payload(
-            prompt, system_prompt, stream=False, fmt=fmt, model=model
+        role = self._role_for(model)
+        chat = providers.get_chat_model(
+            role,
+            json_mode=(fmt == "json"),
+            model=model,
+            settings=self.settings,
         )
         log.info(
-            "Ollama call: model=%s, prompt=%d chars%s",
-            payload["model"],
+            "LLM call: %s (role=%s), prompt=%d chars%s",
+            model or providers.resolve_model_name(role, self.settings),
+            role,
             len(prompt),
-            f", format={fmt}" if fmt else "",
+            ", json" if fmt else "",
         )
-
-        response = await self.client.post(
-            f"{self.settings.ollama_url}/api/generate",
-            json=payload,
-        )
-        response.raise_for_status()
-        return response.json().get("response", "").strip()
+        response = await chat.ainvoke(self._messages(prompt, system_prompt))
+        return (response.text or "").strip()
 
     async def stream_llm(
         self,
@@ -68,58 +105,22 @@ class LLMClient:
         fmt: str | None = None,
         model: str | None = None,
     ) -> AsyncIterator[str]:
-        payload = self._build_payload(
-            prompt, system_prompt, stream=True, fmt=fmt, model=model
+        role = self._role_for(model)
+        chat = providers.get_chat_model(
+            role,
+            json_mode=(fmt == "json"),
+            model=model,
+            settings=self.settings,
         )
+        async for chunk in chat.astream(self._messages(prompt, system_prompt)):
+            # ``.text`` flattens structured content parts (Gemini returns a list
+            # when reasoning or citations are attached) down to plain text, so
+            # the streamer downstream never has to know which shape arrived.
+            text = chunk.text
+            if text:
+                yield text
 
-        async with self.client.stream(
-            "POST",
-            f"{self.settings.ollama_url}/api/generate",
-            json=payload,
-        ) as response:
-            response.raise_for_status()
-            async for line in response.aiter_lines():
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                token = data.get("response", "")
-                if token:
-                    yield token
-                if data.get("done", False):
-                    break
-
-    def _build_payload(
-        self,
-        prompt: str,
-        system_prompt: str,
-        stream: bool,
-        fmt: str | None = None,
-        model: str | None = None,
-    ) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "model": model or self.settings.llm_model,
-            "prompt": prompt,
-            "stream": stream,
-            "options": {
-                "temperature": self.settings.llm_temperature,
-                "num_predict": self.settings.llm_num_predict,
-                "num_ctx": self.settings.llm_num_ctx,
-                "num_thread": self.settings.llm_num_threads,
-                "top_p": self.settings.llm_top_p,
-            },
-        }
-        if system_prompt:
-            payload["system"] = system_prompt
-        # Ollama's grammar-constrained decoding: when fmt="json" the model is
-        # forced to emit a single syntactically valid JSON object (with proper
-        # string escaping), which small models like deepseek-coder:1.3b cannot
-        # reliably do on their own. The prompt must still ask for JSON.
-        if fmt:
-            payload["format"] = fmt
-        return payload
+    # --- JSON salvage (removed in Phase 1, once every call site is schema-bound)
 
     def extract_json(self, raw_text: str) -> dict:
         text = raw_text.strip()
@@ -180,7 +181,30 @@ class LLMClient:
 
         raise ValueError("No valid JSON in LLM response")
 
+    # --- Provider health / model provisioning ------------------------------
+
+    @property
+    def http(self) -> httpx.AsyncClient:
+        """HTTP client for Ollama's admin endpoints (tags / pull).
+
+        Only the local provider has anything to administer; hosted providers are
+        reached exclusively through their LangChain integration.
+        """
+        if self._http is None:
+            self._http = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
+        return self._http
+
     async def health_check(self) -> bool:
+        """Whether the configured provider looks usable.
+
+        For a hosted provider this is a *configuration* check, not a network
+        probe: ``/migrate`` calls this on every request, so a real round trip
+        would spend quota and add latency to answer a question the actual model
+        call is about to answer anyway. A missing key is the failure this can
+        genuinely catch early, and it is the common one.
+        """
+        if providers.is_hosted(self.settings):
+            return bool(self.settings.google_api_key)
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 r = await client.get(f"{self.settings.ollama_url}/api/tags")
@@ -189,14 +213,15 @@ class LLMClient:
             return False
 
     async def ensure_model(self, model: str) -> bool:
-        """Ensure an Ollama model is available locally, pulling it if missing.
+        """Ensure a local model is available, pulling it if missing.
 
-        Returns True if the model is present (or was successfully pulled),
-        False otherwise. Never raises — callers treat False as "unavailable"
-        and degrade gracefully.
+        A no-op returning True for hosted providers — there is nothing to pull.
+        Never raises; callers treat False as "unavailable" and degrade.
         """
+        if providers.is_hosted(self.settings):
+            return True
         try:
-            resp = await self.client.get(f"{self.settings.ollama_url}/api/tags")
+            resp = await self.http.get(f"{self.settings.ollama_url}/api/tags")
             resp.raise_for_status()
             installed = {m.get("name", "") for m in resp.json().get("models", [])}
         except Exception as exc:
@@ -212,10 +237,11 @@ class LLMClient:
 
         log.info("Model '%s' not found locally; pulling from Ollama registry…", model)
         try:
-            async with self.client.stream(
+            async with self.http.stream(
                 "POST",
                 f"{self.settings.ollama_url}/api/pull",
                 json={"name": model, "stream": True},
+                timeout=httpx.Timeout(600.0),
             ) as resp:
                 resp.raise_for_status()
                 async for line in resp.aiter_lines():
@@ -238,6 +264,6 @@ class LLMClient:
             return False
 
     async def close(self):
-        if self._client:
-            await self._client.aclose()
-            self._client = None
+        if self._http:
+            await self._http.aclose()
+            self._http = None

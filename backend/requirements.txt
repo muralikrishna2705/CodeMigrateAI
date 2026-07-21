@@ -4,14 +4,33 @@ httpx==0.27.0
 pydantic>=2.10.0
 pydantic-settings>=2.1.0
 redis>=5.0.0
-langchain>=0.2.0
-langchain-community>=0.2.0
-langchain-chroma>=0.1.0
+
+# LangChain v1. The floors are v1 on purpose: this project uses APIs that do not
+# exist in 0.x — init_chat_model's provider dispatch, .with_structured_output on
+# the chat model, langgraph's Send API and typed reducers. Installing an 0.2.x
+# line here would fail at import, not at runtime.
+langchain>=1.3.0
+langchain-core>=1.4.0
+langchain-community>=0.4.0
+langchain-classic>=1.0.0
+langchain-text-splitters>=1.1.0
+langchain-chroma>=1.1.0
+langgraph>=1.2.0
+langgraph-checkpoint-sqlite>=3.1.0
+
+# Model providers. Gemini is the default (native tool calling + structured
+# output on a hosted endpoint); Ollama is kept as a selectable local provider.
+langchain-google-genai>=4.2.0
+langchain-ollama>=1.1.0
+
+# Retrieval reranking. FlashRank is a ~34MB ONNX cross-encoder that runs on CPU
+# in ~50-100ms for 20 docs, so precision reranking costs no API call.
+flashrank>=0.2.10
+
 chromadb>=0.5.0
 beautifulsoup4>=4.12.0
 lxml>=5.0.0
 markdownify>=0.12.0
-langgraph>=0.1.0
 typing-extensions>=4.9.0
 PyGithub>=2.0.0
 

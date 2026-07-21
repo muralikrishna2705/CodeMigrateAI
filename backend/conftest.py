@@ -2,6 +2,7 @@
 
 import pytest
 
+from llm import providers
 from runtime import agent_recovery
 from runtime.agent_observer import ObserverAgent
 
@@ -16,9 +17,14 @@ def _reset_runtime_state():
     """
     agent_recovery.reset()
     ObserverAgent.reset_metrics()
+    providers.reset_models()
     yield
     agent_recovery.reset()
     ObserverAgent.reset_metrics()
+    # Chat models and the rate limiter are cached process-wide, so a test that
+    # changes provider settings would otherwise be served the previous test's
+    # client — and the limiter would carry its spent token budget forward.
+    providers.reset_models()
 
 
 @pytest.fixture

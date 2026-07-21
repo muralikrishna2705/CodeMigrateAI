@@ -16,6 +16,7 @@ import pytest
 from agents.analyzer_agent import AnalyzerAgent
 from agents.migrator_agent import MigratorAgent
 from config import Settings
+from llm import providers
 from llm.client import LLMClient
 from llm.language_profiles import get_profile, get_supported_profiles
 from llm.prompt_composer import PromptComposer
@@ -460,9 +461,15 @@ async def test_migrator_flags_ungrounded_imports_in_report():
 # --- Model routing ----------------------------------------------------------
 
 
-def test_fast_model_falls_back_to_main_when_unset():
-    client = LLMClient(_settings_with())
-    assert client.fast_model == client.settings.llm_model
+def test_fast_model_defaults_to_the_providers_cheap_model():
+    # With nothing configured, each role resolves to that provider's own default
+    # rather than collapsing onto one model — the fast role existing at all is
+    # what keeps routing/grading calls off the expensive model.
+    client = LLMClient(_settings_with(llm_provider="google_genai", llm_model=""))
+    defaults = providers.DEFAULT_MODELS["google_genai"]
+    assert client.fast_model == defaults["fast"]
+    assert client.main_model == defaults["main"]
+    assert client.fast_model != client.main_model
 
 
 def test_fast_model_used_when_configured():
@@ -470,12 +477,28 @@ def test_fast_model_used_when_configured():
     assert client.fast_model == "fast:1b"
 
 
-def test_build_payload_honors_model_override():
-    client = LLMClient(_settings_with())
-    payload = client._build_payload("p", "s", stream=False, model="override:7b")
-    assert payload["model"] == "override:7b"
-    default_payload = client._build_payload("p", "s", stream=False)
-    assert default_payload["model"] == client.settings.llm_model
+def test_model_defaults_follow_the_configured_provider():
+    # Switching provider must carry the whole model set with it; leaving a
+    # Gemini id pointed at Ollama would fail only at call time.
+    client = LLMClient(_settings_with(llm_provider="ollama", llm_model=""))
+    assert client.main_model == providers.DEFAULT_MODELS["ollama"]["main"]
+
+
+def test_explicit_model_overrides_the_role_default():
+    settings = _settings_with(llm_provider="ollama", llm_model="")
+    overridden = providers.get_chat_model(
+        "main", model="override:7b", settings=settings
+    )
+    assert overridden.model == "override:7b"
+    assert providers.get_chat_model("main", settings=settings).model != "override:7b"
+
+
+def test_json_mode_is_translated_per_provider():
+    # Every backend spells "constrain the decoder to JSON" differently, and it is
+    # a constructor field on both — so the model cache must key on it.
+    settings = _settings_with(llm_provider="ollama", llm_model="")
+    assert providers.get_chat_model("main", json_mode=True, settings=settings).format == "json"
+    assert providers.get_chat_model("main", json_mode=False, settings=settings).format is None
 
 
 def test_fast_model_kwargs_empty_for_stub_llm():

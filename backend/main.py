@@ -22,6 +22,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from graph import nodes as graph_nodes
+from llm import providers
 from llm.client import LLMClient
 from llm.language_profiles import get_supported_profiles
 from llm.streaming import sse_event_generator
@@ -55,28 +56,34 @@ async def lifespan(app: FastAPI):
     global llm_client, pipeline, cache_manager
 
     settings = get_settings()
-    log.info("OLLAMA_URL : %s", settings.ollama_url)
-    log.info("LLM_MODEL  : %s", settings.llm_model)
-    log.info("PIPELINE   : AnalyzerAgent -> MigratorAgent")
+    main_model = providers.resolve_model_name("main", settings)
+    fast_model = providers.resolve_model_name("fast", settings)
+    hosted = providers.is_hosted(settings)
+    log.info("PROVIDER   : %s%s", settings.llm_provider, " (hosted)" if hosted else "")
+    log.info("LLM_MODEL  : %s | fast: %s", main_model, fast_model)
+    log.info("EMBEDDINGS : %s/%s", settings.embedding_provider,
+             providers.resolve_embedding_model(settings))
+    if settings.llm_requests_per_second > 0:
+        log.info("RATE LIMIT : %.2f req/s", settings.llm_requests_per_second)
 
     llm_client = LLMClient()
     alive = await llm_client.health_check()
     if alive:
-        log.info("Ollama is reachable and ready")
-        # Pull the chat model if it isn't present yet, so switching LLM_MODEL
-        # (e.g. to a stronger coder model) works on the next startup without a
-        # manual `ollama pull`.
-        if settings.ollama_auto_pull:
-            await llm_client.ensure_model(settings.llm_model)
-            # Pull the optional fast analysis/planning model too, but only when
-            # it's a distinct model — otherwise routing reuses llm_model.
-            if (
-                settings.fast_llm_model
-                and settings.fast_llm_model != settings.llm_model
-            ):
-                await llm_client.ensure_model(settings.fast_llm_model)
+        log.info("LLM provider is configured and ready")
+    elif hosted:
+        log.warning(
+            "No API key configured for %s; set GOOGLE_API_KEY to enable the LLM",
+            settings.llm_provider,
+        )
     else:
         log.warning("Ollama is not reachable; check that Ollama is running")
+
+    # Only a local provider has models to provision. Hosted ones resolve
+    # server-side, so ensure_model is a no-op there.
+    if alive and not hosted and settings.ollama_auto_pull:
+        await llm_client.ensure_model(main_model)
+        if fast_model != main_model:
+            await llm_client.ensure_model(fast_model)
 
     cache_manager = CacheManager()
 
@@ -110,14 +117,16 @@ async def lifespan(app: FastAPI):
 
     async def _init_rag() -> None:
         try:
-            # The embedding model is separate from the chat model and is often
-            # not pulled on a fresh Ollama install — without it every embed call
-            # 404s and RAG silently disables itself. Pull it once on startup.
-            if settings.ollama_auto_pull:
-                await llm_client.ensure_model(settings.embedding_model)
+            # A local embedding model is separate from the chat model and is
+            # often not pulled on a fresh Ollama install — without it every
+            # embed call 404s and RAG silently disables itself. Pull it once on
+            # startup; a hosted embedding provider needs no provisioning.
+            if settings.embedding_provider == "ollama" and settings.ollama_auto_pull:
+                await llm_client.ensure_model(
+                    providers.resolve_embedding_model(settings)
+                )
             rag_embeddings = CachedEmbeddings(
-                model=settings.embedding_model,
-                base_url=settings.ollama_url,
+                providers.get_embeddings(settings),
                 max_cache=settings.local_cache_max_entries,
             )
             rag_vector_store = VectorStore(rag_embeddings)
@@ -208,8 +217,12 @@ async def health():
     settings = get_settings()
     return {
         "status": "ok",
-        "model": settings.llm_model,
-        "fast_model": settings.fast_llm_model or settings.llm_model,
+        "provider": settings.llm_provider,
+        "model": providers.resolve_model_name("main", settings),
+        "fast_model": providers.resolve_model_name("fast", settings),
+        "llm": "ready" if alive else "unavailable",
+        # Retained under its original key so existing clients keep parsing; it
+        # now reports the configured provider, whichever that is.
         "ollama": "connected" if alive else "unavailable",
         "prompt_composer": "ready",
         "rag": "ready" if getattr(app.state, "rag_pipeline", None) else "unavailable",
@@ -224,17 +237,30 @@ async def get_languages():
     return {"languages": get_settings().supported_languages}
 
 
+def _llm_unavailable_detail() -> str:
+    """The 503 body when the configured provider can't serve a migration.
+
+    Provider-specific because the fix is: a hosted provider needs a key, a local
+    one needs a running daemon and a pulled model. A single generic message
+    would send the operator looking in the wrong place.
+    """
+    settings = get_settings()
+    if providers.is_hosted(settings):
+        return (
+            f"No API key configured for provider '{settings.llm_provider}'. "
+            "Set GOOGLE_API_KEY in the environment or backend/.env."
+        )
+    return (
+        f"Ollama is not reachable at {settings.ollama_url}. Make sure Ollama is "
+        f"running and model '{providers.resolve_model_name('main', settings)}' "
+        "is pulled."
+    )
+
+
 @app.post("/migrate", response_model=MigrateResponse)
 async def migrate(request: MigrateRequest):
     if not await llm_client.health_check():
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                f"Ollama is not reachable at {get_settings().ollama_url}. "
-                f"Make sure Ollama is running and model "
-                f"'{get_settings().llm_model}' is pulled."
-            ),
-        )
+        raise HTTPException(status_code=503, detail=_llm_unavailable_detail())
 
     state = MigrationState(
         source_code=request.source_code,
@@ -269,14 +295,7 @@ async def migrate(request: MigrateRequest):
 @app.post("/migrate/stream")
 async def migrate_stream(request: MigrateRequest):
     if not await llm_client.health_check():
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                f"Ollama is not reachable at {get_settings().ollama_url}. "
-                f"Make sure Ollama is running and model "
-                f"'{get_settings().llm_model}' is pulled."
-            ),
-        )
+        raise HTTPException(status_code=503, detail=_llm_unavailable_detail())
 
     state = MigrationState(
         source_code=request.source_code,
