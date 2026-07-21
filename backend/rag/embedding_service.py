@@ -83,8 +83,12 @@ class CachedEmbeddings(Embeddings):
             vec = self._inner.embed_query(text)
             self._remember_dimensions(vec)
         except Exception as e:
+            # Not cached. Embedding failures here are overwhelmingly transient —
+            # a 503, a rate limit, a dropped connection — and caching the
+            # fallback would make one bad second permanent for that query text
+            # for the life of the process, long after the service recovered.
             log.warning("Embedding failed, using fallback: %s", e)
-            vec = self._fallback_embed(text)
+            return self._fallback_embed(text)
         self._cache[text] = vec
         if len(self._cache) > self._max_cache:
             self._cache.popitem(last=False)

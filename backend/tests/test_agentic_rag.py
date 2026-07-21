@@ -159,6 +159,22 @@ class TestReranking:
         assert len(attempts) == 1
 
 
+class TestScoreFloor:
+    """Which stage is allowed to reject a candidate."""
+
+    def test_a_reranker_downstream_disables_the_cosine_floor(self):
+        # Fetching 20 candidates for the cross-encoder to judge, then dropping
+        # most of them on cosine before it runs, uses the weaker signal to
+        # overrule the stronger one. Measured: at 0.3 this returned nothing at
+        # all for queries whose answer was plainly in the corpus.
+        settings = Settings(rag_rerank_enabled=True, rag_min_score=0.3)
+        assert RAGPipeline._score_floor(settings) == 0.0
+
+    def test_without_a_reranker_the_cosine_floor_is_the_only_control(self):
+        settings = Settings(rag_rerank_enabled=False, rag_min_score=0.3)
+        assert RAGPipeline._score_floor(settings) == 0.3
+
+
 class TestCandidateWidth:
     def test_reranking_widens_the_candidate_pool(self):
         settings = Settings(rag_rerank_enabled=True, rag_top_k=4, rag_rerank_candidates=20)

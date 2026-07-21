@@ -375,13 +375,33 @@ class RAGPipeline:
             return max(settings.rag_top_k, settings.rag_rerank_candidates)
         return settings.rag_top_k
 
+    @staticmethod
+    def _score_floor(settings) -> float:
+        """The cosine floor to apply inside the vector store.
+
+        Zero when a reranker is downstream. The whole point of fetching
+        ``rag_rerank_candidates`` is to let the cross-encoder judge a wide pool,
+        and a cosine floor applied first throws candidates away before it ever
+        sees them — using the weaker signal to overrule the stronger one.
+
+        This was not theoretical. At ``rag_min_score`` 0.3, queries whose answer
+        was plainly in the corpus returned nothing at all ("All 6 results below
+        threshold 0.30, returning empty"), because absolute cosine values from
+        gemini-embedding-001 sit low even for good matches. Precision is now
+        ``rag_rerank_min_score``, applied after reranking on a calibrated score.
+
+        Without a reranker the store's own ordering is final, so the floor is
+        the only precision control there is and ``rag_min_score`` still applies.
+        """
+        return 0.0 if settings.rag_rerank_enabled else settings.rag_min_score
+
     async def _search(self, query: str, where: dict | None):
         settings = get_settings()
         return await asyncio.to_thread(
             self._vector_store.similarity_search,
             query,
             k=self._candidate_k(settings),
-            score_threshold=settings.rag_min_score,
+            score_threshold=self._score_floor(settings),
             where=where,
         )
 

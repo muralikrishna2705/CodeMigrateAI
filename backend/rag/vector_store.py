@@ -59,7 +59,23 @@ class VectorStore:
         kwargs = {"k": k}
         if where:
             kwargs["filter"] = where
-        docs_with_scores = self._store.similarity_search_with_relevance_scores(query, **kwargs)
+        try:
+            docs_with_scores = self._store.similarity_search_with_relevance_scores(
+                query, **kwargs
+            )
+        except Exception as exc:  # noqa: BLE001 — retrieval degrades, never fails
+            # Retrieval is grounding, not correctness: a migration without it is
+            # worse, not broken, and the caller already handles no hits by
+            # emitting the ungrounded notice. Raising here would turn a
+            # transient embedding outage into a failed migration.
+            #
+            # The concrete case: the embedding service returns 503,
+            # CachedEmbeddings substitutes a zero vector of its *assumed* width,
+            # and Chroma rejects it outright when the collection was built at a
+            # different width ("expecting dimension 3072, got 768"). The
+            # fallback exists to degrade gracefully and without this it crashed.
+            log.warning("Vector search failed, continuing without it: %s", exc)
+            return []
         # Filter by threshold
         filtered = [(doc, score) for doc, score in docs_with_scores if score >= score_threshold]
         if not filtered and docs_with_scores:
