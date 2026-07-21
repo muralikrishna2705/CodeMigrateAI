@@ -25,6 +25,7 @@ sequential flow.
 import logging
 
 from config import get_settings
+from models.schemas import SubTaskPlan
 from models.state import MigrationState
 
 from agents.base import AgentResult, BaseAgent
@@ -106,48 +107,28 @@ class OrchestratorAgent(BaseAgent):
         :data:`PARALLELIZABLE_TASKS` — a decomposition naming ``migration`` or a
         hallucinated task would otherwise schedule chained work concurrently.
         """
-        call_llm = getattr(self.llm, "call_llm", None)
-        if call_llm is None:
-            return None
-        try:
-            prompt = (
-                f"A developer is migrating {state.source_language} "
-                f"{state.source_version} to {state.target_language} "
-                f"{state.target_version}.\n\n"
-                "Which preparation sub-tasks should run before planning the "
-                "migration? Choose from:\n"
-                '- "analysis": deep structural analysis of complex constructs\n'
-                '- "retrieval": fetch reference documentation and examples\n\n'
-                f"Detected complexity: "
-                f"{(state.code_metrics or {}).get('complexity', 'low')}.\n\n"
-                'Respond with only JSON: {"tasks": ["..."]}'
-            )
-            raw = await call_llm(
-                prompt,
-                system_prompt="Respond ONLY with the JSON object.",
-                fmt="json",
-                **self._fast_model_kwargs(),
-            )
-        except Exception as exc:  # noqa: BLE001 — planning hint is strictly optional
-            log.warning("LLM decomposition call failed, using rules: %s", exc)
-            return None
-
-        try:
-            data = self._parse_tool_choice(raw)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("LLM decomposition unparseable, using rules: %s", exc)
-            return None
-        if not data:
-            return None
-
-        raw_tasks = data.get("tasks")
-        if not isinstance(raw_tasks, list):
+        prompt = (
+            f"A developer is migrating {state.source_language} "
+            f"{state.source_version} to {state.target_language} "
+            f"{state.target_version}.\n\n"
+            "Which preparation sub-tasks should run before planning the "
+            "migration?\n\n"
+            f"Detected complexity: "
+            f"{(state.code_metrics or {}).get('complexity', 'low')}."
+        )
+        plan = await self._call_structured(
+            SubTaskPlan,
+            prompt,
+            system_prompt="You are planning the preparation phase of a migration.",
+        )
+        if plan is None:
             return None
 
         # Preserve the catalog's order rather than the model's, and drop
         # duplicates, so the plan is a stable set regardless of how the model
-        # phrased it.
-        tasks = [t for t in PARALLELIZABLE_TASKS if t in raw_tasks]
+        # phrased it. The schema's Literal already excludes a hallucinated task
+        # name, so this is now ordering and dedup only — not validation.
+        tasks = [t for t in PARALLELIZABLE_TASKS if t in plan.tasks]
         if not tasks:
             log.info("LLM decomposition selected nothing valid; using rules")
             return None

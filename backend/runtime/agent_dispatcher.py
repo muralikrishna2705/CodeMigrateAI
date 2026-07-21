@@ -16,6 +16,7 @@ body without touching the graph.
 import logging
 
 from config import get_settings
+from models.schemas import RouteDecision
 from models.state import MigrationState
 
 from agents.base import AgentResult, BaseAgent
@@ -73,30 +74,29 @@ class DispatcherAgent(BaseAgent):
         Best-effort: returns ``None`` on any failure (stub LLM, model down, an
         unparseable answer) so the caller keeps the rule-based decision.
         """
-        call_llm = getattr(self.llm, "call_llm", None)
-        if call_llm is None:
+        prompt = (
+            f"A developer is migrating {state.source_language} "
+            f"{state.source_version} to {state.target_language} "
+            f"{state.target_version}. Detected complexity: "
+            f"{(state.code_metrics or {}).get('complexity', 'low')}.\n\n"
+            "Should a deep structural analysis pass run before planning? It is "
+            "worth the extra latency for generics, reflection, async, deep "
+            "inheritance, or heavy standard-library use.\n\nCODE:\n"
+            f"{state.source_code[: get_settings().max_llm_code_chars]}"
+        )
+        # A bool field beats parsing 'yes'/'no': free text left a third outcome
+        # (neither prefix matched) that silently fell back to the rule, so a
+        # chatty model disabled LLM routing without anything logging that it had.
+        decision = await self._call_structured(
+            RouteDecision,
+            prompt,
+            system_prompt="You are triaging a code migration.",
+        )
+        if decision is None:
             return None
-        try:
-            prompt = (
-                f"A developer is migrating {state.source_language} "
-                f"{state.source_version} to {state.target_language} "
-                f"{state.target_version}. Detected complexity: "
-                f"{(state.code_metrics or {}).get('complexity', 'low')}. Should we "
-                "run a deep structural analysis pass before planning? Answer only "
-                "'yes' or 'no'.\n\nCODE:\n"
-                f"{state.source_code[: get_settings().max_llm_code_chars]}"
-            )
-            raw = await call_llm(
-                prompt,
-                system_prompt="Answer with only 'yes' or 'no'.",
-                **self._fast_model_kwargs(),
-            )
-            answer = raw.strip().lower()
-            if answer.startswith("yes"):
-                return True
-            if answer.startswith("no"):
-                return False
-            return None
-        except Exception as exc:  # noqa: BLE001 — routing hint is strictly optional
-            log.warning("LLM routing failed, using rules: %s", exc)
-            return None
+        log.info(
+            "LLM routing: deep_analyze=%s (%s)",
+            decision.deep_analyze,
+            decision.reasoning or "no reason given",
+        )
+        return decision.deep_analyze

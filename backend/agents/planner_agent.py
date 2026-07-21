@@ -2,6 +2,7 @@ import logging
 
 from config import get_settings
 from llm.language_profiles import get_profile
+from models.schemas import MigrationPlan
 from models.state import MigrationState, MigrationType
 
 from agents.base import AgentResult, BaseAgent
@@ -24,12 +25,10 @@ class PlannerAgent(BaseAgent):
         )
         system_prompt = self._build_system_prompt(migration_type, state)
 
-        # Planning is structured reasoning, not code generation — route to the
-        # fast model when configured (falls back to the main model otherwise).
-        raw = await self.llm.call_llm(
-            prompt, system_prompt, fmt="json", **self._fast_model_kwargs()
-        )
-        plan = self._extract_plan(raw)
+        # Planning is structured reasoning, not code generation — routed to the
+        # fast model. The step structure exists to make the model think in steps;
+        # downstream consumes the rendered prose, not the shape.
+        plan = await self._plan(prompt, system_prompt)
 
         # Self-reflection (Dimension 3): critique the plan and refine it once if the
         # model is not confident in it. Opt-in and best-effort — off by default and
@@ -82,17 +81,9 @@ class PlannerAgent(BaseAgent):
         refine_prompt = (
             f"{planning_prompt}\n\n---\n\nYour previous plan was:\n{plan}\n\n"
             f"A reviewer flagged these issues:\n{reflection.feedback}\n\n"
-            "Produce an improved plan that addresses every point, in the same JSON "
-            "format."
+            "Produce an improved plan that addresses every point."
         )
-        try:
-            raw = await self.llm.call_llm(
-                refine_prompt, system_prompt, fmt="json", **self._fast_model_kwargs()
-            )
-            refined = self._extract_plan(raw)
-        except Exception as exc:  # noqa: BLE001 — refinement is optional enrichment
-            log.warning("Plan refinement failed: %s", exc)
-            return plan, note
+        refined = await self._plan(refine_prompt, system_prompt)
 
         if refined and refined.strip():
             note["refined"] = True
@@ -138,30 +129,15 @@ class PlannerAgent(BaseAgent):
             "```" + source_profile.language_id,
             state.source_code[: settings.max_llm_code_chars],
             "```",
-            "",
-            "OUTPUT FORMAT (JSON only, no markdown):",
-            "{",
-            '  "plan_summary": "One-sentence overview",',
-            '  "steps": [',
-            '    {"step": 1, "action": "...", "details": "..."},',
-            '    {"step": 2, "action": "...", "details": "..."}',
-            "  ],",
-            '  "risk_areas": ["area1", "area2"]',
-            "}",
         ]
         return "\n".join(lines)
 
-    def _extract_plan(self, raw: str) -> str:
-        try:
-            import json
+    async def _plan(self, prompt: str, system_prompt: str) -> str:
+        """Produce a rendered plan, or an empty string when none can be had.
 
-            data = json.loads(raw)
-            return data.get("plan_summary", raw.strip())
-        except json.JSONDecodeError:
-            if hasattr(self.llm, "extract_json"):
-                try:
-                    data = self.llm.extract_json(raw)
-                    return data.get("plan_summary", raw.strip())
-                except Exception:
-                    pass
-            return raw.strip()
+        Empty is meaningful: ``run`` keeps the previous plan on a failed refine,
+        and an empty first plan simply leaves ``inline_plan`` unset — the
+        MigratorAgent already handles a missing plan section.
+        """
+        result = await self._call_structured(MigrationPlan, prompt, system_prompt)
+        return result.render() if result else ""

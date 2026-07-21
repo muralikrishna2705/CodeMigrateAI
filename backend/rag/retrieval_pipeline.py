@@ -1,6 +1,5 @@
 import asyncio
 import hashlib
-import json
 import logging
 import re
 from abc import ABC, abstractmethod
@@ -161,13 +160,14 @@ class RetrievalStrategy(ABC):
 
     async def _ask_json(self, prompt: str, system: str = "") -> dict:
         """Fast-model JSON call parsed to a dict; ``{}`` when unavailable/bad."""
+        from llm.structured import salvage_json
+
         raw = await self._ask(prompt, system=system, fmt="json")
         if not raw:
             return {}
-        extract = getattr(self.llm, "extract_json", None)
         try:
-            return extract(raw) if extract else json.loads(raw)
-        except Exception:  # noqa: BLE001
+            return salvage_json(raw)
+        except ValueError:
             return {}
 
     @property

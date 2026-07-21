@@ -51,6 +51,7 @@ class MigratedCodeStreamer:
         self._pos = 0
         self._in_value = False
         self._done = False
+        self._decoded: list[str] = []
 
     def feed(self, delta: str) -> str:
         """Append ``delta`` to the buffer and return any newly decoded code.
@@ -70,7 +71,20 @@ class MigratedCodeStreamer:
             self._in_value = True
             self._pos = match.end()
 
-        return self._drain_value()
+        chunk = self._drain_value()
+        if chunk:
+            self._decoded.append(chunk)
+        return chunk
+
+    def value(self) -> str:
+        """Everything decoded from ``migrated_code`` so far.
+
+        The salvage path uses this when the completed response won't parse: the
+        streamer has been tracking the code field character by character all
+        along, so its view survives a response that was truncated before its
+        closing brace — which is exactly when parsing fails.
+        """
+        return "".join(self._decoded)
 
     def _drain_value(self) -> str:
         buf = self._buf

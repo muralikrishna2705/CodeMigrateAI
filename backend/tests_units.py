@@ -18,6 +18,8 @@ from agents.migrator_agent import MigratorAgent
 from config import Settings
 from llm import providers
 from llm.client import LLMClient
+from llm.structured import coerce_or_none, salvage_json
+from models.schemas import Critique
 from llm.language_profiles import get_profile, get_supported_profiles
 from llm.prompt_composer import PromptComposer
 from models.state import MigrationState, MigrationType
@@ -82,22 +84,43 @@ def make_state(**overrides) -> MigrationState:
     return MigrationState(**data)
 
 
-def test_extract_json_from_fenced_block():
-    client = LLMClient()
-    text = '```json\n{"key": "value"}\n```'
-    assert client.extract_json(text) == {"key": "value"}
+# JSON salvage now lives in one place (llm/structured.py) instead of being
+# copy-pasted across six agents, and production never reaches it — a schema-bound
+# model cannot emit malformed JSON. It survives for test doubles and for the
+# streaming path, where the response is parsed by us rather than the provider.
 
 
-def test_extract_json_from_raw_object():
-    client = LLMClient()
+def test_salvage_json_from_fenced_block():
+    assert salvage_json('```json\n{"key": "value"}\n```') == {"key": "value"}
+
+
+def test_salvage_json_from_raw_object():
     text = 'Some preamble {"complexity": "high"} trailing'
-    assert client.extract_json(text) == {"complexity": "high"}
+    assert salvage_json(text) == {"complexity": "high"}
 
 
-def test_extract_json_raises_on_no_json():
-    client = LLMClient()
+def test_salvage_json_prefers_the_outer_object():
+    text = '{"outer": {"inner": 1}, "b": 2}'
+    assert salvage_json(text) == {"outer": {"inner": 1}, "b": 2}
+
+
+def test_salvage_json_repairs_a_truncated_object():
+    # The shape a response takes when it hits the token ceiling mid-write.
+    assert salvage_json('{"plan_summary": "did a thing"') == {
+        "plan_summary": "did a thing"
+    }
+
+
+def test_salvage_json_raises_on_no_json():
     with pytest.raises(ValueError):
-        client.extract_json("no json here at all")
+        salvage_json("no json here at all")
+
+
+def test_coerce_or_none_returns_none_on_schema_mismatch():
+    # Callers treat structured reasoning as enrichment over a rule-based path,
+    # so a response that parses but doesn't fit must be None, not an exception.
+    assert coerce_or_none(Critique, '{"confidence": 99}') is None
+    assert coerce_or_none(Critique, '{"confidence": 0.5}').confidence == 0.5
 
 
 def test_strip_fences_removes_code_block():
@@ -316,14 +339,12 @@ async def test_migrator_detects_language_conversion():
 
 
 @pytest.mark.asyncio
-async def test_migrator_retries_invalid_json():
-    retry_response = json.dumps(
-        {
-            "plan_summary": "Retry produced valid JSON.",
-            "migrated_code": "print('ok')",
-        }
-    )
-    llm = MockLLM(responses=["not json", retry_response])
+async def test_migrator_recovers_when_the_model_ignores_the_schema():
+    # A model that emits bare code instead of the structured object is still
+    # giving us a working migration. Reporting a format error and throwing the
+    # code away would be the wrong trade, so the second, unstructured attempt
+    # salvages it.
+    llm = MockLLM(responses=["not json at all", "```python\nprint('ok')\n```"])
     agent = MigratorAgent(llm)
     state = make_state(
         source_language="python",
@@ -334,9 +355,32 @@ async def test_migrator_retries_invalid_json():
 
     result = await agent(state)
 
-    assert result.inline_plan == "Retry produced valid JSON."
     assert result.migrated_code == "print('ok')"
     assert llm.call_llm.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_migrator_uses_the_structured_result_without_a_retry():
+    llm = MockLLM(
+        responses=[
+            json.dumps({"plan_summary": "Upgraded prints.", "migrated_code": "print('ok')"})
+        ]
+    )
+    agent = MigratorAgent(llm)
+    result = await agent(make_state(source_language="python", target_language="python"))
+
+    assert result.inline_plan == "Upgraded prints."
+    assert result.migrated_code == "print('ok')"
+    assert llm.call_llm.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_migrator_accepts_an_aliased_code_key():
+    # Models reach for "code"/"output" often enough that accepting them saves a
+    # whole regeneration round trip on the streaming path.
+    llm = MockLLM(responses=[json.dumps({"plan_summary": "p", "code": "x = 1"})])
+    result = await MigratorAgent(llm)(make_state())
+    assert result.migrated_code == "x = 1"
 
 
 def test_registry_discovers_domain_and_runtime_agents():

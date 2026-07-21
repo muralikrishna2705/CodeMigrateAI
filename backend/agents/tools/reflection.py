@@ -14,8 +14,10 @@ down, unparseable answer) degrades to a *passing* verdict. Reflection improves a
 migration when it works and is invisible when it can't, but never blocks one.
 """
 
-import json
 import logging
+
+from llm.structured import coerce_or_none
+from models.schemas import Critique
 
 from agents.base import ReflectionResult
 from agents.tools.base import AgentTool, ToolResult
@@ -36,8 +38,6 @@ PLAN_CRITERIA = (
     "risk coverage (calls out what could break)",
 )
 
-_VALID_RECOMMENDATIONS = {"pass", "re-generate", "gather-more-info"}
-
 
 def _fast_model_kwargs(llm) -> dict:
     """Route the critique to the fast model when the client exposes one.
@@ -50,44 +50,37 @@ def _fast_model_kwargs(llm) -> dict:
     return {"model": fast} if fast else {}
 
 
-def _coerce_confidence(value) -> float:
-    try:
-        conf = float(value)
-    except (TypeError, ValueError):
-        return 1.0
-    return max(0.0, min(1.0, conf))
+async def _critique(llm, prompt: str, system_prompt: str) -> Critique | None:
+    """Get a :class:`Critique` from ``llm``, natively when it can.
 
-
-def _normalize_recommendation(value) -> str:
-    """Map a free-text recommendation onto the three canonical actions.
-
-    A small model rarely echoes the exact enum, so we accept near-misses
-    ("regenerate", "needs more context") and fall back to ``"pass"`` for anything
-    unrecognized — the safe default that keeps the migration moving.
+    Mirrors ``BaseAgent._call_structured`` but works off a bare client, because
+    the engine and the tool both hold a client rather than an agent. Returns None
+    on any failure — the caller turns that into a *passing* verdict.
     """
-    text = str(value or "").strip().lower()
-    if text in _VALID_RECOMMENDATIONS:
-        return text
-    if "regen" in text or "redo" in text or "rewrite" in text:
-        return "re-generate"
-    if "info" in text or "context" in text or "retriev" in text or "gather" in text:
-        return "gather-more-info"
-    return "pass"
+    chat_model = getattr(llm, "chat_model", None)
+    if chat_model is not None:
+        from langchain_core.messages import HumanMessage, SystemMessage
 
-
-def _parse(raw: str, llm) -> dict | None:
-    """Parse the critique JSON, tolerating fenced or prefixed output."""
-    try:
-        data = json.loads(raw.strip())
-    except (json.JSONDecodeError, AttributeError):
-        extract_json = getattr(llm, "extract_json", None)
-        if extract_json is None:
-            return None
         try:
-            data = extract_json(raw)
-        except Exception:  # noqa: BLE001 — parsing is best-effort
+            model = chat_model("fast").with_structured_output(Critique)
+            return await model.ainvoke(
+                [SystemMessage(content=system_prompt), HumanMessage(content=prompt)]
+            )
+        except Exception as exc:  # noqa: BLE001 — reflection is strictly optional
+            log.warning("Structured reflection failed: %s", exc)
             return None
-    return data if isinstance(data, dict) else None
+
+    call_llm = getattr(llm, "call_llm", None)
+    if call_llm is None:
+        return None
+    try:
+        raw = await call_llm(
+            prompt, system_prompt=system_prompt, fmt="json", **_fast_model_kwargs(llm)
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Reflection call failed: %s", exc)
+        return None
+    return coerce_or_none(Critique, raw)
 
 
 async def evaluate_output(
@@ -104,8 +97,8 @@ async def evaluate_output(
     judge (empty output) or no usable LLM, so callers never need to guard the
     degraded path themselves.
     """
-    call_llm = getattr(llm, "call_llm", None)
-    if call_llm is None or not (output or "").strip():
+    usable = getattr(llm, "chat_model", None) or getattr(llm, "call_llm", None)
+    if usable is None or not (output or "").strip():
         return ReflectionResult.neutral()
 
     criteria_str = (
@@ -122,44 +115,31 @@ async def evaluate_output(
         f"{stage.upper()}:",
         output[:6000],
         "",
-        "Rate your confidence from 0.0 (badly wrong) to 1.0 (correct and "
-        "complete), and choose ONE recommendation:",
-        "- \"pass\": good enough to proceed.",
-        "- \"re-generate\": has real problems; redo it.",
-        "- \"gather-more-info\": can't be sure without more reference material.",
-        "",
-        'Respond with ONLY JSON: {"confidence": <0.0-1.0>, "recommendation": '
-        '"pass|re-generate|gather-more-info", "feedback": "specific, actionable '
-        'issues to fix (empty if pass)"}',
+        # What each recommendation means lives in the Critique schema's field
+        # descriptions, which are serialized into the schema the model sees —
+        # repeating them here would be two copies free to drift apart.
+        "Rate your confidence honestly and choose one recommendation.",
     ]
     prompt = "\n".join(prompt_parts)
 
-    try:
-        raw = await call_llm(
-            prompt,
-            system_prompt=(
-                "You are a meticulous senior reviewer performing self-reflection. "
-                "Be honest about flaws. Respond ONLY with the JSON object."
-            ),
-            fmt="json",
-            **_fast_model_kwargs(llm),
-        )
-    except Exception as exc:  # noqa: BLE001 — reflection is strictly optional
-        log.warning("Reflection call failed: %s", exc)
+    critique = await _critique(
+        llm,
+        prompt,
+        "You are a meticulous senior reviewer performing self-reflection. "
+        "Be honest about flaws.",
+    )
+    if critique is None:
+        log.info("No usable critique; treating as pass")
         return ReflectionResult.neutral()
 
-    data = _parse(raw, llm)
-    if not data:
-        log.info("Reflection response unparseable; treating as pass")
-        return ReflectionResult.neutral()
-
-    confidence = _coerce_confidence(data.get("confidence", 1.0))
-    recommendation = _normalize_recommendation(data.get("recommendation", "pass"))
-    feedback = str(data.get("feedback", "") or "").strip()
+    # The schema bounds confidence to [0.0, 1.0] and constrains recommendation to
+    # the three canonical actions, so the manual clamping and the fuzzy
+    # "regenerate"/"needs more context" string matching that used to live here
+    # are no longer reachable states.
     return ReflectionResult(
-        confidence=confidence,
-        recommendation=recommendation,
-        feedback=feedback,
+        confidence=critique.confidence,
+        recommendation=critique.recommendation,
+        feedback=critique.feedback.strip(),
         details={"stage": stage, "criteria": list(criteria)},
     )
 

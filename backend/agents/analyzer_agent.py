@@ -3,6 +3,7 @@ from typing import Any
 
 from config import get_settings
 from llm.prompts import ANALYZER_PROMPT
+from models.schemas import SemanticAnalysis
 from models.state import MigrationState
 
 from agents.base import AgentResult, BaseAgent
@@ -107,13 +108,15 @@ class AnalyzerAgent(BaseAgent):
         if outline:
             prompt = f"{prompt}\n\nFULL-FILE OUTLINE (code above is truncated):\n{outline}"
 
-        raw = await self.llm.call_llm(
+        result = await self._call_structured(
+            SemanticAnalysis,
             prompt,
-            system_prompt=(
-                "You are a code analysis expert. Respond ONLY with valid JSON."
-            ),
+            system_prompt="You are a code analysis expert.",
         )
-        return self.llm.extract_json(raw)
+        # None means the semantic pass produced nothing usable. Returning {} lets
+        # the caller's dict merge leave the static-only defaults in place, which
+        # is exactly the degraded shape those defaults exist for.
+        return result.model_dump() if result else {}
 
     async def _outline_if_truncated(self, code: str, limit: int) -> str:
         if len(code) <= limit:

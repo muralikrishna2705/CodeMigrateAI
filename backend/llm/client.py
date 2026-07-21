@@ -14,8 +14,7 @@ compatibility surface, not the target API.
 
 import json
 import logging
-import re
-from typing import Any, AsyncIterator
+from typing import AsyncIterator
 
 import httpx
 from config import get_settings
@@ -119,67 +118,6 @@ class LLMClient:
             text = chunk.text
             if text:
                 yield text
-
-    # --- JSON salvage (removed in Phase 1, once every call site is schema-bound)
-
-    def extract_json(self, raw_text: str) -> dict:
-        text = raw_text.strip()
-
-        # 1. Strip common preamble/suffix before any parsing.
-        cleaned = re.sub(
-            r"(?i)^(?:here(?:'s| is) (?:the |my |your )?"
-            r"(?:migrated|converted|upgraded) code[:\s]*|output[:\s]*|"
-            r"result[:\s]*|sure[^.]*\.)",
-            "",
-            text,
-        ).strip()
-
-        # 2. Extract from markdown fenced blocks (handle both ```json and ```).
-        for block in re.findall(r"```(?:json)?\s*([\s\S]*?)```", cleaned):
-            try:
-                return json.loads(block.strip())
-            except json.JSONDecodeError:
-                pass
-
-        # 3. Balanced-brace extraction — find all {…} pairs using depth tracking.
-        candidates = []
-        depth = 0
-        start = -1
-        for i, ch in enumerate(cleaned):
-            if ch == "{":
-                if depth == 0:
-                    start = i
-                depth += 1
-            elif ch == "}":
-                if depth > 0:
-                    depth -= 1
-                    if depth == 0 and start >= 0:
-                        candidates.append(cleaned[start : i + 1])
-                        start = -1
-        for candidate in sorted(candidates, key=len, reverse=True):
-            try:
-                return json.loads(candidate)
-            except json.JSONDecodeError:
-                pass
-
-        # 4. Fallback: try to repair truncated JSON (add missing closing brace).
-        for candidate in candidates:
-            for fix in [candidate + "}", candidate + '"}}']:
-                try:
-                    return json.loads(fix)
-                except json.JSONDecodeError:
-                    pass
-
-        # 5. Last resort: greedy regex (original approach).
-        for obj in sorted(
-            re.findall(r"\{[\s\S]*\}", text), key=len, reverse=True
-        ):
-            try:
-                return json.loads(obj)
-            except json.JSONDecodeError:
-                pass
-
-        raise ValueError("No valid JSON in LLM response")
 
     # --- Provider health / model provisioning ------------------------------
 

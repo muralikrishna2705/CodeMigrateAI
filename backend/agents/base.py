@@ -1,4 +1,3 @@
-import json
 import logging
 import time
 from abc import ABC, ABCMeta, abstractmethod
@@ -8,6 +7,8 @@ from typing import TYPE_CHECKING
 from models.state import MigrationState
 
 if TYPE_CHECKING:
+    from pydantic import BaseModel
+
     from agents.tools.base import ToolRegistry, ToolResult
 
 log = logging.getLogger("CodeMigrateAI.Agents")
@@ -184,6 +185,64 @@ class BaseAgent(ABC, metaclass=AgentMeta):
             self.llm, output=output, criteria=chosen, stage=stage, context=context
         )
 
+    # --- Structured output ------------------------------------------------
+
+    async def _call_structured(
+        self,
+        schema: "type[BaseModel]",
+        prompt: str,
+        system_prompt: str = "",
+        *,
+        role: str = "fast",
+    ) -> "BaseModel | None":
+        """Ask the model for ``schema`` and return a validated instance.
+
+        Prefers native structured output — the provider constrains decoding to
+        the schema, so a malformed response is not a state the model can reach.
+        When ``self.llm`` is a test double (anything without ``chat_model``) it
+        falls back to a plain JSON call plus :func:`llm.structured.coerce`.
+
+        Returns ``None`` on any failure rather than raising, because every caller
+        treats structured reasoning as enrichment over a working rule-based path:
+        a routing hint, a critique, a decomposition. None means "use the rule".
+        """
+        from llm.structured import coerce_or_none
+
+        chat_model = getattr(self.llm, "chat_model", None)
+        if chat_model is not None:
+            from langchain_core.messages import HumanMessage, SystemMessage
+
+            messages: list = []
+            if system_prompt:
+                messages.append(SystemMessage(content=system_prompt))
+            messages.append(HumanMessage(content=prompt))
+            try:
+                model = chat_model(role).with_structured_output(schema)
+                return await model.ainvoke(messages)
+            except Exception as exc:  # noqa: BLE001 — structured output is optional
+                log.warning(
+                    "[%s] structured call for %s failed: %s",
+                    self.name,
+                    schema.__name__,
+                    exc,
+                )
+                return None
+
+        call_llm = getattr(self.llm, "call_llm", None)
+        if call_llm is None:
+            return None
+        try:
+            raw = await call_llm(
+                prompt,
+                system_prompt=system_prompt,
+                fmt="json",
+                **self._fast_model_kwargs(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[%s] %s call failed: %s", self.name, schema.__name__, exc)
+            return None
+        return coerce_or_none(schema, raw)
+
     # --- Tool use ---------------------------------------------------------
 
     async def _call_tool(self, name: str, **kwargs) -> "ToolResult":
@@ -284,15 +343,13 @@ class BaseAgent(ABC, metaclass=AgentMeta):
         return name, arguments
 
     def _parse_tool_choice(self, raw: str) -> dict | None:
-        """Parse the selection response, tolerating fenced//prefixed JSON."""
+        """Parse the selection response, tolerating fenced/prefixed JSON."""
+        from llm.structured import salvage_json
+
         try:
-            data = json.loads(raw.strip())
-        except json.JSONDecodeError:
-            extract_json = getattr(self.llm, "extract_json", None)
-            if extract_json is None:
-                return None
-            data = extract_json(raw)
-        return data if isinstance(data, dict) else None
+            return salvage_json(raw)
+        except ValueError:
+            return None
 
     def _fast_model_kwargs(self) -> dict:
         """Return call kwargs routing to the fast model, when supported.

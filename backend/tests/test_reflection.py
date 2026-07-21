@@ -18,11 +18,7 @@ from agents.planner_agent import PlannerAgent
 from agents.reflector_agent import ReflectorAgent
 from agents.tools import ReflectionTool, build_registry
 from agents.tools.base import ToolRegistry
-from agents.tools.reflection import (
-    CODE_CRITERIA,
-    _normalize_recommendation,
-    evaluate_output,
-)
+from agents.tools.reflection import CODE_CRITERIA, evaluate_output
 from config import Settings
 from graph import nodes
 from graph.conditions import reflect_condition
@@ -116,17 +112,37 @@ class TestEvaluateOutput:
         assert result.passed
 
     @pytest.mark.asyncio
-    async def test_confidence_is_clamped(self):
+    async def test_out_of_range_confidence_is_rejected_not_clamped(self):
+        # The Critique schema bounds confidence to [0.0, 1.0], so a value outside
+        # it fails validation and the critique degrades to a passing verdict.
+        # Previously this was clamped after parsing, which silently turned a
+        # model that misunderstood the scale into a confident-looking answer.
         llm = ScriptedLLM(json.dumps({"confidence": 5, "recommendation": "pass"}))
         result = await evaluate_output(llm, output="x = 1")
-        assert result.confidence == 1.0
+        assert result.passed
+        assert result.details == {"degraded": True}
 
-    def test_recommendation_normalization(self):
-        assert _normalize_recommendation("regenerate") == "re-generate"
-        assert _normalize_recommendation("REDO it") == "re-generate"
-        assert _normalize_recommendation("needs more context") == "gather-more-info"
-        assert _normalize_recommendation("looks good") == "pass"
-        assert _normalize_recommendation("pass") == "pass"
+    @pytest.mark.asyncio
+    async def test_recommendation_outside_the_enum_degrades_to_pass(self):
+        # The three actions are a Literal on the schema rather than a fuzzy
+        # string match over "regenerate"/"redo"/"needs more context". Anything
+        # else is now a validation failure, and a failed critique must never
+        # block a migration.
+        llm = ScriptedLLM(json.dumps({"confidence": 0.2, "recommendation": "redo it"}))
+        result = await evaluate_output(llm, output="x = 1")
+        assert result.passed
+
+    @pytest.mark.asyncio
+    async def test_valid_recommendation_is_carried_through(self):
+        llm = ScriptedLLM(
+            json.dumps(
+                {"confidence": 0.2, "recommendation": "re-generate", "feedback": "stub"}
+            )
+        )
+        result = await evaluate_output(llm, output="x = 1")
+        assert result.recommendation == "re-generate"
+        assert result.confidence == 0.2
+        assert result.feedback == "stub"
 
 
 # --- ReflectionTool ---------------------------------------------------------
