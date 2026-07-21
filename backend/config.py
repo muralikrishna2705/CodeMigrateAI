@@ -105,10 +105,17 @@ class Settings(BaseSettings):
 
     # LangGraph (Phase 3)
     max_retries: int = 2
-    # Dynamic routing: when on, the DispatcherAgent asks the fast model whether a
-    # migration needs deep analysis (falling back to the complexity rule on any
-    # failure). Off by default so routing stays deterministic and offline-safe.
-    dispatcher_llm_routing: bool = False
+    # Dynamic routing: the DispatcherAgent asks the fast model whether a
+    # migration needs deep analysis, falling back to the complexity rule on any
+    # failure.
+    #
+    # On by default. Whether the *model* decides control flow, rather than only
+    # generating content, is the difference between an agentic system and a
+    # scripted one with an LLM in it — leaving this off shipped a pipeline whose
+    # every branch was a hardcoded rule. It costs one fast-model call, and the
+    # rule remains as the fallback, so the worst case is the old behaviour plus
+    # one call. Set false for a fully deterministic, offline-reproducible run.
+    dispatcher_llm_routing: bool = True
     # Dynamic orchestration (Dimension 4)
     #
     # The OrchestratorAgent decomposes a migration into sub-tasks and the
@@ -124,11 +131,13 @@ class Settings(BaseSettings):
     # invocation that can make LLM calls, so this bounds simultaneous load on
     # the Ollama endpoint rather than just CPU.
     max_parallel_tasks: int = 4
-    # When on, the OrchestratorAgent asks the fast model to decompose the
-    # migration instead of applying its rules (falling back to the rules on any
-    # failure), mirroring dispatcher_llm_routing. Off by default so the
-    # decomposition stays deterministic and offline-safe.
-    orchestrator_llm_planning: bool = False
+    # The OrchestratorAgent asks the fast model to decompose the migration
+    # instead of applying its rules, falling back to the rules on any failure.
+    # On by default for the same reason as dispatcher_llm_routing, and bounded
+    # the same way: one fast-model call, and the answer is constrained to a
+    # Literal-typed SubTaskPlan, so a hallucinated sub-task cannot reach the
+    # graph. Set false for a deterministic decomposition.
+    orchestrator_llm_planning: bool = True
 
     # Adaptive RAG: when the MigratorAgent emits at least this many ungrounded
     # imports, it enqueues them as targeted retrieval queries and the graph loops

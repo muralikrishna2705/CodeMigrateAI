@@ -11,7 +11,14 @@ pythonpath = ["backend"]
 # importlib import mode loads each test file by path under a unique name instead
 # of registering by basename; it is pytest's recommended mode for non-installed
 # test layouts and avoids sys.path/sys.modules surprises.
-addopts = "--import-mode=importlib"
+# `-m "not live"` deselects the tests that make real API calls. They are opt-in
+# rather than skipped-by-default so that running the suite costs nothing and
+# needs no key, while `pytest -m live` stays a deliberate, cheap pre-demo check.
+addopts = "--import-mode=importlib -m 'not live'"
+
+markers = [
+    "live: makes a real API call to the configured provider (opt-in; needs a key)",
+]
 
 # Collect the tests/ package plus the loose end-to-end files at backend/ root
 # (tests_graph.py, tests_orchestrator.py, tests_units.py). The default

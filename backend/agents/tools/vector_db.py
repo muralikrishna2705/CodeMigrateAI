@@ -12,7 +12,7 @@ Both paths share ``RAGPipeline``'s filter ladder, ranking, and cache, so
 on-demand queries are grounded exactly the way the passive ones are.
 """
 
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -31,8 +31,21 @@ class VectorDBArgs(BaseModel):
         default="", description="Restrict results to this language."
     )
     target_version: str = Field(default="", description="Prefer this version's docs.")
-    intent: Literal["", "precise", "exploratory", "verify"] = Field(
-        default="",
+    # Optional rather than a Literal containing "".
+    #
+    # An empty string in a Literal becomes an empty enum value in the generated
+    # JSON schema, and Gemini rejects the whole tool declaration for it:
+    # "function_declarations[0].parameters.properties[intent].enum[0]: cannot be
+    # empty" (400). Every retrieval tool call failed that way while the agent
+    # degraded quietly to its no-tool path, so the symptom was weaker retrieval
+    # rather than an error — native tool calling was effectively off in
+    # production while all its unit tests passed.
+    #
+    # None and "" mean the same thing downstream (neither maps to a strategy in
+    # _INTENT_STRATEGY, so both fall through to the plain search), so this is
+    # behaviour-preserving.
+    intent: Optional[Literal["precise", "exploratory", "verify"]] = Field(
+        default=None,
         description=(
             "'precise' when you want one exact answer, 'exploratory' when casting "
             "wide for options, 'verify' for a plain existence check."
@@ -77,7 +90,7 @@ class VectorDBTool(AgentTool):
         query: str = "",
         target_language: str = "",
         target_version: str = "",
-        intent: str = "",
+        intent: str | None = None,
         **_,
     ) -> ToolResult:
         if not self._rag:

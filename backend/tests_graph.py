@@ -57,6 +57,17 @@ class StubLLM:
     ) -> str:
         self.calls.append(prompt)
 
+        # DispatcherAgent (dispatcher_llm_routing, on by default): asks whether
+        # deep analysis is warranted. Answer "no" so these tests exercise the
+        # loops they are about, on the same sequential path they always took.
+        if "Should a deep structural analysis pass run" in prompt:
+            return json.dumps({"deep_analyze": False, "reason": "stub"})
+
+        # OrchestratorAgent (orchestrator_llm_planning, on by default): asks for
+        # the preparation decomposition. One task means no fan-out.
+        if "Which preparation sub-tasks should run" in prompt:
+            return json.dumps({"tasks": ["retrieval"]})
+
         # AnalyzerAgent: keyed on ANALYZER_PROMPT's opening line. Matching on a
         # schema key like "deprecated_patterns" would be wrong — the migrator
         # prompt embeds code_metrics, so it contains those key names too.
@@ -354,6 +365,10 @@ async def test_adaptive_reretrieval_loop_on_ungrounded_imports():
             self.migrator_calls = 0
 
         async def call_llm(self, prompt, system_prompt="", fmt=None, **kwargs):
+            if "Should a deep structural analysis pass run" in prompt:
+                return json.dumps({"deep_analyze": False, "reason": "stub"})
+            if "Which preparation sub-tasks should run" in prompt:
+                return json.dumps({"tasks": ["retrieval"]})
             # Routed before the stateful migrator fall-through, so the analyzer's
             # semantic call cannot consume one of the scripted migrations.
             if prompt.startswith("Analyze this"):

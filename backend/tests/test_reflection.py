@@ -388,6 +388,10 @@ class ReflectLoopLLM:
         self.migrator_calls = 0
 
     async def call_llm(self, prompt, system_prompt="", fmt=None, model=None) -> str:
+        if "Should a deep structural analysis pass run" in prompt:
+            return json.dumps({"deep_analyze": False, "reason": "stub"})
+        if "Which preparation sub-tasks should run" in prompt:
+            return json.dumps({"tasks": ["retrieval"]})
         if prompt.startswith("Analyze this"):
             return json.dumps(
                 {
