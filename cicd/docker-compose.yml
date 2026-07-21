@@ -3,8 +3,11 @@
 # MTech Final Year Project
 #
 # ARCHITECTURE:
-#   Ollama  →  runs on Windows host (already installed, already running)
-#   Backend →  Docker container, talks to Ollama via host.docker.internal:11434
+#   Gemini  →  default LLM provider, reached over the internet; the key comes
+#              from the repo-root .env via the backend's env_file below
+#   Ollama  →  optional local fallback (LLM_PROVIDER=ollama), runs on the
+#              Windows host, reached via host.docker.internal:11434
+#   Backend →  Docker container, FastAPI + the LangGraph agent pipeline
 #   Frontend → Docker container, served by Nginx on port 3000
 #   Redis   →  Cache layer for migration results
 #   Validator -> Optional syntax validation service
@@ -40,8 +43,8 @@ services:
 
   # ---------------------------------------------------------------------------
   # BACKEND — FastAPI + AI Agent Pipeline
-  # Agents: AnalyzerAgent -> MigratorAgent
-  # LLM: deepseek-coder:1.3b via Ollama on Windows host
+  # LLM: Gemini via the google_genai provider by default. Set LLM_PROVIDER=ollama
+  # in the root .env to fall back to local inference on the Windows host.
   # ---------------------------------------------------------------------------
   backend:
     build:
@@ -50,6 +53,17 @@ services:
     container_name: codemigrateai-backend
     ports:
       - "8000:8000"
+    # The image has no .env baked in (it is git-ignored and must never be), so
+    # secrets reach the container through the host's root .env. Compose reads
+    # this at *up* time on the host; the file is never copied into the image.
+    # Values under `environment:` win over it, which is what keeps the
+    # container-network URLs below authoritative regardless of local settings.
+    # `required: false` because .env is git-ignored: a fresh clone has none, and
+    # the default (required) would fail `compose up` outright instead of letting
+    # the app start and report the missing key through /health.
+    env_file:
+      - path: ../.env
+        required: false
     environment:
       - PYTHONUNBUFFERED=1
       - REDIS_URL=redis://redis:6379/0

@@ -5,11 +5,16 @@ CodeMigrateAI is an AI-driven code migration platform — an MTech Final Year Pr
 ## Quick start
 
 ```bash
-cp backend/.env.example backend/.env    # then set GOOGLE_API_KEY
+echo "GOOGLE_API_KEY=your-key-here" > .env   # repo root; get one at aistudio.google.com/apikey
 pip install -r backend/requirements.txt
-python backend/scripts/build_index.py   # build the RAG index once
+python backend/scripts/build_index.py        # build the RAG index once
 cd backend && uvicorn main:app --reload
 ```
+
+`.env` lives at the **repo root** and is git-ignored. `config.py` resolves it
+from its own location rather than the working directory, so every entry point —
+uvicorn, the index builder, pytest — reads the same file no matter where you
+launch it from.
 
 The default model provider is **Gemini**, because native tool calling is what
 the agentic paths require. `LLM_PROVIDER=ollama` switches to local inference,
@@ -142,7 +147,10 @@ Key modules:
 
 ## Environment variables
 
-See `backend/.env.example` for the annotated set. The essentials:
+Every setting is a field on `Settings` in `backend/config.py`, annotated there
+with why the default is what it is; that is the authoritative list. Any field
+can be overridden by an upper-case entry in `.env` or a real environment
+variable, which wins over the file. The essentials:
 
 ```text
 LLM_PROVIDER=google_genai        # or "ollama"

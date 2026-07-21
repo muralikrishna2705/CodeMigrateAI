@@ -1,11 +1,23 @@
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# One .env, at the repo root, resolved from this file rather than from the
+# process working directory.
+#
+# A relative ``env_file=".env"`` is resolved against the CWD, which silently
+# made configuration depend on where you happened to stand: `uvicorn` launched
+# from backend/ saw the file, while `python backend/scripts/build_index.py` and
+# `pytest` launched from the repo root did not — and a missing API key surfaces
+# as an authentication error, which reads like a bad key rather than an absent
+# one. Anchoring to __file__ makes every entry point load the same settings.
+ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=ENV_FILE,
         env_file_encoding="utf-8",
         extra="ignore",
     )

@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager
 
 from cache.keys import key_prefix
 from cache.manager import CacheManager
-from config import get_settings
+from config import ENV_FILE, get_settings
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -250,7 +250,7 @@ def _llm_unavailable_detail() -> str:
     if providers.is_hosted(settings):
         return (
             f"No API key configured for provider '{settings.llm_provider}'. "
-            "Set GOOGLE_API_KEY in the environment or backend/.env."
+            f"Set GOOGLE_API_KEY in the environment or in {ENV_FILE}."
         )
     return (
         f"Ollama is not reachable at {settings.ollama_url}. Make sure Ollama is "
