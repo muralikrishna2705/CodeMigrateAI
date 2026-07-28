@@ -104,6 +104,47 @@ class TestCachedEmbeddings:
         assert result[0] == [0.5] * 768
         assert result[1] == [0.0] * 768  # fallback padding
 
+    def test_gemini_backend_seeds_the_3072_fallback_width(self):
+        # gemini-embedding-001 is 3072-wide; the fallback seed must match before
+        # any real vector arrives, keyed off the backend class name.
+        class GoogleGenerativeAIEmbeddings:  # name is what detection inspects
+            pass
+
+        emb = CachedEmbeddings(inner=GoogleGenerativeAIEmbeddings())
+        assert len(emb._fallback_embed("x")) == 3072
+
+    def test_detection_unwraps_the_resilience_wrapper(self):
+        # get_embeddings hands CachedEmbeddings the throttling wrapper, not the
+        # raw backend, so detection must look through its `.inner`.
+        class GoogleGenerativeAIEmbeddings:
+            pass
+
+        class _Wrapper:  # mirrors providers._ResilientEmbeddings
+            def __init__(self, inner):
+                self.inner = inner
+
+        emb = CachedEmbeddings(inner=_Wrapper(GoogleGenerativeAIEmbeddings()))
+        assert len(emb._fallback_embed("x")) == 3072
+
+    def test_first_batch_failure_pads_at_the_gemini_width(self):
+        # The exact bug: a first-batch 429 used to pad zero-vectors at 768 while
+        # the Gemini collection expects 3072, so Chroma rejected every insert and
+        # RAG disabled itself. The seed is 3072 from construction, so the pad fits.
+        class GoogleGenerativeAIEmbeddings:
+            def embed_documents(self, texts):
+                raise RuntimeError("429 RESOURCE_EXHAUSTED")
+
+        emb = CachedEmbeddings(inner=GoogleGenerativeAIEmbeddings())
+        out = emb.embed_documents(["a", "b"])
+        assert out == [[0.0] * 3072, [0.0] * 3072]
+
+    def test_explicit_dimensions_still_override_detection(self):
+        class GoogleGenerativeAIEmbeddings:
+            pass
+
+        emb = CachedEmbeddings(inner=GoogleGenerativeAIEmbeddings(), dimensions=512)
+        assert len(emb._fallback_embed("x")) == 512
+
 
 class _FakeDoc:
     def __init__(self, content: str, language: str, **metadata):

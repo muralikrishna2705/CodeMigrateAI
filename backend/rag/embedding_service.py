@@ -5,9 +5,30 @@ from langchain_core.embeddings import Embeddings
 
 log = logging.getLogger("CodeMigrateAI.Embeddings")
 
-#: Fallback vector width used until a real embedding reveals the backend's own.
-#: 768 matches nomic-embed-text, the historical default.
+#: Fallback vector widths, used until a real embedding reveals the backend's own.
+#: The seed MUST match the backend or Chroma rejects the zero vector with an
+#: "expecting dimension N, got M" error and RAG silently disables itself — so when
+#: the very first batch 429s, before any real width is known, the seed already has
+#: to be right. 768 matches nomic-embed-text (the historical default);
+#: gemini-embedding-001 returns 3072 (kept in step with
+#: providers.GEMINI_EMBED_DIMENSIONS).
 DEFAULT_DIMENSIONS = 768
+GEMINI_DIMENSIONS = 3072
+
+
+def _default_dimensions(backend: Embeddings) -> int:
+    """Best-guess vector width for ``backend`` before its first successful embed.
+
+    Keyed on the concrete embedding class, which is what pins the width: Google's
+    is 3072, everything else here is 768. The resilience wrapper that
+    ``providers.get_embeddings`` puts around a hosted backend is unwrapped first
+    (its ``.inner``) so the real class is what gets inspected.
+    """
+    target = getattr(backend, "inner", backend)
+    name = type(target).__name__.lower()
+    if "google" in name or "gemini" in name:
+        return GEMINI_DIMENSIONS
+    return DEFAULT_DIMENSIONS
 
 
 class CachedEmbeddings(Embeddings):
@@ -34,7 +55,7 @@ class CachedEmbeddings(Embeddings):
         model: str = "",
         base_url: str = "",
         max_cache: int = 200,
-        dimensions: int = DEFAULT_DIMENSIONS,
+        dimensions: int | None = None,
     ):
         if inner is None:
             inner = self._build_inner(model, base_url)
@@ -43,9 +64,13 @@ class CachedEmbeddings(Embeddings):
         self._max_cache = max_cache
         # The fallback must match the backend's width or Chroma rejects the
         # insert, and backends disagree (nomic 768, gemini-embedding-001 3072).
-        # Seeded with a default and corrected the first time a real vector
-        # arrives, so a wrong configured value cannot outlive one success.
-        self._dimensions = dimensions
+        # Seeded from the backend *type* so even a first-batch failure pads at the
+        # right width, then corrected the first time a real vector arrives — so
+        # neither a wrong seed nor a wrong configured value can outlive one
+        # success. An explicit ``dimensions`` still overrides the detection.
+        self._dimensions = (
+            dimensions if dimensions is not None else _default_dimensions(inner)
+        )
 
     @staticmethod
     def _build_inner(model: str, base_url: str) -> Embeddings:

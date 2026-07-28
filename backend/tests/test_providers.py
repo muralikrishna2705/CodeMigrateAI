@@ -138,3 +138,73 @@ class TestHostedDetection:
     )
     def test_is_hosted(self, provider, expected):
         assert providers.is_hosted(_settings(llm_provider=provider)) is expected
+
+
+class TestEmbeddings:
+    """The embedding path had no throttle or retry — the seam a free-tier 429
+    slips through to poison the vector store."""
+
+    def test_hosted_embeddings_share_the_chat_limiter(self):
+        # Embeddings spend the same per-project quota as chat, so the throttle
+        # must draw from the same bucket — not a second one that, together with
+        # the chat limiter, bursts to double the quota.
+        s = _settings(
+            llm_provider="google_genai", google_api_key="k",
+            llm_requests_per_second=1.0,
+        )
+        emb = providers.get_embeddings(s)
+        assert isinstance(emb, providers._ResilientEmbeddings)
+        assert emb.rate_limiter is providers.get_rate_limiter(s)
+        assert emb.rate_limiter is providers.get_chat_model("main", settings=s).rate_limiter
+
+    def test_hosted_embeddings_pin_the_output_width(self):
+        # A pinned width is what lets the zero-vector fallback match the collection
+        # even before the first successful embedding.
+        s = _settings(llm_provider="google_genai", google_api_key="k")
+        emb = providers.get_embeddings(s)
+        assert emb.inner.output_dimensionality == providers.GEMINI_EMBED_DIMENSIONS
+
+    def test_zero_rate_leaves_hosted_embeddings_unthrottled(self):
+        s = _settings(
+            llm_provider="google_genai", google_api_key="k",
+            llm_requests_per_second=0,
+        )
+        emb = providers.get_embeddings(s)
+        assert isinstance(emb, providers._ResilientEmbeddings)
+        assert emb.rate_limiter is None
+
+    def test_local_embeddings_are_not_wrapped(self):
+        # Ollama is local: no quota to throttle and no hosted 429s to retry, so
+        # wrapping it would only slow ingestion to the hosted rate for nothing.
+        s = _settings(llm_provider="ollama", embedding_provider="ollama")
+        emb = providers.get_embeddings(s)
+        assert not isinstance(emb, providers._ResilientEmbeddings)
+
+    def test_a_transient_failure_is_retried_not_surfaced(self):
+        # base_delay=0 keeps the backoff instant for the test.
+        class _Flaky:
+            def __init__(self):
+                self.calls = 0
+
+            def embed_documents(self, texts):
+                self.calls += 1
+                if self.calls < 3:
+                    raise RuntimeError("429 RESOURCE_EXHAUSTED")
+                return [[1.0] for _ in texts]
+
+        flaky = _Flaky()
+        wrap = providers._ResilientEmbeddings(flaky, max_retries=2, base_delay=0)
+        out = wrap.embed_documents(["a", "b"])
+        assert flaky.calls == 3
+        assert out == [[1.0], [1.0]]
+
+    def test_retries_are_bounded_then_the_error_propagates(self):
+        # Exhausted retries must re-raise so the caller's fallback (zero vector at
+        # the right width) takes over — the graceful-degradation contract.
+        class _Broken:
+            def embed_query(self, text):
+                raise RuntimeError("permanent")
+
+        wrap = providers._ResilientEmbeddings(_Broken(), max_retries=2, base_delay=0)
+        with pytest.raises(RuntimeError, match="permanent"):
+            wrap.embed_query("x")
