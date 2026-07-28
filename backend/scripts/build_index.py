@@ -1,10 +1,15 @@
 """Build the Chroma reference index offline.
 
-The app ingests in a background task on startup, which is right for a server
-(the API answers immediately and RAG attaches when it is ready) and wrong for a
-demo: the first migration of a fresh checkout retrieves nothing, because
-embedding the corpus has not finished. Building the index ahead of time makes it
-a deliverable artifact instead of a race.
+The app can ingest in a background task on startup, which is right for a fresh
+checkout and wrong for anything repeated: the first migration retrieves nothing
+until embedding finishes, and every boot re-spends embedding quota. Building the
+index ahead of time makes it a deliverable artifact instead of a race.
+
+The production pairing is this script plus ``RAG_INGEST_ON_STARTUP=false`` and a
+volume on the index (see cicd/docker-compose.yml), which makes a restart cost no
+quota at all. Even with startup ingestion left on, chunk ids are content hashes,
+so re-running this is idempotent — unchanged chunks are skipped before any
+embedding call rather than added a second time.
 
 Usage, from the repo root::
 

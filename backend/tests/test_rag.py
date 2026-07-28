@@ -6,6 +6,7 @@ import hashlib
 from rag.embedding_service import CachedEmbeddings
 from rag.retrieval_pipeline import RAGPipeline
 from rag.splitter import LANGUAGE_SEPARATORS, DocSplitter
+from rag.vector_store import VectorStore
 
 
 class TestDocSplitter:
@@ -144,6 +145,65 @@ class TestCachedEmbeddings:
 
         emb = CachedEmbeddings(inner=GoogleGenerativeAIEmbeddings(), dimensions=512)
         assert len(emb._fallback_embed("x")) == 512
+
+    def test_padded_texts_are_reported_so_they_are_never_persisted(self):
+        # The interface forces one vector per text, so a caller that persists the
+        # result cannot otherwise tell a real vector from a zero one — and a
+        # stored zero vector is permanently unretrievable while still counting as
+        # an indexed document.
+        emb = CachedEmbeddings(
+            model="nomic-embed-text", base_url="http://localhost:11434"
+        )
+
+        class _Short:
+            def embed_documents(self, texts):
+                return [[0.5] * 768]  # only the first text really embedded
+
+        emb._inner = _Short()
+        emb.embed_documents(["one", "two", "three"])
+        assert emb.last_failed_texts == {"two", "three"}
+
+    def test_a_fallback_is_never_cached(self):
+        # embed_query already refuses to cache failures; embed_documents used to,
+        # which made one rate-limited second permanent for that text — and then
+        # handed the cached zero vector to the store on a later healthy attempt.
+        emb = CachedEmbeddings(
+            model="nomic-embed-text", base_url="http://localhost:11434"
+        )
+
+        class _Flaky:
+            def __init__(self):
+                self.calls = 0
+
+            def embed_documents(self, texts):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("429 RESOURCE_EXHAUSTED")
+                return [[0.5] * 768 for _ in texts]
+
+        emb._inner = _Flaky()
+        first = emb.embed_documents(["alpha"])
+        assert first == [[0.0] * 768]
+        assert "alpha" not in emb._cache, "a fallback must not enter the cache"
+
+        # Once the backend recovers the same text embeds for real.
+        second = emb.embed_documents(["alpha"])
+        assert second == [[0.5] * 768]
+        assert emb.last_failed_texts == set()
+
+    def test_a_successful_text_in_a_partly_failed_batch_is_still_cached(self):
+        emb = CachedEmbeddings(
+            model="nomic-embed-text", base_url="http://localhost:11434"
+        )
+
+        class _Short:
+            def embed_documents(self, texts):
+                return [[0.5] * 768]
+
+        emb._inner = _Short()
+        emb.embed_documents(["good", "bad"])
+        assert emb._cache.get("good") == [0.5] * 768
+        assert "bad" not in emb._cache
 
 
 class _FakeDoc:
@@ -680,3 +740,110 @@ class TestQueryEnrichment:
         assert store.queries, "similarity_search should have been called"
         assert "numpy" in store.queries[0]
         assert "generics" in store.queries[0]
+
+
+class _FakeChroma:
+    """Stand-in for langchain_chroma.Chroma with just the write path used here."""
+
+    def __init__(self, existing=()):
+        self.existing = set(existing)
+        self.writes = []
+
+    def get(self, ids=None, include=None, **kwargs):
+        return {"ids": [i for i in (ids or []) if i in self.existing]}
+
+    def add_texts(self, texts, metadatas=None, ids=None):
+        self.writes.append({"texts": list(texts), "ids": list(ids or [])})
+        self.existing.update(ids or [])
+        return list(ids or [])
+
+
+class _StubEmbeddings:
+    """Embedding service that fails for a named set of texts."""
+
+    cache_capacity = 100
+
+    def __init__(self, fail_texts=()):
+        self._fail = set(fail_texts)
+        self.batches = []
+        self.last_failed_texts = set()
+
+    def embed_documents(self, texts):
+        self.batches.append(list(texts))
+        self.last_failed_texts = {t for t in texts if t in self._fail}
+        return [[0.0] * 4 if t in self._fail else [1.0] * 4 for t in texts]
+
+
+class TestVectorStoreWrites:
+    """The write path that used to persist zero vectors and duplicate the corpus."""
+
+    def _store(self, embeddings, existing=()):
+        vs = VectorStore(embeddings)
+        vs._store = _FakeChroma(existing)
+        return vs
+
+    def test_unembeddable_chunks_are_not_stored(self):
+        # The observed failure: a 429 padded every chunk with a zero vector, all
+        # 66 were written, and the run logged "Ingested 66 unique chunks". They
+        # were in the collection, counted as indexed, and matched nothing ever.
+        emb = _StubEmbeddings(fail_texts={"bad one"})
+        vs = self._store(emb)
+        vs.add_documents([_FakeDoc("good one", "java"), _FakeDoc("bad one", "java")])
+
+        written = [t for w in vs._store.writes for t in w["texts"]]
+        assert written == ["good one"]
+
+    def test_a_wholly_failed_batch_writes_nothing(self):
+        emb = _StubEmbeddings(fail_texts={"a", "b"})
+        vs = self._store(emb)
+        vs.add_documents([_FakeDoc("a", "java"), _FakeDoc("b", "java")])
+        assert vs._store.writes == []
+
+    def test_ids_are_content_derived_so_a_reinsert_upserts(self):
+        # Chroma minted a fresh UUID per insert, so every restart appended a
+        # second copy of the corpus and the store grew without bound.
+        emb = _StubEmbeddings()
+        vs = self._store(emb)
+        vs.add_documents([_FakeDoc("stable text", "python")])
+        first = vs._store.writes[0]["ids"]
+
+        vs2 = self._store(_StubEmbeddings())
+        vs2.add_documents([_FakeDoc("stable text", "python")])
+        assert vs2._store.writes[0]["ids"] == first
+
+    def test_already_indexed_chunks_cost_no_embedding_call(self):
+        # This is what makes a restart free: the expensive resource is quota, and
+        # re-ingesting an unchanged corpus must not spend any.
+        emb = _StubEmbeddings()
+        vs = self._store(emb)
+        vs.add_documents([_FakeDoc("cached chunk", "python")])
+        assert emb.batches, "first ingestion must embed"
+
+        emb2 = _StubEmbeddings()
+        vs2 = VectorStore(emb2)
+        vs2._store = _FakeChroma(existing=vs._store.existing)
+        vs2.add_documents([_FakeDoc("cached chunk", "python")])
+        assert emb2.batches == [], "an already-indexed chunk must not be re-embedded"
+        assert vs2._store.writes == []
+
+    def test_duplicate_content_in_one_call_collapses_to_one_row(self):
+        # Chroma rejects a single upsert that repeats an id.
+        emb = _StubEmbeddings()
+        vs = self._store(emb)
+        vs.add_documents([_FakeDoc("same", "java"), _FakeDoc("same", "java")])
+        ids = [i for w in vs._store.writes for i in w["ids"]]
+        assert len(ids) == len(set(ids)) == 1
+
+    def test_a_failed_chunk_is_retried_on_the_next_ingestion(self):
+        # Not storing a failure is only half the contract; it has to remain
+        # eligible, otherwise a transient 429 silently drops it from the corpus.
+        emb = _StubEmbeddings(fail_texts={"flaky"})
+        vs = self._store(emb)
+        vs.add_documents([_FakeDoc("flaky", "java")])
+        assert vs._store.writes == []
+
+        recovered = _StubEmbeddings()
+        vs2 = VectorStore(recovered)
+        vs2._store = _FakeChroma(existing=vs._store.existing)
+        vs2.add_documents([_FakeDoc("flaky", "java")])
+        assert [t for w in vs2._store.writes for t in w["texts"]] == ["flaky"]

@@ -144,18 +144,63 @@ class TestEmbeddings:
     """The embedding path had no throttle or retry — the seam a free-tier 429
     slips through to poison the vector store."""
 
-    def test_hosted_embeddings_share_the_chat_limiter(self):
-        # Embeddings spend the same per-project quota as chat, so the throttle
-        # must draw from the same bucket — not a second one that, together with
-        # the chat limiter, bursts to double the quota.
+    def test_hosted_embeddings_get_their_own_bucket(self):
+        # These used to share the chat limiter, on the theory that one project
+        # means one quota. Google meters embeddings separately
+        # (embed_content_free_tier_requests, 100/min, versus ~10 RPM for chat),
+        # so sharing throttled ingestion to a fraction of its allowance AND
+        # still 429'd — the buckets count different things.
         s = _settings(
             llm_provider="google_genai", google_api_key="k",
-            llm_requests_per_second=1.0,
+            llm_requests_per_second=1.0, embed_requests_per_second=2.0,
         )
         emb = providers.get_embeddings(s)
         assert isinstance(emb, providers._ResilientEmbeddings)
-        assert emb.rate_limiter is providers.get_rate_limiter(s)
-        assert emb.rate_limiter is providers.get_chat_model("main", settings=s).rate_limiter
+        assert emb.rate_limiter is providers.get_embed_rate_limiter(s)
+        assert emb.rate_limiter is not providers.get_rate_limiter(s)
+
+    def test_a_batch_costs_one_token_per_text(self):
+        # The bug this pins: the quota counts content items, so a limiter taking
+        # one token per *call* let a 50-text batch spend 50 units believing it
+        # spent 1 — which is how 0.16 req/s still 429'd within four calls.
+        taken = []
+
+        class _CountingLimiter:
+            def acquire(self, blocking=True):
+                taken.append(1)
+                return True
+
+        class _Backend:
+            def embed_documents(self, texts):
+                return [[1.0] for _ in texts]
+
+        wrap = providers._ResilientEmbeddings(_Backend(), limiter=_CountingLimiter())
+        wrap.embed_documents(["a", "b", "c", "d", "e"])
+        assert len(taken) == 5, "one token per text, not one per call"
+
+    def test_backoff_obeys_the_delay_the_server_asked_for(self):
+        # Retrying a quota error before its reset cannot succeed, and each
+        # premature attempt spends more of the quota it is waiting on. Google
+        # states the reset in the error; exponential backoff from 2s ignored it.
+        wrap = providers._ResilientEmbeddings(object(), max_retries=2, base_delay=2.0)
+        structured = RuntimeError(
+            "429 RESOURCE_EXHAUSTED {'error': {...}, 'details': "
+            "[{'@type': '...RetryInfo', 'retryDelay': '58s'}]}"
+        )
+        prose = RuntimeError("You exceeded your current quota. Please retry in 45.9s.")
+        # +1s so we wake after the reset rather than exactly on it.
+        assert wrap._backoff(0, structured) == 59.0
+        assert wrap._backoff(0, prose) == 46.9
+        # No advice -> the exponential schedule still applies.
+        assert wrap._backoff(0, RuntimeError("connection reset")) == 2.0
+        assert wrap._backoff(1, RuntimeError("connection reset")) == 4.0
+
+    def test_a_server_delay_longer_than_the_exponential_cap_is_honoured(self):
+        # Truncating an advertised 58s back to the 30s exponential ceiling would
+        # reintroduce the premature retry this exists to stop.
+        wrap = providers._ResilientEmbeddings(object(), max_retries=2)
+        delay = wrap._backoff(0, RuntimeError("'retryDelay': '58s'"))
+        assert delay > providers._ResilientEmbeddings._MAX_BACKOFF_SEC
 
     def test_hosted_embeddings_pin_the_output_width(self):
         # A pinned width is what lets the zero-vector fallback match the collection
@@ -167,7 +212,7 @@ class TestEmbeddings:
     def test_zero_rate_leaves_hosted_embeddings_unthrottled(self):
         s = _settings(
             llm_provider="google_genai", google_api_key="k",
-            llm_requests_per_second=0,
+            embed_requests_per_second=0,
         )
         emb = providers.get_embeddings(s)
         assert isinstance(emb, providers._ResilientEmbeddings)

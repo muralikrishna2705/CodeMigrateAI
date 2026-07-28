@@ -67,6 +67,10 @@ async def lifespan(app: FastAPI):
              providers.resolve_embedding_model(settings))
     if settings.llm_requests_per_second > 0:
         log.info("RATE LIMIT : %.2f req/s", settings.llm_requests_per_second)
+    if settings.embed_requests_per_second > 0:
+        # Reported separately because it is a separate quota, in a different
+        # unit — texts per second, not calls per second.
+        log.info("EMBED LIMIT: %.2f texts/s", settings.embed_requests_per_second)
 
     llm_client = LLMClient()
     alive = await llm_client.health_check()
@@ -133,11 +137,21 @@ async def lifespan(app: FastAPI):
             )
             rag_vector_store = VectorStore(rag_embeddings)
             rag_vector_store.initialize()
-            ingestion = IngestionPipeline(rag_vector_store, rag_embeddings)
-            rag_state["ingestion"] = ingestion
-            await ingestion.run(
-                [lang["id"] for lang in settings.supported_languages]
-            )
+            if settings.rag_ingest_on_startup:
+                ingestion = IngestionPipeline(rag_vector_store, rag_embeddings)
+                rag_state["ingestion"] = ingestion
+                await ingestion.run(
+                    [lang["id"] for lang in settings.supported_languages]
+                )
+            else:
+                # Serving a prebuilt index (backend/scripts/build_index.py).
+                # Ingestion is the only thing here that spends embedding quota,
+                # so skipping it makes a restart free.
+                log.info(
+                    "Startup ingestion disabled; serving prebuilt index "
+                    "(%d chunks)",
+                    rag_vector_store.count(),
+                )
             # Pass the LLM client so the agentic RAG strategies (HyDE, CRAG,
             # multi-query, …) can reason; single-hop retrieval never touches it.
             app.state.rag_pipeline = RAGPipeline(

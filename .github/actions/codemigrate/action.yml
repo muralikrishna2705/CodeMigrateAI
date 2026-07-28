@@ -46,10 +46,9 @@ runs:
         pip install -r backend/requirements.txt
         pip install PyGithub
 
-    - name: Start ChromaDB
-      shell: bash
-      run: |
-        docker run -d --name chromadb -p 8002:8000 chromadb/chroma:latest
+    # No ChromaDB service step: the backend uses Chroma's embedded persistent
+    # client (rag/vector_store.py), so a standalone server had nothing connecting
+    # to it and only cost the job a container pull.
 
     - name: Run migration
       shell: bash

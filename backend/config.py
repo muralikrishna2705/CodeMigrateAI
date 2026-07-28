@@ -61,6 +61,27 @@ class Settings(BaseSettings):
     llm_requests_per_second: float = 0.16
     llm_max_burst: int = 4
 
+    # Embeddings get their OWN bucket rather than sharing the chat one, because
+    # Google meters them as a separate quota
+    # (`embed_content_free_tier_requests`, 100/min) from generateContent
+    # (~10 RPM). Sharing was wrong in both directions: it throttled corpus
+    # ingestion to ~6x slower than its own quota allowed, and still did not
+    # prevent the 429 — the chat limiter counts *calls* while this quota counts
+    # *content items*, so one 50-text batch spent 50 units against a budget the
+    # limiter believed had cost 1.
+    #
+    # Denominated in items per second (providers._ResilientEmbeddings takes one
+    # token per text), so 1.5 -> 90/min: under the 100/min ceiling with headroom
+    # for the retrieval-time embed_query calls sharing the same bucket.
+    # 0 disables throttling, which is correct for Ollama.
+    embed_requests_per_second: float = 1.5
+    embed_max_burst: int = 10
+    # Texts per embedding API call. Smaller than the old hardcoded 50 so a failed
+    # batch forfeits less work, and so one batch always fits inside the embedding
+    # LRU — see rag.vector_store.VectorStore.add_documents, which relies on the
+    # cache to avoid paying twice for the same vector.
+    embed_batch_size: int = 16
+
     # Gemini 2.5+ reasons before answering by default. Worth it for code
     # generation, pure latency for a yes/no routing call, so the fast role
     # disables it. Negative leaves the provider default in place.
@@ -239,6 +260,13 @@ class Settings(BaseSettings):
 
     # RAG Pipeline (Phase 2)
     enable_rag: bool = True
+    # Whether startup ingests the corpus, or trusts an index built ahead of time
+    # by backend/scripts/build_index.py. Ingesting at startup costs embedding
+    # quota on every boot; with a persisted index (the chroma volume in
+    # cicd/docker-compose.yml) the honest production setting is False, and the
+    # container then serves retrieval from the prebuilt artifact. Left True so a
+    # fresh checkout still works with no extra step.
+    rag_ingest_on_startup: bool = True
     rag_top_k: int = 4
     # Cosine floor on the vector leg. Deliberately low: with a cross-encoder
     # downstream, this is no longer what protects the prompt from junk — it is

@@ -69,6 +69,29 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - VALIDATOR_URL=http://validator:8000
       - ENABLE_VALIDATION=true
+      # Absolute, and pointed at the mounted data volume. The defaults are
+      # "memory/*.db", which resolve_data_path anchors to /app/memory — that is
+      # the Python package directory, and mounting a volume over it would shadow
+      # the package's own source (and then keep serving a stale snapshot of it
+      # after every rebuild, because Docker seeds a new named volume from the
+      # image). Keeping the data out of the source tree avoids the whole class
+      # of problem; resolve_data_path honours absolute paths as given.
+      - MEMORY_DB_PATH=/app/data/codemigrate.db
+      - CHECKPOINT_DB_PATH=/app/data/checkpoints.db
+    # Everything the backend cannot cheaply rebuild lives on a volume. Without
+    # these the RAG index and both SQLite databases sat in the container's
+    # writable layer and died on every rebuild — which meant re-embedding the
+    # whole corpus, and therefore re-spending the embedding quota, on each boot.
+    # Chunk ids are content hashes (rag/vector_store.content_id), so a surviving
+    # index makes re-ingestion a no-op instead of a duplicate copy.
+    #
+    # The fetched-docs cache under /app/rag/reference deliberately is NOT
+    # mounted: a volume there would shadow the built-in corpus baked into the
+    # image, and re-fetching is plain HTTP that costs no quota. Unchanged docs
+    # hash to ids the index already holds and are skipped before any embed call.
+    volumes:
+      - chroma_index:/app/rag/chroma_db
+      - backend_data:/app/data
     extra_hosts:
       # This resolves host.docker.internal → your Windows machine IP
       # so the container can reach Ollama running on Windows
@@ -76,28 +99,16 @@ services:
     depends_on:
       - redis
       - validator
-      - chromadb
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
-  # CHROMADB — Vector database for the RAG reference index (Phase 2)
+  # NOTE: there is no chromadb service. The backend uses Chroma's *embedded*
+  # persistent client (see rag/vector_store.py: PERSIST_DIR), so a standalone
+  # Chroma server had nothing connecting to it. If you ever move to client/server
+  # Chroma, add the service back and point VectorStore at it — and note that the
+  # image persists to /data, not /chroma/chroma, and that its /api/v1 heartbeat
+  # endpoint was removed in Chroma 1.x.
   # ---------------------------------------------------------------------------
-  chromadb:
-    image: chromadb/chroma:latest
-    container_name: codemigrateai-chromadb
-    ports:
-      - "8002:8000"
-    volumes:
-      - ./chroma_data:/chroma/chroma
-    environment:
-      - IS_PERSISTENT=TRUE
-      - ANONYMIZED_TELEMETRY=FALSE
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
 
   # ---------------------------------------------------------------------------
   # VALIDATOR - optional language syntax validation service
@@ -139,3 +150,8 @@ services:
 
 volumes:
   redis_data:
+  # The reference index. Expensive to rebuild — every chunk in it was paid for
+  # in embedding-API quota.
+  chroma_index:
+  # SQLite: persistent migration memory + LangGraph checkpoints.
+  backend_data:

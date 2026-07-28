@@ -62,6 +62,14 @@ class CachedEmbeddings(Embeddings):
         self._inner = inner
         self._cache: OrderedDict[str, list[float]] = OrderedDict()
         self._max_cache = max_cache
+        #: Texts whose vector in the *most recent* ``embed_documents`` call is a
+        #: fallback rather than a real embedding. The interface forces this
+        #: method to return one vector per text, so a caller that *persists* the
+        #: result cannot tell a real vector from a zero one — and a persisted
+        #: zero vector is permanently unretrievable while still counting as an
+        #: indexed document. Callers that write to a store consult this and skip
+        #: those texts; see rag.vector_store.VectorStore.add_documents.
+        self._last_failed: set[str] = set()
         # The fallback must match the backend's width or Chroma rejects the
         # insert, and backends disagree (nomic 768, gemini-embedding-001 3072).
         # Seeded from the backend *type* so even a first-batch failure pads at the
@@ -119,10 +127,30 @@ class CachedEmbeddings(Embeddings):
             self._cache.popitem(last=False)
         return vec
 
+    @property
+    def cache_capacity(self) -> int:
+        """How many vectors the LRU holds before it starts evicting.
+
+        Read by :meth:`rag.vector_store.VectorStore.add_documents`, which sizes
+        its write batches to fit so a preflighted vector is still cached when the
+        store asks for it again.
+        """
+        return self._max_cache
+
+    @property
+    def last_failed_texts(self) -> set[str]:
+        """Texts the most recent :meth:`embed_documents` could not really embed.
+
+        A snapshot, not a live view — callers filter against it immediately after
+        the call that produced it.
+        """
+        return set(self._last_failed)
+
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         uncached = []
         indices = []
         results: list[list[float] | None] = [None] * len(texts)
+        self._last_failed = set()
 
         for i, text in enumerate(texts):
             cached = self._cache.get(text)
@@ -144,23 +172,32 @@ class CachedEmbeddings(Embeddings):
             # A short batch would otherwise leave holes in `results`, and the
             # return below would hand back fewer vectors than texts — silently
             # misaligning every embedding with the wrong document downstream.
-            if len(batch) < len(uncached):
+            real = len(batch)
+            if real < len(uncached):
                 log.warning(
                     "Embedding backend returned %d vectors for %d texts; "
-                    "padding with fallback",
-                    len(batch),
+                    "%d will be reported as failed rather than indexed",
+                    real,
                     len(uncached),
+                    len(uncached) - real,
                 )
                 batch = list(batch) + [
-                    self._fallback_embed(t) for t in uncached[len(batch):]
+                    self._fallback_embed(t) for t in uncached[real:]
                 ]
+            self._last_failed = set(uncached[real:])
             # `indices[pos]` is the position in the original `texts` list, while
             # `uncached[pos]`/`batch[pos]` line up positionally with each other.
             for pos, original_index in enumerate(indices):
-                self._cache[uncached[pos]] = batch[pos]
                 results[original_index] = batch[pos]
-                if len(self._cache) > self._max_cache:
-                    self._cache.popitem(last=False)
+                # Only real vectors are cached. Caching a fallback would make one
+                # rate-limited second permanent for that text for the life of the
+                # process — the same trap embed_query documents above, and worse
+                # here because a cached zero vector would then be handed to the
+                # vector store on a later, healthy attempt and persisted.
+                if pos < real:
+                    self._cache[uncached[pos]] = batch[pos]
+                    if len(self._cache) > self._max_cache:
+                        self._cache.popitem(last=False)
 
         return [r for r in results if r is not None]
 

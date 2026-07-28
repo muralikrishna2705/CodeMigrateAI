@@ -1,6 +1,8 @@
+import hashlib
 import logging
 from pathlib import Path
 
+from config import get_settings
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 
@@ -8,6 +10,19 @@ log = logging.getLogger("CodeMigrateAI.VectorStore")
 
 PERSIST_DIR = Path(__file__).resolve().parent / "chroma_db"
 COLLECTION_NAME = "codemigrate_ref"
+
+
+def content_id(text: str) -> str:
+    """A stable Chroma id derived from the chunk's content.
+
+    Ingestion used to let Chroma mint a fresh UUID per insert, so every restart
+    appended a complete second copy of the corpus — the store grew without bound
+    and re-embedded (re-paid for) content it already held. A content hash makes
+    the write idempotent: ``add_texts`` upserts, so re-ingesting the same chunk
+    overwrites its own row instead of creating a new one, and an unchanged
+    corpus can be skipped entirely.
+    """
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
 
 
 class VectorStore:
@@ -31,19 +46,111 @@ class VectorStore:
         count = len(self._store.get()["ids"]) if self._store else 0
         log.info("Vector store initialized with %d existing docs", count)
 
+    def _existing_ids(self, ids: list[str]) -> set[str]:
+        """Which of ``ids`` the collection already holds.
+
+        Best-effort: a store that cannot answer is treated as holding nothing,
+        which costs a re-embed but never skips a document that is actually
+        missing.
+        """
+        if not ids:
+            return set()
+        try:
+            return set(self._store.get(ids=ids, include=[])["ids"])
+        except Exception as exc:  # noqa: BLE001 — an unanswerable store re-embeds
+            log.debug("Existing-id lookup failed, assuming none: %s", exc)
+            return set()
+
     def add_documents(self, documents: list[Document]):
+        """Index ``documents``, skipping what is already stored or unembeddable.
+
+        Two things this deliberately does not do, both of which it used to:
+
+        * **Persist a failed embedding.** The embedding service must return one
+          vector per text to satisfy the interface, so it pads failures with a
+          zero vector. Zero vectors are the right answer for a transient query
+          (they match nothing) and a silent disaster in a store: permanently
+          unretrievable, yet counted as indexed and reported as success. Each
+          batch is therefore embedded here first, and only texts that came back
+          with a real vector are handed to Chroma.
+        * **Re-pay for content it already has.** Ids are content hashes, so the
+          already-stored chunks are filtered out before any embedding call.
+
+        The pre-flight embed is not wasted work: the embedding service caches
+        successes, so the ``add_texts`` call behind it is served from that cache
+        rather than making a second API call. Batches are capped to the cache
+        capacity so that stays true.
+        """
         if not self._store:
             self.initialize()
+        if not documents:
+            return
+
+        settings = get_settings()
+        batch_size = max(1, settings.embed_batch_size)
+        capacity = getattr(self._embedding_service, "cache_capacity", batch_size)
+        if capacity and batch_size > capacity:
+            log.debug(
+                "Capping write batch %d -> %d to fit the embedding cache",
+                batch_size,
+                capacity,
+            )
+            batch_size = capacity
+
         texts = [d.page_content for d in documents]
         metadatas = [d.metadata for d in documents]
-        # Batch to avoid memory issues
-        batch_size = 50
-        for i in range(0, len(texts), batch_size):
-            self._store.add_texts(
-                texts[i:i + batch_size],
-                metadatas[i:i + batch_size] if metadatas else None,
+        ids = [content_id(t) for t in texts]
+
+        # Two chunks with identical content collapse to one id; Chroma rejects a
+        # single upsert that repeats an id, so de-duplicate before batching.
+        pending: list[int] = []
+        seen: set[str] = set()
+        for i, doc_id in enumerate(ids):
+            if doc_id not in seen:
+                seen.add(doc_id)
+                pending.append(i)
+
+        already = self._existing_ids([ids[i] for i in pending])
+        if already:
+            pending = [i for i in pending if ids[i] not in already]
+            log.info("Skipping %d chunks already indexed", len(already))
+        if not pending:
+            log.info("Nothing new to index (%d chunks already present)", len(documents))
+            return
+
+        added = 0
+        failed = 0
+        for start in range(0, len(pending), batch_size):
+            window = pending[start:start + batch_size]
+            batch_texts = [texts[i] for i in window]
+
+            self._embedding_service.embed_documents(batch_texts)
+            unembeddable = getattr(
+                self._embedding_service, "last_failed_texts", set()
             )
-        log.info("Added %d documents to vector store", len(documents))
+            good = [i for i in window if texts[i] not in unembeddable]
+            failed += len(window) - len(good)
+            if not good:
+                continue
+
+            self._store.add_texts(
+                [texts[i] for i in good],
+                [metadatas[i] for i in good] if metadatas else None,
+                ids=[ids[i] for i in good],
+            )
+            added += len(good)
+
+        if failed:
+            # Loud on purpose: a partial index is a silent quality regression at
+            # retrieval time, and the count is the only signal it happened.
+            log.warning(
+                "Indexed %d documents; %d could not be embedded and were NOT "
+                "stored (they will be retried on the next ingestion)",
+                added,
+                failed,
+            )
+        else:
+            log.info("Added %d documents to vector store", added)
 
     def similarity_search(
         self,

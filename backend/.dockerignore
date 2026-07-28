@@ -1,0 +1,42 @@
+# Build context exclusions for backend/Dockerfile.
+#
+# There is a specific incident behind this file. With no .dockerignore, `COPY . .`
+# baked the developer's own rag/chroma_db into the image — which is where
+# "Vector store initialized with 49 existing docs" came from on a container that
+# had never ingested anything. Now that the index is a named volume, that is
+# worse than untidy: Docker seeds a new named volume from whatever the image has
+# at the mount point, so a stale or zero-vector-poisoned index would reappear
+# after every rebuild and survive `docker compose down -v`.
+#
+# It also cut a 26MB build context (20MB of it one developer's checkpoints.db)
+# down to the source that actually needs to ship.
+
+# --- Runtime state: belongs on a volume, never in an image layer -------------
+rag/chroma_db/
+memory/*.db
+memory/*.db-shm
+memory/*.db-wal
+data/
+
+# Fetched reference docs are a cache the container rebuilds over plain HTTP.
+# Unchanged docs hash to ids the index already holds, so this costs no quota.
+rag/reference/**/_fetched/
+
+# --- Secrets -----------------------------------------------------------------
+# The root .env reaches the container through compose's env_file at run time.
+# A key copied into a layer stays in that layer forever, whatever deletes it later.
+.env
+.env.*
+*.pem
+*.key
+
+# --- Build and test detritus -------------------------------------------------
+# Stale .pyc compiled by a different interpreter than the image's python:3.12
+# is actively harmful, not merely large.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/

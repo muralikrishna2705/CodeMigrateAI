@@ -19,16 +19,27 @@ than the AI Studio / Gemini API path this project uses. Leaving inference to
 guess would silently route to a different backend that needs different
 credentials, so ``model_provider`` is never omitted.
 
-The rate limiter is deliberately **one shared instance across every role and
-model**: API quota is billed per project, not per model, so two limiters would
-each think they owned the whole budget and together burst to double it. Hosted
-embeddings acquire from the same bucket (via :class:`_ResilientEmbeddings`) for
-that same reason — the startup corpus ingestion and the chat calls spend one
-shared project quota.
+The chat rate limiter is deliberately **one shared instance across every role
+and model**: chat quota is billed per project, not per model, so two limiters
+would each think they owned the whole budget and together burst to double it.
+
+Embeddings get a **separate** bucket, because they are a separate quota:
+Google meters ``embed_content_free_tier_requests`` (100/min) independently of
+generateContent (~10 RPM). Putting them on the chat bucket throttled corpus
+ingestion to a fraction of its own allowance while still 429ing, because the
+chat limiter counts *calls* and the embedding quota counts *content items* — a
+50-text batch cost 50 units against a budget that believed it had spent 1. So
+:class:`_ResilientEmbeddings` acquires one token **per text**, from a bucket
+sized in items per second.
+
+Both limiters are per-process. Anything that runs the app with more than one
+worker process multiplies the effective rate by the worker count — see the
+single-worker note in ``backend/Dockerfile``.
 """
 
 import asyncio
 import logging
+import re
 import threading
 import time
 from typing import Literal
@@ -73,6 +84,7 @@ _lock = threading.Lock()
 _model_cache: dict[tuple, BaseChatModel] = {}
 _embeddings_cache: dict[tuple, Embeddings] = {}
 _rate_limiter: InMemoryRateLimiter | None = None
+_embed_rate_limiter: InMemoryRateLimiter | None = None
 
 
 def resolve_model_name(role: Role = "main", settings=None) -> str:
@@ -130,6 +142,33 @@ def get_rate_limiter(settings=None) -> InMemoryRateLimiter | None:
                 settings.llm_max_burst,
             )
     return _rate_limiter
+
+
+def get_embed_rate_limiter(settings=None) -> InMemoryRateLimiter | None:
+    """The process-wide **embedding** limiter, or None when throttling is off.
+
+    Separate from the chat limiter because it is a separate quota measured in a
+    different unit — see the module docstring. Denominated in *texts* per
+    second, since :class:`_ResilientEmbeddings` takes one token per text rather
+    than one per API call.
+    """
+    global _embed_rate_limiter
+    settings = settings or get_settings()
+    if settings.embed_requests_per_second <= 0:
+        return None
+    with _lock:
+        if _embed_rate_limiter is None:
+            _embed_rate_limiter = InMemoryRateLimiter(
+                requests_per_second=settings.embed_requests_per_second,
+                check_every_n_seconds=0.1,
+                max_bucket_size=max(1.0, settings.embed_max_burst),
+            )
+            log.info(
+                "Embedding rate limiter: %.2f texts/s (burst %d)",
+                settings.embed_requests_per_second,
+                settings.embed_max_burst,
+            )
+    return _embed_rate_limiter
 
 
 def _provider_kwargs(provider: str, role: Role, json_mode: bool, settings) -> dict:
@@ -233,34 +272,71 @@ def get_chat_model(
 GEMINI_EMBED_DIMENSIONS = 3072
 
 
+#: Google reports how long to wait in two places in the same error — the
+#: structured ``RetryInfo`` detail and the prose message. Either is worth far
+#: more than a guess: exponential backoff from 2s against an advertised 58s wait
+#: is three guaranteed failures that each cost quota and push the reset further
+#: out.
+_RETRY_DELAY_PATTERNS = (
+    re.compile(r"['\"]retryDelay['\"]:\s*['\"](\d+(?:\.\d+)?)s['\"]"),
+    re.compile(r"retry in (\d+(?:\.\d+)?)s"),
+)
+
+
+def _server_retry_delay(exc: Exception) -> float | None:
+    """Seconds the provider asked us to wait, or None if it did not say."""
+    text = str(exc)
+    for pattern in _RETRY_DELAY_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            try:
+                return float(match.group(1))
+            except ValueError:  # pragma: no cover — regex already constrains it
+                return None
+    return None
+
+
 class _ResilientEmbeddings(Embeddings):
     """Rate-limited, self-retrying wrapper around a hosted embedding backend.
 
-    Two gaps this closes, both invisible until a free-tier quota is actually hit:
+    Three gaps this closes, all invisible until a free-tier quota is actually hit:
 
     * LangChain's :class:`InMemoryRateLimiter` throttles *chat* models only — it
       is a callback the chat client invokes and has no hook into
       ``embed_documents`` / ``embed_query``. So the startup corpus ingestion fires
       embedding batches completely unthrottled and 429s almost immediately. The
-      token is acquired here instead, before every embed, from the **same shared
-      limiter** the chat models use: one project quota, one bucket.
+      tokens are acquired here instead, before every embed.
+    * The quota counts **content items, not calls**. A limiter that takes one
+      token per ``embed_documents`` call lets a 50-text batch spend 50 units of a
+      100/min budget while believing it spent 1 — which is why throttling to
+      0.16 req/s still 429'd within four calls. One token is taken per *text*,
+      from a bucket denominated in texts per second.
     * ``GoogleGenerativeAIEmbeddings`` has no ``max_retries`` of its own — the
       field does not exist on it and its ``request_options`` is inert in this
       version — so a transient 429/5xx would go straight to the caller's
       zero-vector fallback and, on the *first* batch, poison the collection at the
-      wrong width. Here the call is retried with exponential backoff first,
-      re-acquiring a token each attempt so retries respect the same quota.
+      wrong width. Here the call is retried first, re-acquiring tokens each
+      attempt so retries respect the same quota.
+
+    Backoff prefers the delay the server itself advertises (``RetryInfo``) over
+    the exponential schedule. Retrying a quota error sooner than the reset cannot
+    succeed by construction, and each premature attempt spends more of the quota
+    it is waiting on.
 
     Any exception is retried up to ``max_retries`` rather than only status codes
-    parsed out of a provider-specific error string: the bound is small, the
-    backoff is cheap, and a genuinely permanent error simply exhausts the retries
-    and reaches the caller's graceful fallback a few seconds later — the same
-    place it would have reached immediately.
+    parsed out of a provider-specific error string: the bound is small, and a
+    genuinely permanent error simply exhausts the retries and reaches the
+    caller's graceful fallback — the same place it would have reached
+    immediately.
     """
 
-    #: Ceiling on a single backoff sleep, so a large ``max_retries`` cannot
+    #: Ceiling on an exponential backoff sleep, so a large ``max_retries`` cannot
     #: schedule an absurd wait.
     _MAX_BACKOFF_SEC = 30.0
+    #: Higher ceiling for a delay the *server* asked for: free-tier resets are
+    #: routinely 30-60s, and truncating that back to 30 reintroduces the very
+    #: premature retry this exists to stop.
+    _MAX_SERVER_BACKOFF_SEC = 120.0
 
     def __init__(
         self,
@@ -275,20 +351,36 @@ class _ResilientEmbeddings(Embeddings):
         self._max_retries = max(0, max_retries)
         self._base_delay = base_delay
 
-    def _backoff(self, attempt: int) -> float:
+    def _backoff(self, attempt: int, exc: Exception) -> float:
+        advised = _server_retry_delay(exc)
+        if advised is not None:
+            # +1s so we wake up after the reset rather than exactly on it.
+            return min(self._MAX_SERVER_BACKOFF_SEC, advised + 1.0)
         return min(self._MAX_BACKOFF_SEC, self._base_delay * (2 ** attempt))
 
-    def _call(self, fn, *args):
+    def _acquire(self, cost: int) -> None:
+        """Take ``cost`` tokens — one per text the call will actually embed."""
+        if self.rate_limiter is None:
+            return
+        for _ in range(max(1, cost)):
+            self.rate_limiter.acquire(blocking=True)
+
+    async def _aacquire(self, cost: int) -> None:
+        if self.rate_limiter is None:
+            return
+        for _ in range(max(1, cost)):
+            await self.rate_limiter.aacquire(blocking=True)
+
+    def _call(self, fn, arg, *, cost: int = 1):
         attempt = 0
         while True:
-            if self.rate_limiter is not None:
-                self.rate_limiter.acquire(blocking=True)
+            self._acquire(cost)
             try:
-                return fn(*args)
+                return fn(arg)
             except Exception as exc:  # noqa: BLE001 — bounded retry, then propagate
                 if attempt >= self._max_retries:
                     raise
-                delay = self._backoff(attempt)
+                delay = self._backoff(attempt, exc)
                 attempt += 1
                 log.warning(
                     "Embedding call failed (attempt %d/%d), backing off %.1fs: %s",
@@ -296,17 +388,16 @@ class _ResilientEmbeddings(Embeddings):
                 )
                 time.sleep(delay)
 
-    async def _acall(self, fn, *args):
+    async def _acall(self, fn, arg, *, cost: int = 1):
         attempt = 0
         while True:
-            if self.rate_limiter is not None:
-                await self.rate_limiter.aacquire(blocking=True)
+            await self._aacquire(cost)
             try:
-                return await fn(*args)
+                return await fn(arg)
             except Exception as exc:  # noqa: BLE001 — bounded retry, then propagate
                 if attempt >= self._max_retries:
                     raise
-                delay = self._backoff(attempt)
+                delay = self._backoff(attempt, exc)
                 attempt += 1
                 log.warning(
                     "Async embedding call failed (attempt %d/%d), backing off %.1fs: %s",
@@ -315,16 +406,18 @@ class _ResilientEmbeddings(Embeddings):
                 await asyncio.sleep(delay)
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        return self._call(self.inner.embed_documents, texts)
+        return self._call(self.inner.embed_documents, texts, cost=len(texts))
 
     def embed_query(self, text: str) -> list[float]:
-        return self._call(self.inner.embed_query, text)
+        return self._call(self.inner.embed_query, text, cost=1)
 
     async def aembed_documents(self, texts: list[str]) -> list[list[float]]:
-        return await self._acall(self.inner.aembed_documents, texts)
+        return await self._acall(
+            self.inner.aembed_documents, texts, cost=len(texts)
+        )
 
     async def aembed_query(self, text: str) -> list[float]:
-        return await self._acall(self.inner.aembed_query, text)
+        return await self._acall(self.inner.aembed_query, text, cost=1)
 
 
 def get_embeddings(settings=None) -> Embeddings:
@@ -354,13 +447,14 @@ def get_embeddings(settings=None) -> Embeddings:
             # rejects the insert ("expecting dimension 3072, got 768").
             output_dimensionality=GEMINI_EMBED_DIMENSIONS,
         )
-        # Hosted embeddings share the chat models' per-project quota, and the
-        # startup corpus ingestion is the burstiest caller of it. Wrap so every
-        # embed acquires a token from the shared limiter first and transient
-        # 429/5xx are retried before the fallback ever substitutes a zero vector.
+        # Embeddings are their own metered quota, and the startup corpus
+        # ingestion is the burstiest caller of it. Wrap so every embed acquires
+        # one token *per text* from the embedding bucket first, and so transient
+        # 429/5xx are retried — at the server's advertised delay — before the
+        # fallback ever substitutes a zero vector.
         embeddings: Embeddings = _ResilientEmbeddings(
             backend,
-            limiter=get_rate_limiter(settings),
+            limiter=get_embed_rate_limiter(settings),
             max_retries=settings.llm_max_retries,
         )
     elif provider == "ollama":
@@ -388,8 +482,9 @@ def reset_models() -> None:
     Tests mutate settings between cases; without this they would keep getting a
     client built from the previous case's configuration.
     """
-    global _rate_limiter
+    global _rate_limiter, _embed_rate_limiter
     with _lock:
         _model_cache.clear()
         _embeddings_cache.clear()
         _rate_limiter = None
+        _embed_rate_limiter = None

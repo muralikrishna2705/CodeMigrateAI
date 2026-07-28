@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import logging
 
@@ -58,7 +59,16 @@ class IngestionPipeline:
                         self._ingested_hashes.add(h)
                         unique_chunks.append(chunk)
                 if unique_chunks:
-                    self.vector_store.add_documents(unique_chunks)
+                    # Chroma writes, the embedding call behind them, and the
+                    # rate-limiter/backoff sleeps inside that call are all
+                    # blocking. Ingestion runs as a background task on the
+                    # server's event loop, so doing this inline froze the whole
+                    # worker — /health and /migrate included — for the length of
+                    # every quota backoff. Same treatment as every other store
+                    # access (see runtime/agent_observer.py).
+                    await asyncio.to_thread(
+                        self.vector_store.add_documents, unique_chunks
+                    )
                     log.info("  Ingested %d unique chunks for %s", len(unique_chunks), lang)
                 else:
                     log.info("  No new chunks for %s", lang)
