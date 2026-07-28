@@ -625,8 +625,12 @@ class RAGPipeline:
             "Choose how to search the reference corpus for this query."
         )
         try:
+            from llm import providers
+
             model = chat_model("fast").with_structured_output(RetrievalRouteDecision)
-            decision = await model.ainvoke(prompt)
+            decision = await providers.ainvoke_with_retry(
+                model, prompt, label="Strategy routing"
+            )
         except Exception as exc:  # noqa: BLE001 — routing is optional
             log.warning("Strategy routing failed, using single_hop: %s", exc)
             return "single_hop"

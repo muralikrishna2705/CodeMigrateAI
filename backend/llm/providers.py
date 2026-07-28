@@ -35,6 +35,15 @@ sized in items per second.
 Both limiters are per-process. Anything that runs the app with more than one
 worker process multiplies the effective rate by the worker count — see the
 single-worker note in ``backend/Dockerfile``.
+
+Both are also **open-loop**: a token bucket spends the quota it *believes* it
+has and never learns what the server actually thinks. That holds right up until
+something outside its model happens — a retry it did not meter, a second process
+sharing the key, a per-day cap it cannot see — and then every caller keeps firing
+into an exhausted quota, each 429 pushing the reset further out. The
+:class:`_QuotaGate` closes that loop: one 429 anywhere parks *every* caller in
+the process until the reset the server advertised, so a four-way fan-out costs
+one rejected request instead of four.
 """
 
 import asyncio
@@ -42,13 +51,15 @@ import logging
 import re
 import threading
 import time
-from typing import Literal
+from typing import Any, AsyncIterator, Literal
 
 from config import get_settings
 from langchain.chat_models import init_chat_model
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
-from langchain_core.rate_limiters import InMemoryRateLimiter
+from langchain_core.rate_limiters import BaseRateLimiter, InMemoryRateLimiter
+from langchain_core.runnables import Runnable
 
 log = logging.getLogger("CodeMigrateAI.Providers")
 
@@ -80,11 +91,248 @@ DEFAULT_MODELS: dict[str, dict[str, str]] = {
 # an API key is required (it is).
 HOSTED_PROVIDERS = frozenset({"google_genai", "google_vertexai", "openai", "anthropic", "groq"})
 
-_lock = threading.Lock()
+# Reentrant because the limiter accessors build their quota gate while holding
+# it, and the gate accessors take it too.
+_lock = threading.RLock()
 _model_cache: dict[tuple, BaseChatModel] = {}
 _embeddings_cache: dict[tuple, Embeddings] = {}
-_rate_limiter: InMemoryRateLimiter | None = None
-_embed_rate_limiter: InMemoryRateLimiter | None = None
+_rate_limiter: BaseRateLimiter | None = None
+_embed_rate_limiter: BaseRateLimiter | None = None
+_chat_gate: "_QuotaGate | None" = None
+_embed_gate: "_QuotaGate | None" = None
+
+
+# --- Quota detection --------------------------------------------------------
+
+#: Google reports how long to wait in two places in the same error — the
+#: structured ``RetryInfo`` detail and the prose message. Either is worth far
+#: more than a guess: exponential backoff from 1s against an advertised 58s wait
+#: is a guaranteed failure that costs quota and pushes the reset further out.
+#: This is exactly what the google-genai SDK's own retry gets wrong — it waits
+#: ``wait_exponential_jitter(initial=1.0)`` and never reads the advertised delay
+#: — which is why transport-level retry is disabled in :func:`_provider_kwargs`
+#: and retries are performed here instead.
+_RETRY_DELAY_PATTERNS = (
+    re.compile(r"['\"]retryDelay['\"]:\s*['\"](\d+(?:\.\d+)?)s['\"]"),
+    re.compile(r"retry in (\d+(?:\.\d+)?)s"),
+)
+
+#: Whether a failure is the provider saying "too fast" rather than "wrong".
+#: Deliberately loose: a false positive costs one pause, while a false negative
+#: puts the caller straight back into the quota it just exhausted.
+_QUOTA_PATTERN = re.compile(
+    r"\b429\b|RESOURCE_EXHAUSTED|rate.?limit|quota", re.IGNORECASE
+)
+
+#: A *daily* cap, as opposed to a per-minute one. The distinction is the
+#: difference between waiting 30s and waiting until midnight Pacific, so these
+#: are reported and abandoned rather than retried — see :func:`_aretry`.
+_DAILY_QUOTA_PATTERN = re.compile(r"PerDay|per.?day|daily", re.IGNORECASE)
+
+#: Rejections no amount of waiting fixes — a bad key, a model id that does not
+#: exist, a request the API will not parse. Retrying these is pure latency: three
+#: attempts with backoff spend ~14s to arrive at the identical error, and they
+#: delay the one thing that helps, which is the message reaching the log.
+_PERMANENT_PATTERN = re.compile(
+    r"INVALID_ARGUMENT|PERMISSION_DENIED|UNAUTHENTICATED|NOT_FOUND"
+    r"|FAILED_PRECONDITION|API key not valid",
+    re.IGNORECASE,
+)
+
+
+def _server_retry_delay(exc: BaseException) -> float | None:
+    """Seconds the provider asked us to wait, or None if it did not say."""
+    text = str(exc)
+    for pattern in _RETRY_DELAY_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            try:
+                return float(match.group(1))
+            except ValueError:  # pragma: no cover — regex already constrains it
+                return None
+    return None
+
+
+def _is_quota_error(exc: BaseException) -> bool:
+    """Whether ``exc`` is a rate-limit / quota rejection."""
+    # Structured first: google.genai.errors.APIError carries the status as an
+    # int, which is unambiguous where a message match is only a heuristic.
+    for attr in ("code", "status_code"):
+        if getattr(exc, attr, None) == 429:
+            return True
+    return bool(_QUOTA_PATTERN.search(str(exc)))
+
+
+def _is_daily_quota_error(exc: BaseException) -> bool:
+    """Whether ``exc`` is a per-*day* quota, which no backoff can outlast."""
+    return _is_quota_error(exc) and bool(_DAILY_QUOTA_PATTERN.search(str(exc)))
+
+
+def _is_permanent_error(exc: BaseException) -> bool:
+    """Whether ``exc`` is a rejection that retrying cannot fix.
+
+    A 4xx other than 429 is the provider saying the *request* is wrong, not that
+    it arrived too soon. Checked structurally where the exception exposes a
+    status, and by the named gRPC status otherwise — both unambiguous, unlike
+    matching a bare "400" that could as easily be a token count.
+    """
+    if _is_quota_error(exc):
+        return False
+    for attr in ("code", "status_code"):
+        code = getattr(exc, attr, None)
+        if isinstance(code, int) and 400 <= code < 500:
+            return True
+    return bool(_PERMANENT_PATTERN.search(str(exc)))
+
+
+class _QuotaGate:
+    """A process-wide "stop calling" signal, shared by every caller of one quota.
+
+    The token buckets elsewhere in this module are open-loop — they pace against
+    a quota they *assume*, and a 429 tells them nothing. That is the gap this
+    fills: the first caller to be rejected records the reset the server
+    advertised, and every other caller waits it out before spending a request of
+    its own. Without it, a parallel fan-out turns one exhausted quota into one
+    rejection per branch, each of which pushes the reset further out.
+
+    Hold windows only ever extend, never shorten: two concurrent 429s advertising
+    different delays should leave the longer one standing.
+    """
+
+    def __init__(
+        self, name: str, *, default_cooldown: float = 30.0, max_cooldown: float = 120.0
+    ):
+        self.name = name
+        self._default = default_cooldown
+        self._max = max_cooldown
+        self._until = 0.0
+        self._lock = threading.Lock()
+
+    @property
+    def remaining(self) -> float:
+        """Seconds left on the current hold; 0.0 when callers may proceed."""
+        return max(0.0, self._until - time.monotonic())
+
+    def penalize(self, exc: BaseException) -> float:
+        """Open a hold window sized to ``exc``; returns the seconds held.
+
+        A non-quota error is not this gate's business and returns 0.0 — a bad
+        prompt or a dropped socket says nothing about how much quota is left.
+        """
+        if not _is_quota_error(exc):
+            return 0.0
+        advised = _server_retry_delay(exc)
+        if _is_daily_quota_error(exc):
+            # Nothing resets before the provider's next quota day, so the only
+            # useful hold is the longest bounded one — anything shorter just lets
+            # every caller re-confirm the same cap on a loop.
+            hold = self._max
+        else:
+            # +1s so callers wake *after* the reset rather than exactly on it.
+            hold = min(
+                self._max, advised + 1.0 if advised is not None else self._default
+            )
+        with self._lock:
+            deadline = time.monotonic() + hold
+            if deadline <= self._until:
+                return self.remaining
+            self._until = deadline
+        log.warning(
+            "%s quota exhausted; holding every caller for %.1fs (%s)",
+            self.name,
+            hold,
+            "server-advised" if advised is not None else "no delay advertised",
+        )
+        return hold
+
+    def clear(self) -> None:
+        with self._lock:
+            self._until = 0.0
+
+    # Both waits tick in ≤1s slices rather than sleeping the whole span at once,
+    # so a *longer* hold recorded by another caller mid-wait is picked up, and so
+    # an async cancellation is not stuck behind a 60s sleep.
+    def wait(self) -> None:
+        while (delay := self.remaining) > 0:
+            time.sleep(min(delay, 1.0))
+
+    async def await_clear(self) -> None:
+        while (delay := self.remaining) > 0:
+            await asyncio.sleep(min(delay, 1.0))
+
+
+def get_quota_gate(settings=None) -> _QuotaGate:
+    """The process-wide gate for the **chat** quota."""
+    global _chat_gate
+    settings = settings or get_settings()
+    with _lock:
+        if _chat_gate is None:
+            _chat_gate = _QuotaGate(
+                "Chat",
+                default_cooldown=settings.llm_quota_cooldown_sec,
+                max_cooldown=settings.llm_quota_max_cooldown_sec,
+            )
+    return _chat_gate
+
+
+def get_embed_quota_gate(settings=None) -> _QuotaGate:
+    """The process-wide gate for the **embedding** quota (a separate budget)."""
+    global _embed_gate
+    settings = settings or get_settings()
+    with _lock:
+        if _embed_gate is None:
+            _embed_gate = _QuotaGate(
+                "Embedding",
+                default_cooldown=settings.llm_quota_cooldown_sec,
+                max_cooldown=settings.llm_quota_max_cooldown_sec,
+            )
+    return _embed_gate
+
+
+class _QuotaAwareRateLimiter(BaseRateLimiter):
+    """A token bucket that also honours its quota's :class:`_QuotaGate`.
+
+    Enforcement lives here rather than at the call sites because *every* chat
+    path funnels through the limiter — ``ainvoke``, ``astream``, a model with
+    tools bound, a structured-output chain — while call sites are something new
+    code can forget to route through. A caller that never sees a 429 itself still
+    waits out one that another branch hit.
+    """
+
+    def __init__(self, inner: InMemoryRateLimiter, gate: _QuotaGate):
+        self.inner = inner
+        self.gate = gate
+
+    def acquire(self, *, blocking: bool = True) -> bool:
+        if not blocking:
+            return self.gate.remaining <= 0 and self.inner.acquire(blocking=False)
+        self.gate.wait()
+        return self.inner.acquire(blocking=True)
+
+    async def aacquire(self, *, blocking: bool = True) -> bool:
+        if not blocking:
+            return self.gate.remaining <= 0 and (
+                await self.inner.aacquire(blocking=False)
+            )
+        await self.gate.await_clear()
+        return await self.inner.aacquire(blocking=True)
+
+
+class _QuotaCallbackHandler(BaseCallbackHandler):
+    """Reports every model failure to the quota gate.
+
+    A callback is what makes the gate *complete*: LangChain fires ``on_llm_error``
+    for every chat model call regardless of how it was reached, so a 429 raised
+    inside a ``bind_tools`` chain or a ``with_structured_output`` chain still
+    lands here — including on paths that predate this module and on any added
+    later.
+    """
+
+    def __init__(self, gate: _QuotaGate):
+        self.gate = gate
+
+    def on_llm_error(self, error: BaseException, **kwargs: Any) -> None:
+        self.gate.penalize(error)
 
 
 def resolve_model_name(role: Role = "main", settings=None) -> str:
@@ -117,13 +365,16 @@ def resolve_embedding_model(settings=None) -> str:
     return DEFAULT_MODELS.get(provider, {}).get("embed", "")
 
 
-def get_rate_limiter(settings=None) -> InMemoryRateLimiter | None:
+def get_rate_limiter(settings=None) -> BaseRateLimiter | None:
     """The process-wide limiter, or None when throttling is disabled.
 
     Hosted free tiers are measured in requests per *minute* and this graph makes
     8-15 model calls per migration, so without this the parallel fan-out 429s
     long before it saturates anything. ``max_bucket_size`` allows a short burst
     (the fan-out) while the steady-state rate still holds.
+
+    Wrapped in a :class:`_QuotaAwareRateLimiter` so the open-loop bucket also
+    honours a 429 that some *other* caller already collected.
     """
     global _rate_limiter
     settings = settings or get_settings()
@@ -131,10 +382,13 @@ def get_rate_limiter(settings=None) -> InMemoryRateLimiter | None:
         return None
     with _lock:
         if _rate_limiter is None:
-            _rate_limiter = InMemoryRateLimiter(
-                requests_per_second=settings.llm_requests_per_second,
-                check_every_n_seconds=0.1,
-                max_bucket_size=max(1.0, settings.llm_max_burst),
+            _rate_limiter = _QuotaAwareRateLimiter(
+                InMemoryRateLimiter(
+                    requests_per_second=settings.llm_requests_per_second,
+                    check_every_n_seconds=0.1,
+                    max_bucket_size=max(1.0, settings.llm_max_burst),
+                ),
+                get_quota_gate(settings),
             )
             log.info(
                 "Rate limiter: %.2f req/s (burst %d)",
@@ -144,13 +398,14 @@ def get_rate_limiter(settings=None) -> InMemoryRateLimiter | None:
     return _rate_limiter
 
 
-def get_embed_rate_limiter(settings=None) -> InMemoryRateLimiter | None:
+def get_embed_rate_limiter(settings=None) -> BaseRateLimiter | None:
     """The process-wide **embedding** limiter, or None when throttling is off.
 
     Separate from the chat limiter because it is a separate quota measured in a
     different unit — see the module docstring. Denominated in *texts* per
     second, since :class:`_ResilientEmbeddings` takes one token per text rather
-    than one per API call.
+    than one per API call. Gated on the embedding quota, not the chat one, for
+    the same reason.
     """
     global _embed_rate_limiter
     settings = settings or get_settings()
@@ -158,10 +413,13 @@ def get_embed_rate_limiter(settings=None) -> InMemoryRateLimiter | None:
         return None
     with _lock:
         if _embed_rate_limiter is None:
-            _embed_rate_limiter = InMemoryRateLimiter(
-                requests_per_second=settings.embed_requests_per_second,
-                check_every_n_seconds=0.1,
-                max_bucket_size=max(1.0, settings.embed_max_burst),
+            _embed_rate_limiter = _QuotaAwareRateLimiter(
+                InMemoryRateLimiter(
+                    requests_per_second=settings.embed_requests_per_second,
+                    check_every_n_seconds=0.1,
+                    max_bucket_size=max(1.0, settings.embed_max_burst),
+                ),
+                get_embed_quota_gate(settings),
             )
             log.info(
                 "Embedding rate limiter: %.2f texts/s (burst %d)",
@@ -186,7 +444,19 @@ def _provider_kwargs(provider: str, role: Role, json_mode: bool, settings) -> di
             kwargs["api_key"] = settings.google_api_key
         kwargs["max_output_tokens"] = settings.llm_max_tokens
         kwargs["timeout"] = settings.llm_timeout_sec
-        kwargs["max_retries"] = settings.llm_max_retries
+        # Transport-level retry OFF (1 == "one attempt, no retries"), and the
+        # retrying is done by _aretry instead. Two things are wrong with the
+        # SDK's version, and both only bite on a quota error:
+        #
+        #  * It is delay-blind. `max_retries` becomes
+        #    `HttpRetryOptions(attempts=N)`, which waits
+        #    `wait_exponential_jitter(initial=1.0)` and never reads the
+        #    `retryDelay` the 429 itself carries. Retrying after ~1s against an
+        #    advertised 30-60s reset cannot succeed by construction.
+        #  * It is unmetered. Those retries happen inside httpx, below LangChain,
+        #    so they never take a token from the rate limiter — the limiter goes
+        #    on believing it spent one request while the wire carried several.
+        kwargs["max_retries"] = 1
         if json_mode:
             kwargs["response_mime_type"] = "application/json"
         # Gemini 2.5+ reasons before answering by default. That is worth paying
@@ -250,6 +520,11 @@ def get_chat_model(
     limiter = get_rate_limiter(settings)
     if limiter is not None:
         kwargs["rate_limiter"] = limiter
+    # Every failure reaches the gate through this, whatever shape the call took
+    # — a plain ainvoke, a tool-bound model, a structured-output chain. Attached
+    # after the cache key is computed: it is process state, identical for every
+    # model, so keying on it would only fragment the cache.
+    kwargs["callbacks"] = [_QuotaCallbackHandler(get_quota_gate(settings))]
 
     chat = init_chat_model(name, model_provider=provider, **kwargs)
     with _lock:
@@ -272,28 +547,149 @@ def get_chat_model(
 GEMINI_EMBED_DIMENSIONS = 3072
 
 
-#: Google reports how long to wait in two places in the same error — the
-#: structured ``RetryInfo`` detail and the prose message. Either is worth far
-#: more than a guess: exponential backoff from 2s against an advertised 58s wait
-#: is three guaranteed failures that each cost quota and push the reset further
-#: out.
-_RETRY_DELAY_PATTERNS = (
-    re.compile(r"['\"]retryDelay['\"]:\s*['\"](\d+(?:\.\d+)?)s['\"]"),
-    re.compile(r"retry in (\d+(?:\.\d+)?)s"),
-)
+#: Ceiling on an exponential backoff sleep for a *non*-quota failure, so a large
+#: retry budget cannot schedule an absurd wait.
+_MAX_BACKOFF_SEC = 30.0
 
 
-def _server_retry_delay(exc: Exception) -> float | None:
-    """Seconds the provider asked us to wait, or None if it did not say."""
-    text = str(exc)
-    for pattern in _RETRY_DELAY_PATTERNS:
-        match = pattern.search(text)
-        if match:
-            try:
-                return float(match.group(1))
-            except ValueError:  # pragma: no cover — regex already constrains it
-                return None
-    return None
+async def _aretry(factory, *, gate: _QuotaGate, max_retries: int, base_delay: float,
+                  label: str):
+    """Await ``factory()``, retrying transient failures against ``gate``.
+
+    Waiting is deliberately split in two. A **quota** failure sleeps for nothing
+    here — it penalizes the gate and loops, and the ``await_clear`` at the top of
+    the next iteration is what holds, for exactly as long as the server asked and
+    in a way every *other* caller observes too. Only a non-quota failure (a 5xx,
+    a dropped socket) uses the local exponential schedule, because nothing
+    authoritative said how long to wait.
+
+    A per-day quota is not retried at all: it does not reset inside any backoff
+    worth waiting through, so retrying only spends minutes to reach the same
+    failure.
+    """
+    attempt = 0
+    while True:
+        await gate.await_clear()
+        try:
+            return await factory()
+        except Exception as exc:  # noqa: BLE001 — bounded retry, then propagate
+            quota = _is_quota_error(exc)
+            if quota:
+                # Belt and braces: the callback handler already reports failures
+                # raised by a chat model, but this path also wraps runnables that
+                # never went through a callback manager.
+                gate.penalize(exc)
+            if _is_daily_quota_error(exc):
+                log.error(
+                    "%s: daily quota exhausted — not retrying, this does not "
+                    "reset until the provider's next quota day: %s",
+                    label,
+                    exc,
+                )
+                raise
+            if _is_permanent_error(exc):
+                log.error("%s: request rejected, not retryable: %s", label, exc)
+                raise
+            if attempt >= max_retries:
+                raise
+            attempt += 1
+            delay = (
+                0.0
+                if quota
+                else min(_MAX_BACKOFF_SEC, base_delay * (2 ** (attempt - 1)))
+            )
+            log.warning(
+                "%s failed (attempt %d/%d, %s), retrying%s: %s",
+                label,
+                attempt,
+                max_retries,
+                "quota" if quota else "transient",
+                f" in {delay:.1f}s" if delay else f" after {gate.remaining:.1f}s hold",
+                exc,
+            )
+            if delay:
+                await asyncio.sleep(delay)
+
+
+async def ainvoke_with_retry(
+    runnable: Runnable,
+    input: Any,
+    *,
+    settings=None,
+    label: str = "Model call",
+    **kwargs: Any,
+):
+    """``runnable.ainvoke(input)``, retried against the chat quota gate.
+
+    The entry point for every chat call in the app. The gate is enforced in the
+    rate limiter regardless, so this adds the one thing a limiter cannot do:
+    reissue the request that was actually rejected.
+    """
+    settings = settings or get_settings()
+    return await _aretry(
+        lambda: runnable.ainvoke(input, **kwargs),
+        gate=get_quota_gate(settings),
+        max_retries=settings.llm_max_retries,
+        base_delay=settings.llm_retry_base_delay_sec,
+        label=label,
+    )
+
+
+async def astream_with_retry(
+    runnable: Runnable,
+    input: Any,
+    *,
+    settings=None,
+    label: str = "Model stream",
+    **kwargs: Any,
+) -> AsyncIterator[Any]:
+    """``runnable.astream(input)``, retried *only before the first chunk*.
+
+    Once a chunk has been yielded the caller has already consumed part of the
+    answer, and restarting would duplicate it — a partial answer plus a whole one
+    is worse than the truncation. A 429 is refused before any chunk exists, so
+    the case this protects is the case that matters.
+    """
+    settings = settings or get_settings()
+    gate = get_quota_gate(settings)
+    max_retries = settings.llm_max_retries
+    base_delay = settings.llm_retry_base_delay_sec
+    attempt = 0
+
+    while True:
+        await gate.await_clear()
+        started = False
+        try:
+            async for chunk in runnable.astream(input, **kwargs):
+                started = True
+                yield chunk
+            return
+        except Exception as exc:  # noqa: BLE001 — bounded retry, then propagate
+            quota = _is_quota_error(exc)
+            if quota:
+                gate.penalize(exc)
+            if (
+                started
+                or attempt >= max_retries
+                or _is_daily_quota_error(exc)
+                or _is_permanent_error(exc)
+            ):
+                raise
+            attempt += 1
+            delay = (
+                0.0
+                if quota
+                else min(_MAX_BACKOFF_SEC, base_delay * (2 ** (attempt - 1)))
+            )
+            log.warning(
+                "%s failed before first chunk (attempt %d/%d), retrying: %s",
+                label,
+                attempt,
+                max_retries,
+                exc,
+            )
+            if delay:
+                await asyncio.sleep(delay)
 
 
 class _ResilientEmbeddings(Embeddings):
@@ -342,14 +738,29 @@ class _ResilientEmbeddings(Embeddings):
         self,
         inner: Embeddings,
         *,
-        limiter: InMemoryRateLimiter | None = None,
+        limiter: BaseRateLimiter | None = None,
         max_retries: int = 2,
         base_delay: float = 2.0,
+        gate: _QuotaGate | None = None,
     ):
         self.inner = inner
         self.rate_limiter = limiter
+        self.gate = gate
         self._max_retries = max(0, max_retries)
         self._base_delay = base_delay
+
+    def _holding(self) -> bool:
+        """Whether the gate is already making callers wait.
+
+        When it is, the ``_acquire`` at the top of the next retry pays that wait
+        in full — so the local backoff must stand down or the two would stack
+        into double the delay the server actually asked for.
+        """
+        return self.gate is not None and self.gate.remaining > 0
+
+    def _hold_remaining(self) -> float:
+        """Seconds the gate will make the next acquire wait (0.0 when open)."""
+        return self.gate.remaining if self.gate is not None else 0.0
 
     def _backoff(self, attempt: int, exc: Exception) -> float:
         advised = _server_retry_delay(exc)
@@ -360,16 +771,38 @@ class _ResilientEmbeddings(Embeddings):
 
     def _acquire(self, cost: int) -> None:
         """Take ``cost`` tokens — one per text the call will actually embed."""
+        # The gate is waited even with throttling off: a 429 already collected is
+        # a fact about the quota, not about the pacing policy.
+        if self.gate is not None:
+            self.gate.wait()
         if self.rate_limiter is None:
             return
         for _ in range(max(1, cost)):
             self.rate_limiter.acquire(blocking=True)
 
     async def _aacquire(self, cost: int) -> None:
+        if self.gate is not None:
+            await self.gate.await_clear()
         if self.rate_limiter is None:
             return
         for _ in range(max(1, cost)):
             await self.rate_limiter.aacquire(blocking=True)
+
+    def _give_up(self, exc: Exception, attempt: int) -> bool:
+        """Whether ``exc`` should reach the caller instead of being retried."""
+        if self.gate is not None:
+            self.gate.penalize(exc)
+        if _is_daily_quota_error(exc):
+            log.error(
+                "Embedding daily quota exhausted — not retrying, this does not "
+                "reset until the provider's next quota day: %s",
+                exc,
+            )
+            return True
+        if _is_permanent_error(exc):
+            log.error("Embedding request rejected, not retryable: %s", exc)
+            return True
+        return attempt >= self._max_retries
 
     def _call(self, fn, arg, *, cost: int = 1):
         attempt = 0
@@ -378,15 +811,16 @@ class _ResilientEmbeddings(Embeddings):
             try:
                 return fn(arg)
             except Exception as exc:  # noqa: BLE001 — bounded retry, then propagate
-                if attempt >= self._max_retries:
+                if self._give_up(exc, attempt):
                     raise
-                delay = self._backoff(attempt, exc)
+                delay = 0.0 if self._holding() else self._backoff(attempt, exc)
                 attempt += 1
                 log.warning(
                     "Embedding call failed (attempt %d/%d), backing off %.1fs: %s",
-                    attempt, self._max_retries, delay, exc,
+                    attempt, self._max_retries, delay or self._hold_remaining(), exc,
                 )
-                time.sleep(delay)
+                if delay:
+                    time.sleep(delay)
 
     async def _acall(self, fn, arg, *, cost: int = 1):
         attempt = 0
@@ -395,15 +829,16 @@ class _ResilientEmbeddings(Embeddings):
             try:
                 return await fn(arg)
             except Exception as exc:  # noqa: BLE001 — bounded retry, then propagate
-                if attempt >= self._max_retries:
+                if self._give_up(exc, attempt):
                     raise
-                delay = self._backoff(attempt, exc)
+                delay = 0.0 if self._holding() else self._backoff(attempt, exc)
                 attempt += 1
                 log.warning(
                     "Async embedding call failed (attempt %d/%d), backing off %.1fs: %s",
-                    attempt, self._max_retries, delay, exc,
+                    attempt, self._max_retries, delay or self._hold_remaining(), exc,
                 )
-                await asyncio.sleep(delay)
+                if delay:
+                    await asyncio.sleep(delay)
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         return self._call(self.inner.embed_documents, texts, cost=len(texts))
@@ -456,6 +891,8 @@ def get_embeddings(settings=None) -> Embeddings:
             backend,
             limiter=get_embed_rate_limiter(settings),
             max_retries=settings.llm_max_retries,
+            base_delay=settings.llm_retry_base_delay_sec,
+            gate=get_embed_quota_gate(settings),
         )
     elif provider == "ollama":
         from langchain_ollama import OllamaEmbeddings
@@ -477,14 +914,18 @@ def is_hosted(settings=None) -> bool:
 
 
 def reset_models() -> None:
-    """Drop every cached model, limiter included.
+    """Drop every cached model, limiter and quota gate included.
 
     Tests mutate settings between cases; without this they would keep getting a
-    client built from the previous case's configuration.
+    client built from the previous case's configuration — and, since a gate holds
+    a deadline rather than a count, a 429 simulated by one case would keep the
+    next one waiting on a hold it never triggered.
     """
-    global _rate_limiter, _embed_rate_limiter
+    global _rate_limiter, _embed_rate_limiter, _chat_gate, _embed_gate
     with _lock:
         _model_cache.clear()
         _embeddings_cache.clear()
         _rate_limiter = None
         _embed_rate_limiter = None
+        _chat_gate = None
+        _embed_gate = None

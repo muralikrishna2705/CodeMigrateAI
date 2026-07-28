@@ -122,13 +122,42 @@ class TestRateLimiter:
         main = providers.get_chat_model("main", settings=s)
         fast = providers.get_chat_model("fast", settings=s)
         assert main.rate_limiter is fast.rate_limiter
-        assert isinstance(main.rate_limiter, InMemoryRateLimiter)
+        # The bucket is wrapped so it also honours a 429 collected elsewhere,
+        # but the bucket underneath is still one shared InMemoryRateLimiter.
+        assert isinstance(main.rate_limiter, providers._QuotaAwareRateLimiter)
+        assert isinstance(main.rate_limiter.inner, InMemoryRateLimiter)
 
     def test_zero_rate_disables_throttling(self):
         # Correct for Ollama, where the only limit is local CPU.
         s = _settings(llm_provider="ollama", llm_requests_per_second=0)
         assert providers.get_rate_limiter(s) is None
         assert providers.get_chat_model("main", settings=s).rate_limiter is None
+
+    def test_the_limiter_waits_out_a_hold_another_caller_collected(self):
+        # The point of the gate: a caller that never saw a 429 itself must still
+        # not spend a request while the quota is known to be exhausted. Without
+        # this, a 4-way fan-out turns one exhausted quota into four rejections,
+        # each pushing the reset further out.
+        # A stub bucket that always grants isolates the gate: a real
+        # InMemoryRateLimiter starts empty and would refuse for its own reasons.
+        class _AlwaysGrants:
+            def acquire(self, *, blocking=True):
+                return True
+
+        gate = providers._QuotaGate("T")
+        limiter = providers._QuotaAwareRateLimiter(_AlwaysGrants(), gate)
+        gate.penalize(RuntimeError("429 RESOURCE_EXHAUSTED"))
+        assert limiter.acquire(blocking=False) is False, "gate must refuse"
+        gate.clear()
+        assert limiter.acquire(blocking=False) is True
+
+    def test_the_shared_limiter_is_wired_to_the_shared_gate(self):
+        s = _settings(llm_provider="google_genai", google_api_key="k",
+                      llm_requests_per_second=1.0)
+        assert providers.get_rate_limiter(s).gate is providers.get_quota_gate(s)
+        # Chat and embeddings are separate quotas, so separate gates: an
+        # embedding 429 must not stall code generation, or vice versa.
+        assert providers.get_embed_rate_limiter(s).gate is not providers.get_quota_gate(s)
 
 
 class TestHostedDetection:
@@ -253,3 +282,236 @@ class TestEmbeddings:
         wrap = providers._ResilientEmbeddings(_Broken(), max_retries=2, base_delay=0)
         with pytest.raises(RuntimeError, match="permanent"):
             wrap.embed_query("x")
+
+    def test_the_gate_absorbs_the_wait_instead_of_doubling_it(self):
+        # The gate holds for the advertised delay AND _backoff would sleep for it
+        # too. Paying both would wait twice as long as the server asked, so the
+        # local backoff stands down whenever the gate is already holding.
+        gate = providers._QuotaGate("T", max_cooldown=120.0)
+        wrap = providers._ResilientEmbeddings(object(), max_retries=2, gate=gate)
+        gate.penalize(RuntimeError("429 RESOURCE_EXHAUSTED 'retryDelay': '58s'"))
+        assert wrap._holding() is True
+        assert 58.0 < gate.remaining <= 59.0
+
+
+class TestQuotaGate:
+    """The reactive half of rate limiting.
+
+    A token bucket is open-loop: it paces against an assumed quota and a 429
+    teaches it nothing. Every test here is about the loop being closed.
+    """
+
+    def test_the_server_advertised_delay_beats_the_default(self):
+        gate = providers._QuotaGate("T", default_cooldown=30.0, max_cooldown=120.0)
+        # +1s so callers wake after the reset rather than exactly on it.
+        held = gate.penalize(RuntimeError("429 RESOURCE_EXHAUSTED 'retryDelay': '58s'"))
+        assert held == 59.0
+
+    def test_a_silent_429_falls_back_to_the_configured_cooldown(self):
+        gate = providers._QuotaGate("T", default_cooldown=30.0)
+        assert gate.penalize(RuntimeError("429 Too Many Requests")) == 30.0
+
+    def test_a_non_quota_failure_does_not_hold_anyone(self):
+        # A bad prompt or a dropped socket says nothing about remaining quota;
+        # parking every caller for 30s over one would be a self-inflicted outage.
+        gate = providers._QuotaGate("T")
+        assert gate.penalize(ValueError("schema mismatch")) == 0.0
+        assert gate.remaining == 0.0
+
+    def test_a_hold_only_ever_extends(self):
+        # Two concurrent 429s advertising different resets must leave the LONGER
+        # standing — taking the newer one would cut the wait short and walk
+        # straight back into the quota.
+        gate = providers._QuotaGate("T", max_cooldown=120.0)
+        gate.penalize(RuntimeError("429 RESOURCE_EXHAUSTED 'retryDelay': '90s'"))
+        long_hold = gate.remaining
+        gate.penalize(RuntimeError("429 RESOURCE_EXHAUSTED 'retryDelay': '5s'"))
+        assert gate.remaining >= long_hold - 1.0
+
+    def test_a_daily_cap_holds_for_the_maximum(self):
+        # Nothing resets before the provider's next quota day, so a short hold
+        # only lets every caller re-confirm the same cap on a loop.
+        gate = providers._QuotaGate("T", default_cooldown=30.0, max_cooldown=120.0)
+        held = gate.penalize(
+            RuntimeError("429 quotaId: GenerateRequestsPerDayPerProjectPerModel")
+        )
+        assert held == 120.0
+
+    def test_the_cooldown_is_capped(self):
+        gate = providers._QuotaGate("T", max_cooldown=60.0)
+        assert gate.penalize(RuntimeError("429 RESOURCE_EXHAUSTED 'retryDelay': '3600s'")) == 60.0
+
+    @pytest.mark.parametrize(
+        "message,quota,daily",
+        [
+            ("429 RESOURCE_EXHAUSTED", True, False),
+            ("You exceeded your current quota", True, False),
+            ("quotaId: GenerateRequestsPerDayPerProjectPerModel", True, True),
+            ("Invalid JSON payload", False, False),
+        ],
+    )
+    def test_quota_classification(self, message, quota, daily):
+        exc = RuntimeError(message)
+        assert providers._is_quota_error(exc) is quota
+        assert providers._is_daily_quota_error(exc) is daily
+
+    def test_a_structured_429_is_detected_without_the_message(self):
+        # google.genai.errors.APIError carries the status as an int, which is
+        # unambiguous where a message match is only a heuristic.
+        class _APIError(Exception):
+            code = 429
+
+        assert providers._is_quota_error(_APIError("something opaque")) is True
+
+
+class TestRetryHelper:
+    """`_aretry` is the retry the SDK's own cannot be: metered and delay-aware."""
+
+    @pytest.mark.asyncio
+    async def test_a_transient_failure_is_retried(self):
+        calls = []
+
+        class _Flaky:
+            async def ainvoke(self, x, **kw):
+                calls.append(x)
+                if len(calls) < 3:
+                    raise RuntimeError("503 backend unavailable")
+                return "ok"
+
+        s = _settings(llm_max_retries=3, llm_retry_base_delay_sec=0)
+        assert await providers.ainvoke_with_retry(_Flaky(), "in", settings=s) == "ok"
+        assert len(calls) == 3
+
+    @pytest.mark.asyncio
+    async def test_a_daily_quota_is_not_retried(self):
+        # A per-day cap does not reset inside any backoff worth waiting through,
+        # so retrying only spends minutes to reach the same failure. Failing fast
+        # is also what puts the real reason in the log instead of a timeout.
+        calls = []
+
+        class _Capped:
+            async def ainvoke(self, x, **kw):
+                calls.append(x)
+                raise RuntimeError(
+                    "429 RESOURCE_EXHAUSTED quotaId: "
+                    "GenerateRequestsPerDayPerProjectPerModel"
+                )
+
+        s = _settings(llm_max_retries=5, llm_retry_base_delay_sec=0)
+        with pytest.raises(RuntimeError):
+            await providers.ainvoke_with_retry(_Capped(), "in", settings=s)
+        assert len(calls) == 1, "a daily cap must not burn the retry budget"
+
+    @pytest.mark.asyncio
+    async def test_a_rejected_request_is_not_retried(self):
+        # A bad key or a nonexistent model id is not a timing problem. Retrying
+        # spends ~14s of backoff to reach the identical error and delays the one
+        # thing that helps: the message reaching the log.
+        calls = []
+
+        class _Rejected:
+            async def ainvoke(self, x, **kw):
+                calls.append(x)
+                raise RuntimeError("400 INVALID_ARGUMENT: API key not valid")
+
+        s = _settings(llm_max_retries=5, llm_retry_base_delay_sec=0)
+        with pytest.raises(RuntimeError):
+            await providers.ainvoke_with_retry(_Rejected(), "in", settings=s)
+        assert len(calls) == 1
+
+    def test_a_429_is_never_classified_as_permanent(self):
+        # 429 is a 4xx, so a naive status-range check would file it as
+        # unretryable — the exact inversion of what it means.
+        assert providers._is_permanent_error(RuntimeError("429 RESOURCE_EXHAUSTED")) is False
+
+        class _APIError(Exception):
+            code = 429
+
+        assert providers._is_permanent_error(_APIError("opaque")) is False
+
+    @pytest.mark.asyncio
+    async def test_a_429_holds_every_other_caller(self):
+        # The behaviour the whole gate exists for: one branch's rejection has to
+        # stop the other three from spending requests into the same dead quota.
+        providers.reset_models()
+        s = _settings(llm_max_retries=0, llm_quota_cooldown_sec=25.0)
+
+        class _Limited:
+            async def ainvoke(self, x, **kw):
+                raise RuntimeError("429 RESOURCE_EXHAUSTED")
+
+        with pytest.raises(RuntimeError):
+            await providers.ainvoke_with_retry(_Limited(), "in", settings=s)
+        assert providers.get_quota_gate(s).remaining > 20.0
+        providers.reset_models()
+
+    @pytest.mark.asyncio
+    async def test_a_stream_is_not_retried_once_it_has_yielded(self):
+        # Restarting mid-stream would replay text the caller already received;
+        # a partial answer followed by a whole one is worse than the truncation.
+        class _DiesMidStream:
+            async def astream(self, x, **kw):
+                yield "part"
+                raise RuntimeError("429 RESOURCE_EXHAUSTED")
+
+        s = _settings(llm_max_retries=3, llm_retry_base_delay_sec=0)
+        seen = []
+        with pytest.raises(RuntimeError):
+            async for chunk in providers.astream_with_retry(
+                _DiesMidStream(), "in", settings=s
+            ):
+                seen.append(chunk)
+        assert seen == ["part"]
+        providers.reset_models()
+
+    @pytest.mark.asyncio
+    async def test_a_stream_is_retried_before_the_first_chunk(self):
+        # A 429 is refused before any content exists, so this is the case that
+        # actually matters for rate limiting.
+        attempts = []
+
+        class _FlakyStream:
+            async def astream(self, x, **kw):
+                attempts.append(1)
+                if len(attempts) == 1:
+                    raise RuntimeError("503 backend unavailable")
+                yield "whole answer"
+
+        s = _settings(llm_max_retries=2, llm_retry_base_delay_sec=0)
+        out = [
+            c async for c in providers.astream_with_retry(
+                _FlakyStream(), "in", settings=s
+            )
+        ]
+        assert out == ["whole answer"]
+        assert len(attempts) == 2
+
+
+class TestTransportRetry:
+    def test_the_sdk_retry_is_disabled_in_favour_of_ours(self):
+        # `max_retries` on the Gemini client becomes HttpRetryOptions(attempts=N),
+        # which waits wait_exponential_jitter(initial=1.0) and never reads the
+        # retryDelay the 429 carries — so it cannot succeed against an advertised
+        # 30-60s reset. Worse, it retries inside httpx, below LangChain, so those
+        # requests never take a rate-limiter token. 1 == one attempt, no retries.
+        s = _settings(llm_provider="google_genai", google_api_key="k",
+                      llm_max_retries=5)
+        kwargs = providers._provider_kwargs("google_genai", "main", False, s)
+        assert kwargs["max_retries"] == 1
+
+    def test_failures_are_reported_to_the_gate_on_every_call_path(self):
+        # The callback is what makes the gate complete: LangChain fires
+        # on_llm_error for every chat call however it was reached, so a 429
+        # raised inside a bind_tools or with_structured_output chain still lands.
+        providers.reset_models()
+        s = _settings(llm_provider="google_genai", google_api_key="k",
+                      llm_requests_per_second=1.0)
+        model = providers.get_chat_model("main", settings=s)
+        handlers = [
+            h for h in (model.callbacks or [])
+            if isinstance(h, providers._QuotaCallbackHandler)
+        ]
+        assert handlers, "every chat model must report failures to the gate"
+        handlers[0].on_llm_error(RuntimeError("429 RESOURCE_EXHAUSTED"))
+        assert providers.get_quota_gate(s).remaining > 0
+        providers.reset_models()

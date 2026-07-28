@@ -217,8 +217,17 @@ class BaseAgent(ABC, metaclass=AgentMeta):
                 messages.append(SystemMessage(content=system_prompt))
             messages.append(HumanMessage(content=prompt))
             try:
+                from llm import providers
+
                 model = chat_model(role).with_structured_output(schema)
-                return await model.ainvoke(messages)
+                # Through the retry helper rather than ainvoke directly: a
+                # structured call that dies on a 429 falls back to the rule-based
+                # path below, which quietly costs the whole point of asking the
+                # model — and it is the fast-model calls, being the most frequent,
+                # that meet the quota ceiling first.
+                return await providers.ainvoke_with_retry(
+                    model, messages, label=f"{self.name} structured call"
+                )
             except Exception as exc:  # noqa: BLE001 — structured output is optional
                 log.warning(
                     "[%s] structured call for %s failed: %s",

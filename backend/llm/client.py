@@ -94,7 +94,12 @@ class LLMClient:
             len(prompt),
             ", json" if fmt else "",
         )
-        response = await chat.ainvoke(self._messages(prompt, system_prompt))
+        response = await providers.ainvoke_with_retry(
+            chat,
+            self._messages(prompt, system_prompt),
+            settings=self.settings,
+            label=f"LLM call ({role})",
+        )
         return (response.text or "").strip()
 
     async def stream_llm(
@@ -111,7 +116,16 @@ class LLMClient:
             model=model,
             settings=self.settings,
         )
-        async for chunk in chat.astream(self._messages(prompt, system_prompt)):
+        # Retried only up to the first chunk — see providers.astream_with_retry.
+        # A 429 is refused before any content exists, so the rate-limit case is
+        # fully covered while a mid-stream failure still surfaces rather than
+        # replaying text the caller already received.
+        async for chunk in providers.astream_with_retry(
+            chat,
+            self._messages(prompt, system_prompt),
+            settings=self.settings,
+            label=f"LLM stream ({role})",
+        ):
             # ``.text`` flattens structured content parts (Gemini returns a list
             # when reasoning or citations are attached) down to plain text, so
             # the streamer downstream never has to know which shape arrived.

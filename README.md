@@ -301,7 +301,12 @@ otherwise. Called from within the graph by `RuntimeValidatorAgent` via
 
 Key modules:
 
-- `backend/llm/providers.py` — provider-agnostic chat model + embeddings, rate limiter.
+- `backend/llm/providers.py` — provider-agnostic chat model + embeddings, and
+  two-layer rate limiting: an open-loop token bucket that paces to the assumed
+  quota, plus a reactive `_QuotaGate` that parks *every* caller in the process
+  for the reset a 429 advertised. Retries live here rather than in the provider
+  SDK, whose own retry ignores that advertised delay and fires below LangChain
+  where its extra requests never take a rate-limiter token.
 - `backend/llm/structured.py` — structured-output coercion and JSON salvage.
 - `backend/models/schemas.py` — every structured LLM response shape.
 - `backend/models/state.py` — `MigrationState` Pydantic model with agent reports,
@@ -374,6 +379,8 @@ variable, which wins over the file. The essentials:
 LLM_PROVIDER=google_genai        # or "ollama"
 GOOGLE_API_KEY=                  # required for google_genai
 LLM_REQUESTS_PER_SECOND=0.16     # ~10 RPM free tier; raise on a paid plan
+LLM_MAX_RETRIES=3                # retries are ours, not the provider SDK's
+LLM_QUOTA_COOLDOWN_SEC=30        # hold when a 429 advertises no reset delay
 EMBEDDING_PROVIDER=google_genai
 REDIS_URL=redis://redis:6379/0
 VALIDATOR_URL=http://validator:8000

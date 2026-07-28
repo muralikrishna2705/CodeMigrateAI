@@ -76,9 +76,13 @@ async def _critique(llm, prompt: str, system_prompt: str) -> Critique | None:
         from langchain_core.messages import HumanMessage, SystemMessage
 
         try:
+            from llm import providers
+
             model = chat_model("fast").with_structured_output(Critique)
-            return await model.ainvoke(
-                [SystemMessage(content=system_prompt), HumanMessage(content=prompt)]
+            return await providers.ainvoke_with_retry(
+                model,
+                [SystemMessage(content=system_prompt), HumanMessage(content=prompt)],
+                label="Structured reflection",
             )
         except Exception as exc:  # noqa: BLE001 — reflection is strictly optional
             log.warning("Structured reflection failed: %s", exc)

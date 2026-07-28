@@ -48,9 +48,28 @@ class Settings(BaseSettings):
     llm_timeout_sec: float = 120.0
     llm_max_tokens: int = 4096
     llm_temperature: float = 0.0
-    # Provider-side retry on transient 5xx / rate-limit responses, before our
-    # own error handling ever sees it.
-    llm_max_retries: int = 2
+    # How many times *we* retry a failed model or embedding call. Deliberately
+    # ours rather than the provider's: the google-genai SDK's built-in retry
+    # ignores the `retryDelay` the 429 itself carries (it waits ~1s against an
+    # advertised 30-60s reset, so it cannot succeed) and runs below LangChain,
+    # where its extra requests never take a rate-limiter token. It is disabled in
+    # llm/providers._provider_kwargs and llm.providers._aretry does the work.
+    llm_max_retries: int = 3
+    # First backoff step for a *non*-quota failure (5xx, dropped socket), doubling
+    # per attempt. Quota failures ignore this entirely and wait the interval the
+    # server advertised — see llm.providers._QuotaGate.
+    llm_retry_base_delay_sec: float = 2.0
+
+    # Reactive quota backoff. The token buckets below are open-loop: they pace
+    # against an *assumed* quota and a 429 teaches them nothing. When one does
+    # arrive, llm.providers._QuotaGate parks every caller in the process — not
+    # just the one that was rejected — for as long as the server asked, so a
+    # 4-way parallel fan-out costs one rejected request instead of four.
+    #
+    # These two only apply when the provider does NOT advertise a delay; when it
+    # does, the advertised value wins (capped by the max).
+    llm_quota_cooldown_sec: float = 30.0
+    llm_quota_max_cooldown_sec: float = 120.0
 
     # Rate limiting is a real design constraint, not a nicety: hosted free tiers
     # are quoted in requests per MINUTE and one migration makes 8-15 model calls,
@@ -59,7 +78,12 @@ class Settings(BaseSettings):
     #   free tier  ~10 RPM -> 0.16
     #   paid tier  ~1000 RPM -> 16.0
     llm_requests_per_second: float = 0.16
-    llm_max_burst: int = 4
+    # A burst is what makes a per-MINUTE quota reject a stream whose *average*
+    # rate is legal: 4 calls fired inside one second against a ~10 RPM budget
+    # spends 40% of the minute up front, and the parallel fan-out does exactly
+    # that. Kept to 2 so the fan-out still overlaps two branches without handing
+    # the provider a spike to reject.
+    llm_max_burst: int = 2
 
     # Embeddings get their OWN bucket rather than sharing the chat one, because
     # Google meters them as a separate quota

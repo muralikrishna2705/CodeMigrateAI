@@ -186,7 +186,11 @@ class RetrieverAgent(BaseAgent):
 
         for attempt in range(settings.retriever_max_tool_calls):
             try:
-                reply = await bound.ainvoke(messages)
+                from llm import providers
+
+                reply = await providers.ainvoke_with_retry(
+                    bound, messages, label="Retrieval tool call"
+                )
             except Exception as exc:  # noqa: BLE001 — fall back to the heuristic pass
                 log.warning("Retrieval tool call failed: %s", exc)
                 break

@@ -273,6 +273,34 @@ def _llm_unavailable_detail() -> str:
     )
 
 
+def _quota_http_error(exc: Exception) -> HTTPException | None:
+    """A 429 for an upstream quota failure, or None if that is not what this is.
+
+    Reporting an exhausted provider quota as a 500 is actively misleading: it
+    reads as a bug in this service, when the request was well-formed and the fix
+    is to wait or to raise the quota. 429 also carries `Retry-After`, which is
+    the one thing a client needs in order to do something useful about it.
+    """
+    if not providers._is_quota_error(exc):
+        return None
+    if providers._is_daily_quota_error(exc):
+        detail = (
+            "The model provider's daily quota is exhausted. This does not reset "
+            "until the provider's next quota day — raise the quota or switch "
+            "LLM_PROVIDER to a local Ollama model to keep working."
+        )
+    else:
+        detail = (
+            "The model provider is rate limiting this project. The request was "
+            "retried and still refused; try again shortly, or lower "
+            "LLM_REQUESTS_PER_SECOND if this is persistent."
+        )
+    wait = max(1, int(providers.get_quota_gate().remaining) or 30)
+    return HTTPException(
+        status_code=429, detail=detail, headers={"Retry-After": str(wait)}
+    )
+
+
 @app.post("/migrate", response_model=MigrateResponse)
 async def migrate(request: MigrateRequest):
     if not await llm_client.health_check():
@@ -289,6 +317,10 @@ async def migrate(request: MigrateRequest):
     try:
         final_state = await pipeline.run(state)
     except Exception as exc:
+        quota_error = _quota_http_error(exc)
+        if quota_error is not None:
+            log.warning("Migration refused by the provider's quota: %s", exc)
+            raise quota_error from exc
         log.exception("Pipeline crashed")
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -332,6 +364,14 @@ async def migrate_stream(request: MigrateRequest):
         try:
             await pipeline.run(state)
         except Exception as exc:
+            # The SSE stream has already begun, so there is no status code left
+            # to set — the error event carries the explanation instead, and a raw
+            # provider traceback is not one a user can act on.
+            quota_error = _quota_http_error(exc)
+            if quota_error is not None:
+                log.warning("Migration refused by the provider's quota: %s", exc)
+                await queue.put({"type": "error", "message": quota_error.detail})
+                return
             log.exception("Streaming pipeline error")
             await queue.put({"type": "error", "message": str(exc)})
 
