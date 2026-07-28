@@ -58,8 +58,8 @@ A compiled `StateGraph` with 13 nodes and three budget-bounded cycles:
 analyze → dispatch → orchestrate ═(Send × n)═→ branch ═══════╗
                                   ├─(deep)─→ deep_analyze ──╮║
                                   └─────────→ retrieve ─────┴╩→ plan → migrate
-                                                                        │
-     ┌──────────────────────────────────────────────────────────────────┘
+                                                                            │
+     ┌──────────────────────────────────────────────────────────────────────┘
      ▼
   reflect ──(low confidence)──→ migrate            [bounded by max_reflections]
      │
@@ -120,6 +120,22 @@ caller emits the ungrounded notice rather than inventing grounding.
 
 Built on **LangGraph** for orchestration and **LangChain / ChromaDB** for retrieval.
 
+## Architecture dimensions
+
+The system is organized into six cross-cutting dimensions, each addressing a
+distinct class of problem:
+
+| Dimension | Concern | Key modules |
+| --- | --- | --- |
+| **D1** | Migration pipeline — the core LangGraph workflow | `graph/migration_graph.py`, `graph/nodes.py` |
+| **D2** | Retrieval — RAG ingestion, embedding, hybrid search | `rag/` |
+| **D3** | Reflection — agent self-critique and regeneration loop | `reflector_agent.py`, `graph/conditions.py` |
+| **D4** | Orchestration — parallel sub-task decomposition | `orchestrator_agent.py`, `graph/subgraphs.py` |
+| **D5** | Persistence — cross-session memory, graph checkpointing | `memory/`, `pipeline/orchestrator.py` |
+| **D6** | Data structures — custom containers tuned for each call site | `dsa/` |
+
+Below, D3–D6 are detailed alongside the D1/D2 features already shown.
+
 ## Supported Languages
 
 | Language | IDs / aliases | Sample Versions |
@@ -139,6 +155,26 @@ Built on **LangGraph** for orchestration and **LangChain / ChromaDB** for retrie
 ### LangGraph Migration Workflow
 A compiled `StateGraph` with nodes for analysis, deep analysis, planning, migration, validation, and fixing. On validation failure, a retry loop (`validate → fix → migrate`) executes up to `max_retries` (default 2).
 
+### Subgraphs & Dynamic Orchestration (D4)
+`backend/graph/subgraphs.py` provides five independently compiled subgraphs:
+- **analysis** — Deep structural analysis (depends only on base metrics)
+- **retrieval** — RAG context provisioning (parallel-safe with analysis)
+- **migration** — Plan → generate migrated code
+- **fix** — Validate → fix → re-migrate loop (bounded by retries)
+- **reflection** — Self-critique of migrated output
+
+The `OrchestratorAgent` decomposes a migration into sub-tasks, resolves them
+against the `SUBGRAPH_TASKS` catalog, and fans out data-independent tasks
+concurrently via `Send`. The `branch` node dispatches each task to its compiled
+subgraph and accumulates results through `operator.add` reducers.
+
+### Self-Critique & Reflection (D3)
+The `ReflectorAgent` scores the migrated code on a 0.0–1.0 scale and issues a
+recommendation: `"pass"`, `"re-generate"`, or `"gather-more-info"`. The
+`reflect_condition` edge routes back to the `migrate` node while the reflection
+budget allows (`max_reflections`). Defaults to a passing no-op so the graph
+never stalls on an unavailable critique; enable with `ENABLE_REFLECTION=true`.
+
 ### RAG Pipeline
 - **Corpus**: seven curated migration guides — java8→21, java→python, python2→3,
   python→java, js→ts, ES5→ES2022, java→C# — filed under
@@ -151,27 +187,38 @@ A compiled `StateGraph` with nodes for analysis, deep analysis, planning, migrat
 - **Code-aware query construction**: Extracts imports, API calls, and type names
   from source code — so queries look like symbols, not prose. Retrieval is much
   stronger on `TryGetValue KeyNotFoundException` than on a natural-language
-  paraphrase, and the former is what the pipeline actually generates.
+  paraphrase, and the former is what the pipeline actually generates. Comments are
+  stripped before extraction to avoid dilution.
 - **Hybrid search**: Dense vector embeddings plus keyword retrieval, fused by
   Reciprocal Rank Fusion (RRF).
 - **Version-aware filtering**: Phased retrieval ladder (exact version →
   language-only → unfiltered) with metadata-weighted ranking.
-- **Two-stage precision**: fetch 20 candidates, rerank with a local cross-encoder,
-  then drop everything below `rag_rerank_min_score`. The cosine floor is disabled
-  whenever reranking is on — applying it first would let the weaker signal
-  overrule the stronger one, and at 0.3 it was rejecting good matches outright.
+- **Two-stage precision**: fetch 20 candidates, rerank with a local FlashRank
+  cross-encoder, then drop everything below `rag_rerank_min_score`. The cosine
+  floor is disabled whenever reranking is on — applying it first would let the
+  weaker signal overrule the stronger one, and at 0.3 it was rejecting good
+  matches outright.
+- **Adaptive RAG**: Self-RAG strategies (`single_hop`, `multi_hop`, `hyde`,
+  `multi_query`) selected by the model at runtime via `rag_strategy="auto"`.
+  Ungrounded imports detected by the migrator trigger a re-retrieval loop
+  (bounded by `max_reretrievals`).
 - **Code grounding check**: Post-hoc analysis flags library imports not grounded
   by source, RAG context, or target stdlib.
 - **Degrades, never fails**: an embedding outage returns no hits instead of
   raising, and the caller emits the ungrounded notice.
 
 ### Streaming via SSE
-Server-Sent Events deliver token-by-token code output to the frontend. The `MigratedCodeStreamer` unwraps the JSON wrapper on the fly, showing only clean migrated code while maintaining JSON structure internally for parsing.
+Server-Sent Events deliver token-by-token code output to the frontend. The
+`MigratedCodeStreamer` unwraps the JSON wrapper on the fly, showing only clean
+migrated code while maintaining JSON structure internally for parsing. Five
+event types: `agent_start`, `agent_complete`, `token`, `complete`, `error`.
 
 ### Anti-Hallucination Measures
 - `UngroundedNotice` prepended when RAG finds no reference examples.
 - Version constraints in prompts fence off APIs newer than the target version.
-- Structured output means malformed responses are not a reachable state; the salvage path in `llm/structured.py` exists for the streaming path and test doubles only.
+- Structured output means malformed responses are not a reachable state; the
+  salvage path in `llm/structured.py` exists for the streaming path and test
+  doubles only.
 
 ### Model role routing
 Two roles, resolved by `llm/providers.py`. `main` generates code; `fast` handles
@@ -180,15 +227,75 @@ with the reasoning budget disabled — a thinking budget spent on a yes/no routi
 answer is pure latency. Model ids default per provider, so switching
 `LLM_PROVIDER` carries the whole set with it.
 
+### Language Profiles
+`backend/llm/language_profiles/` — a `LanguageProfile` dataclass per language
+carrying syntax rules, idioms, stdlib mappings, version features, few-shot
+examples, and cross-language mappings. The `ProfileRegistry` normalizes aliases
+(py→python, js→javascript, c#→csharp) and provides system role prompts tailored
+to upgrade vs. conversion migrations.
+
 ### Caching
-Two-tier cache: **Redis** (primary, with TTL) and **local LRU cache** (fallback). Cache keys use SHA-256 hashes of source code, language/version IDs, migration type, and analyzer context.
+Two-tier cache: **Redis** (primary, with TTL) and **local PrefixLRU** (fallback).
+Cache entries are evicted by migration-family prefix (e.g. all migrations into
+Java 21) when a language profile or RAG corpus changes — instead of flushing the
+whole cache. The local `PrefixLRU` in `dsa/lru.py` uses `OrderedDict` recency
+(O(1)) with `str.startswith` prefix scan (outperformed a trie 27x at 500 entries).
+
+### Persistent Memory (D5)
+`backend/memory/` stores cross-session migration outcomes in SQLite:
+- **MemoryStore**: four tables — `migrations` (successful runs), `patterns`
+  (deduplicated conversions), `failures` (runs that errored), `corrections`
+  (user edits). Failures are recorded to warn, never to ground.
+- **MigrationMemory**: two-stage recall — a `LanguagePairTrie` narrows
+  candidates to one language pair in O(k), then cosine similarity ranks
+  survivors against the incoming source. `PatternStore` fronts SQLite with a
+  bloom filter for O(1) deduplication.
+- **Graph checkpointing**: `build_checkpointer` persists LangGraph state per
+  `thread_id` via `aiosqlite`, so an interrupted migration can resume.
+- The pipeline calls `_recall()` before the graph (seeds prior art into RAG
+  context) and `_persist()` after (records outcome or failure).
+
+### Runtime Layer
+`backend/runtime/` centralizes agent execution inside the graph:
+- **Circuit Breaker** (`agent_recovery.py`): per-agent, 3 consecutive failures
+  → 60s cooldown. Consulted by every graph node before constructing an agent.
+- **Provider** (`agent_providers.py`): a dependency-injection container with
+  instance and factory registration. Agents declare `needs` as a tuple of names;
+  the runtime resolves them via `Provider.resolve()` when constructing each
+  agent instance.
+- **Runtime** (`agent_runtime.py`): the single executor all graph nodes delegate
+  to through `_make_node`. Centralizes circuit breaker check, agent resolution,
+  DI hydration, execution, error recording, and delta writeback.
 
 ### Validator Service
-A separate FastAPI microservice (`validator_service/`) with per-language syntax validators using real toolchains when available, and graceful degradation otherwise.
+A separate FastAPI microservice (`validator_service/`) with per-language syntax
+validators using real toolchains when available, and graceful degradation
+otherwise. Called from within the graph by `RuntimeValidatorAgent` via
+`clients/validator_client.py`.
 
 ### CI/CD Integration
-- **GitHub Actions workflow** (`cicd/github-actions.yml`): test → build/push Docker images to GHCR → SSH deploy.
-- **CodeMigrate Pipeline** (`.github/workflows/codemigrate-pipeline.yml`): On PRs, scans changed files, runs migration via a GitHub Action, commits to a `codemigrate/<stem>` branch, and opens a migration PR.
+- **GitHub Actions** (`cicd/github-actions.yml`): test → build/push Docker
+  images to GHCR → SSH deploy.
+- **CodeMigrate Pipeline** (`.github/workflows/codemigrate-pipeline.yml`): On
+  PRs, `cicd/scan_candidates.py` detects changed files by extension, runs
+  migration via the `.github/actions/codemigrate` composite action, commits to
+  a `codemigrate/<stem>` branch, and opens a migration PR.
+- **CI/CD Graph** (`backend/graph/cicd_graph.py`): a separate LangGraph for the
+  automated PR lifecycle — `check_pr` (parse GitHub event) → `create_pr` (branch
+  + commit + PR via PyGithub) → `wait_ci` (poll combined status, 10 min timeout)
+  → `auto_merge` (squash-merge on pass). Runnable locally for smoke testing:
+  `python -m backend.graph.cicd_graph`.
+
+### Data Structures (D6)
+`backend/dsa/` — custom containers, each chosen by measured performance:
+- **Trie** — prefix tree backing the `LanguagePairTrie` for open-ended queries
+  ("every migration out of Java"). A trie was rejected at other call sites where
+  `str.startswith` in C was 15–21x faster.
+- **PrefixLRU** — `OrderedDict` recency with prefix-based invalidation for
+  cache-family eviction.
+- **top_k** — routes between `sorted` (N<128, timsort in C) and `heapq.nlargest`
+  (N≥128, heap in interpreted Python) at the measured crossover. Changes the
+  constant factor by 2.1x at the low end and 4.2x at the high end.
 
 ## Backend
 
@@ -197,16 +304,64 @@ Key modules:
 - `backend/llm/providers.py` — provider-agnostic chat model + embeddings, rate limiter.
 - `backend/llm/structured.py` — structured-output coercion and JSON salvage.
 - `backend/models/schemas.py` — every structured LLM response shape.
+- `backend/models/state.py` — `MigrationState` Pydantic model with agent reports,
+  adaptive-RAG fields, routing plans, parallel task tracking, and memory hooks.
+- `backend/models/requests.py` — `MigrateRequest`/`MigrateResponse` with language
+  and version validation against `Settings.supported_languages`.
 - `backend/graph/migration_graph.py` — LangGraph workflow definition.
-- `backend/graph/nodes.py` — agent-to-node adapters, DI provider wiring.
-- `backend/agents/base.py` — `BaseAgent`, `_call_structured`, `bind_tools`, reflection hook.
-- `backend/agents/tools/base.py` — `AgentTool` and its `StructuredTool` adapter.
+- `backend/graph/cicd_graph.py` — CI/CD PR lifecycle graph.
+- `backend/graph/subgraphs.py` — five independently compiled subgraphs for the
+  orchestrator to dispatch.
+- `backend/graph/conditions.py` — edge routing logic: dispatch, orchestrate,
+  migrate (adaptive RAG), reflect, validate.
+- `backend/graph/state.py` — `GraphState` TypedDict with reducers
+  (`operator.add`, `_keep_highest`, `_merge_dicts`).
+- `backend/graph/nodes.py` — agent-to-node adapters, DI provider wiring,
+  stream token callback.
+- `backend/agents/base.py` — `BaseAgent`, `_call_structured`, `bind_tools`,
+  reflection hook, `ReflectionResult`.
+- `backend/agents/tools/` — `AgentTool`, `StructuredTool` adapter, syntax
+  checker, source reader, semantic search, web search, reflection tool.
+- `backend/agents/orchestrator_agent.py` — LLM-powered sub-task decomposition.
 - `backend/agents/retriever_agent.py` — the ReAct retrieval loop.
+- `backend/pipeline/orchestrator.py` — `Pipeline` class: `run()`, `_recall()`,
+  `_persist()`, `_run_graph()`. The `run_migration_pipeline()` convenience
+  function wires LLM client, cache, and memory.
+- `backend/pipeline/registry.py` — `AgentRegistry` with meta-based auto-discovery.
+- `backend/runtime/agent_runtime.py` — `Runtime` executor class.
+- `backend/runtime/agent_recovery.py` — circuit breaker.
+- `backend/runtime/agent_providers.py` — DI `Provider` container.
+- `backend/runtime/agent_dispatcher.py` — `DispatcherAgent` (LLM or rule routing).
+- `backend/runtime/agent_observer.py` — `ObserverAgent` (metrics + memory persist).
+- `backend/runtime/agent_validator.py` — `RuntimeValidatorAgent`.
 - `backend/rag/retrieval_pipeline.py` — hybrid retrieval, filter ladder, strategy routing.
 - `backend/rag/reranker.py` — FlashRank cross-encoder reranking.
 - `backend/rag/ingestion.py` — ChromaDB ingestion pipeline.
+- `backend/rag/self_rag.py` — Self-RAG strategies and adaptive retrieval.
+- `backend/rag/web_doc_fetcher.py` — online documentation fetching.
+- `backend/rag/url_index.py` — URL-based documentation indexing.
+- `backend/memory/memory_store.py` — SQLite persistence layer.
+- `backend/memory/migration_memory.py` — `LanguagePairTrie` + cosine recall.
+- `backend/memory/pattern_store.py` — bloom-filter-deduplicated patterns.
+- `backend/memory/checkpointer.py` — graph state checkpointing.
+- `backend/dsa/trie.py` — prefix tree.
+- `backend/dsa/lru.py` — `PrefixLRU` cache.
+- `backend/dsa/ranking.py` — adaptive `top_k` selection.
+- `backend/llm/language_profiles/base.py` — `LanguageProfile` dataclass + `ProfileRegistry`.
 - `backend/llm/prompt_composer.py` — cached migration prompt builder.
 - `backend/scripts/build_index.py` — offline index build (`--stats` to check).
+- `backend/clients/validator_client.py` — HTTP client for the validator service.
+
+## API Endpoints
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/health` | Provider status, model ids, RAG state, language profiles, metrics |
+| `GET` | `/languages` | Supported languages and versions |
+| `POST` | `/migrate` | Synchronous migration — returns `MigrateResponse` |
+| `POST` | `/migrate/stream` | SSE-streaming migration — events: agent_start, agent_complete, token, complete, error |
+| `GET` | `/cache/stats` | Cache hit rates, size, Redis status |
+| `POST` | `/cache/clear` | Clear cache, optionally scoped by language/version family |
 
 ## Environment variables
 
@@ -226,6 +381,9 @@ ENABLE_VALIDATION=false
 ENABLE_RAG=false
 ENABLE_GROUNDING_CHECK=false
 ENABLE_WEB_DOCS=false
+OLLAMA_AUTO_PULL=true
+ENABLE_REFLECTION=false           # D3 self-critique
+MEMORY_ENABLED=true               # D5 cross-session persistence
 OLLAMA_AUTO_PULL=true
 ```
 
@@ -248,7 +406,21 @@ Returns:
 }
 ```
 
-Uses real syntax tools when available; returns a structured warning if a toolchain is missing.
+Uses real syntax tools when available; returns a structured warning if a toolchain is missing. Validators for: Python, JavaScript, TypeScript, Java, C#, Go, Kotlin, Rust, C++, C++ (header).
+
+## Frontend
+
+A React single-page app (`frontend/`) with:
+
+- **Sidebar** — source/target language and version selectors with swap button
+- **Editor** — source code input with syntax highlighting
+- **Output** — streaming migrated code display
+- **AgentLog** — real-time agent pipeline progress (analyze → deep analyze → retrieve → plan → migrate → validate → fix → observe)
+- **Header** — branding, example selectors, LLM status pill
+
+Three pre-loaded examples: Java 7 → Java 17, Java 8 → Python 3.12, Python 2.7 → Python 3.12.
+
+Keyboard shortcuts: `Ctrl+Enter` / `⌘↵` to run, `Esc` to cancel. Backend health polls every 15 s.
 
 ## Run Locally
 
@@ -277,10 +449,18 @@ The frontend is served on `http://localhost:3000`; the backend API is on `http:/
 ## Verification
 
 ```powershell
-python -m pytest -q                     # 484 offline tests, no key or network needed
+python -m pytest -q                     # ~500 offline tests, no key or network needed
 python -m compileall -q backend validator_service
 cd frontend; npm.cmd run build
 ```
+
+Tests are configured in `pyproject.toml`: `--import-mode=importlib` for the
+non-installed backend layout, `-m 'not live'` to skip tests needing API keys.
+Key test files: `test_graph.py`, `test_rag.py`, `test_providers.py`,
+`test_memory.py`, `test_orchestration.py`, `test_rag_strategies.py`,
+`test_grounding.py`, `test_reflection.py`, `test_streaming.py`, `test_dsa.py`.
+The `conftest.py` fixture isolates the circuit breaker, observer metrics, and
+provider cache per test.
 
 Before a demo or a submission, also run the opt-in live checks:
 
